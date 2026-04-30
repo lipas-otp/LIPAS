@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lipas"
+version = "0.1.0a1"
+description = "Layered Invariant-Preserving Agent System — side-effect-aware, budget-gated, replayable LLM agent runtime"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+
+dependencies = [
+    # lipas core has no mandatory runtime dependencies.
+    # Adapter dependencies are optional (see [project.optional-dependencies] below).
+]
+
+[project.optional-dependencies]
+ollama = [
+    "httpx>=0.27",
+]
+# openai = [ "openai>=1.30", ]
+# anthropic = [ "anthropic>=0.28", ]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",        # needed by OllamaAdapter in tests
+]
+# all = ["lipas[ollama]"]
+
+[project.keywords]
+# Used by PyPI search — pick terms people actually search for.
+keywords = [
+    "llm",
+    "agent",
+    "audit",
+    "replay",
+    "side-effects",
+    "budget",
+    "react",
+    "tool-use",
+]
+
+[project.classifiers]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage   = "https://github.com/lipas-otp/lipas"
+Repository = "https://github.com/lipas-otp/lipas"
+Changelog  = "https://github.com/lipas-otp/lipas/blob/main/CHANGELOG.md"
+Issues     = "https://github.com/lipas-otp/lipas/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lipas"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
