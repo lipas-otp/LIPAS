@@ -65,4 +65,6 @@ Issues     = "https://github.com/lipas-otp/lipas/issues"
 packages = ["lipas"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
+asyncio_mode = "strict"
+pythonpath = ["."]
+filterwarnings = ["ignore::pytest.PytestWarning:_pytest"]

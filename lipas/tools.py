@@ -19,6 +19,20 @@ P3.1 additions:
     - @tool(declared_buckets=..., estimate=...) wires both at the
       decorator level.
 
+P3.2 additions (RFC-001 §3.4):
+    - Tool.observability_only : bool — marks tools whose side effects
+                                are infrastructure (logging sinks,
+                                metric emitters, trace exports) rather
+                                than application-semantic. During
+                                replay the class is logically
+                                downgraded to READ_ONLY when selecting
+                                a replay operation; the actual
+                                SideEffectClass is preserved on the
+                                audit trail. Tools that lie about this
+                                break replay correctness — same threat
+                                model as a tool lying about its
+                                SideEffectClass.
+
 Naming convention (D1):
     - System-owned buckets (no prefix): tool_calls, wall_seconds,
       tokens_in, tokens_out, cost_usd.
@@ -147,6 +161,13 @@ class Tool:
     consumption.  ``declared_buckets`` is part of equality (it's
     behavioral identity); ``estimate_fn`` is not (callable identity
     is unstable across module reloads).
+
+    P3.2 — ``observability_only`` (RFC-001 §3.4) is part of equality.
+    It is a behavioural identity declaration: a tool with
+    ``observability_only=True`` promises that its side effect, while
+    nominally classified as IDEMPOTENT_WRITE / EXTERNAL_WRITE, has
+    no application-semantic consequence and may be safely re-executed
+    during replay (treated as READ_ONLY for replay decisions).
     """
     name: str
     description: str
@@ -164,6 +185,10 @@ class Tool:
     estimate_fn: EstimateFn | None = field(
         default=None, repr=False, compare=False,
     )
+
+    # ── P3.2 replay declaration (RFC-001 §3.4) ─────────────────────
+    # Part of equality: behavioural identity, not callable identity.
+    observability_only: bool = False
 
     # Cached signature.
     _signature: inspect.Signature = field(init=False, repr=False, compare=False)
@@ -363,6 +388,7 @@ def tool(
     side_effect: SideEffectClass | None = None,
     declared_buckets: Iterable[str] | None = None,
     estimate: EstimateFn | None = None,
+    observability_only: bool = False,
 ) -> Any:
     """Convert a function into a Tool object.
 
@@ -380,6 +406,14 @@ def tool(
             '''Fetch a URL via HTTP GET.'''
             ...
 
+        @tool(
+            side_effect=SideEffectClass.EXTERNAL_WRITE,
+            observability_only=True,
+        )
+        def emit_metric(name: str, value: float) -> None:
+            '''Emit a metric to the observability backend.'''
+            ...
+
     `side_effect=` is REQUIRED (P3.0, D4).
 
     `declared_buckets=` (P3.1) lists every bucket this tool MAY touch.
@@ -393,6 +427,14 @@ def tool(
     the D2 contract, actual ≤ estimate for every returned bucket.
     The harness uses this for pre-flight budget gating; if the contract
     is broken the actual is recorded as TAG_BUDGET_OVERRUN.
+
+    `observability_only=` (P3.2 / RFC-001 §3.4) marks tools whose
+    side effects are infrastructure (logging sinks, metric emitters,
+    trace exports) rather than application-semantic. During replay,
+    such tools are logically downgraded to READ_ONLY when selecting
+    a replay operation; the actual SideEffectClass is still preserved
+    on the audit trail. Tools that lie about this break replay
+    correctness — same threat model as lying about side_effect.
     """
     def wrap(f: Callable[..., Any]) -> Tool:
         if side_effect is None:
@@ -430,6 +472,7 @@ def tool(
             _handler=f,
             declared_buckets=buckets,
             estimate_fn=estimate,
+            observability_only=observability_only,
         )
 
     if fn is None:

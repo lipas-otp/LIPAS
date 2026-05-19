@@ -10,6 +10,13 @@ preflight / fold / spend pipeline as LLM calls — Capability budget
 gating, Guard policy, EffectRow lineage, and replay all "just work"
 across both kinds.
 
+B3 — optional Supervisor.  When configured, ReActAgent calls
+``supervisor.tick(view, ctx)`` after folding each iteration's
+history. Returned ``supervisor_terminate`` / ``supervisor_escalate``
+claims trigger early loop exit; ``supervisor_retry`` is informational
+at this layer (ReAct already re-feeds is_error tool results to the
+LLM in the next iteration). See docs/B3-NOTES.md.
+
 What ReActAgent does NOT do
 ---------------------------
   - It does NOT reclassify harness errors (LLM or tool).  A budget
@@ -35,6 +42,14 @@ from .behaviour import (
 from .calculus import Claim
 from .harness import LLMHarness
 from .rows import RowSet
+from .rows.effect import EffectRow
+from .supervisor import (
+    F_SUP_PAYLOAD,
+    F_SUP_REASON,
+    Supervisor,
+    TAG_SUPERVISOR_ESCALATE,
+    TAG_SUPERVISOR_TERMINATE,
+)
 from .tool_harness import ToolHarness
 from .tools import ToolRegistry
 
@@ -42,6 +57,13 @@ from .tools import ToolRegistry
 __all__ = ["ReActAgent"]
 
 logger = logging.getLogger(__name__)
+
+
+# Behaviour-specific stop_reason strings (the TerminationReason class
+# documents stop_reason as an open string; standard reasons live as
+# constants on it, behaviour-specific strings are used directly).
+_STOP_SUPERVISOR_TERMINATE = "supervisor_terminate"
+_STOP_SUPERVISOR_ESCALATE  = "supervisor_escalate"
 
 
 # =====================================================================
@@ -57,21 +79,22 @@ class ReActAgent:
     harness:
         Configured LLMHarness.  Drives the Reason step.
     tool_harness:
-        Configured ToolHarness (P3.1).  Drives the Act step — each
-        tool_use block from the LLM is dispatched through here, so
-        tool calls share the same preflight / fold / spend machinery
-        as LLM calls.  Almost always shares ``rowset`` with
-        ``harness`` (so EffectRow sees both kinds in one lineage
-        graph) but the harness layer does not require it.
+        Configured ToolHarness (P3.1).  Drives the Act step.
     tools:
-        ToolRegistry.  Used for Request.tools descriptor list (and
-        passed-through to tool_harness which does its own lookup).
+        ToolRegistry.  Used for Request.tools descriptor list.
     rowset:
-        The RowSet to fold history into.
+        The RowSet to fold history into.  ``supervisor`` (if set)
+        SHOULD share this rowset.
     request_template:
         Static fields baked into every Request.
     max_iterations:
         Hard upper bound on R-A-O cycles.
+    supervisor (B3):
+        Optional Supervisor.  Called once per iteration, after
+        ``_fold_iteration`` and before the loop continues.  A
+        ``supervisor_terminate`` or ``supervisor_escalate`` claim
+        in the returned batch causes early loop exit with a
+        FinalResult whose ``stop_reason`` is the supervisor reason.
     name:
         Behaviour identifier.
     """
@@ -82,6 +105,7 @@ class ReActAgent:
     rowset:           RowSet
     request_template: Request
     max_iterations:   int = 10
+    supervisor:       Supervisor | None = None
     name:             str = "react"
 
     _tool_descriptors: tuple[Any, ...] | None = field(
@@ -149,15 +173,8 @@ class ReActAgent:
                 )
 
             # 4. Act — dispatch via ToolHarness, one call at a time.
-            #    Serial (not gather) for v0.1: rowset folds may not
-            #    be safe under concurrent fold, and ordering of
-            #    history claims is part of the audit trail.
             tool_results: list[Mapping[str, Any]] = []
             for tc in tool_calls:
-                # tc shape: {"id": ..., "name": ..., "input": {...}, "type": "tool_use"}
-                # The LLM-issued id IS our effect_id — preserves the
-                # tool_use_id / tool_result.tool_use_id linkage AND
-                # gives EffectRow a stable lineage key across replay.
                 result_dict = await self.tool_harness.call(
                     tool_name=tc["name"],
                     arguments=dict(tc.get("input") or {}),
@@ -165,7 +182,7 @@ class ReActAgent:
                 )
                 tool_results.append(result_dict)
 
-            # 5. Observe — append to messages, advance, fold, loop.
+            # 5. Observe — append to messages, advance, fold.
             assistant_msg = self._message_from_reply(reply)
             results_msg   = self._message_from_tool_results(tool_results)
             state = state.with_messages(
@@ -175,6 +192,69 @@ class ReActAgent:
                 state=state, reply=reply,
                 tool_calls=tool_calls, tool_results=tool_results,
             )
+
+            # 6. Supervisor tick (B3) — runs only on the looping path.
+            #    Natural-stop / error / max-iterations paths do not tick;
+            #    those terminations are already final.
+            early = self._maybe_supervisor_tick(state)
+            if early is not None:
+                return early
+
+    # ── supervisor (B3) ───────────────────────────────────────
+
+    def _maybe_supervisor_tick(self, state: AgentState) -> FinalResult | None:
+        if self.supervisor is None:
+            return None
+        eff_row = next(
+            (r for r in self.rowset.rows if isinstance(r, EffectRow)),
+            None,
+        )
+        if eff_row is None:
+            # Supervisor needs an EffectView; without one, we cannot
+            # build the snapshot.  Log once per absent-EffectRow run
+            # would be tidier; for v0.1 a single warning per tick is
+            # the simpler choice.
+            logger.warning(
+                "react: supervisor configured but rowset has no "
+                "EffectRow; skipping supervisor tick at iteration %d",
+                state.iteration,
+            )
+            return None
+        view = eff_row.project(self.rowset.store)
+        ctx  = self.rowset.store.ctx
+        emitted = self.supervisor.tick(view, ctx)
+        return self._handle_supervisor_outcome(emitted, state)
+
+    @staticmethod
+    def _handle_supervisor_outcome(
+        emitted: list[Claim], state: AgentState,
+    ) -> FinalResult | None:
+        """First terminate/escalate wins. Retry claims are advisory at
+        the ReAct level — they remain in the rowset for downstream
+        tooling but do not alter loop control here."""
+        for c in emitted:
+            if c.tag == TAG_SUPERVISOR_TERMINATE:
+                return FinalResult(
+                    text="",
+                    state=state,
+                    stop_reason=_STOP_SUPERVISOR_TERMINATE,
+                    metadata={
+                        "iterations":        state.iteration,
+                        "supervisor_reason": c.fields.get(F_SUP_REASON),
+                    },
+                )
+            if c.tag == TAG_SUPERVISOR_ESCALATE:
+                return FinalResult(
+                    text="",
+                    state=state,
+                    stop_reason=_STOP_SUPERVISOR_ESCALATE,
+                    metadata={
+                        "iterations":         state.iteration,
+                        "supervisor_reason":  c.fields.get(F_SUP_REASON),
+                        "supervisor_payload": c.fields.get(F_SUP_PAYLOAD),
+                    },
+                )
+        return None
 
     # ── request construction ──────────────────────────────────
 

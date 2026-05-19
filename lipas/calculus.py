@@ -28,6 +28,54 @@ Algebraic guarantees
 
     Both kinds uphold Theorem 1 (belief monotonicity).
     Semilattice fields additionally tolerate re-delivery.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+lipas.calculus — fold strategies.
+
+NORMATIVE: Strategy purity contract
+====================================
+
+A strategy function is any callable registered to the strategy registry,
+with signature::
+
+    strategy(a, b, ctx, registry) -> a'
+
+Strategies MUST be pure functions of their four arguments. Concretely:
+
+  ALLOWED inputs to a strategy:
+    - `a`, `b`           : the two claim/row values being merged
+    - `ctx`              : the BeliefContext, treated as read-only (§3.2)
+    - `registry`         : the strategy registry, treated as read-only
+
+  FORBIDDEN inputs (non-exhaustive; the test tool enumerates the closed list):
+    - time.time(), time.monotonic(), datetime.now(), datetime.utcnow()
+    - random.* (any module-level state)
+    - os.environ (read or write)
+    - any I/O: open(), socket, subprocess, http, file reads
+    - any global mutable state outside `a`, `b`, `ctx`, `registry`
+    - any thread/process identity (os.getpid, threading.current_thread)
+
+  FORBIDDEN side effects:
+    - mutation of `a`, `b` in place (return a new value)
+    - mutation of `ctx` (see §3.2)
+    - mutation of `registry`
+    - logging at WARNING or above (DEBUG/INFO is tolerated; see §3.3)
+
+  REQUIRED:
+    - Determinism: strategy(a, b, ctx, registry) called twice with equal
+      arguments MUST produce equal results, in any process, on any host.
+    - Totality on the declared domain: strategies SHOULD NOT raise on
+      well-typed inputs; if they do, the exception type itself becomes
+      part of the fold semantics and MUST be deterministic.
+
+This contract is enforced in tests via `lipas.testing.deterministic_fold`.
+It is NOT enforced in production: the cost of runtime sandboxing is not
+justified, and the test gate is sufficient because strategies are a
+closed set registered at import time.
+
+Cross-ref: A1 §2.5.1 (observational equivalence at replay) depends on
+this contract. Violations here surface as `ResultDrift` at replay time.
 """
 
 from __future__ import annotations
@@ -35,7 +83,6 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
-
 
 # ================================================================
 #  Type aliases
@@ -49,6 +96,7 @@ MergeStrategy = Callable[[Any, Any, "BeliefContext"], Any]
 # ================================================================
 #  Strategy registry
 # ================================================================
+
 
 class StrategyRegistry:
     """
@@ -111,6 +159,7 @@ class StrategyRegistry:
 # "Monoid"      = associative + identity (but possibly not idempotent
 #                 or commutative).
 
+
 def strategy_max(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     """Higher value wins.  *Semilattice.*"""
     if a is None:
@@ -133,6 +182,7 @@ def strategy_union(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     """Set union.  *Semilattice.*"""
     return set(a or []) | set(b or [])
 
+
 def strategy_append(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     """
     List concatenation. Algebraic Properties:
@@ -146,6 +196,7 @@ def strategy_append(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     Callers must ensure each claim is folded exactly once.  *Monoid.*
     """
     return (a or []) + (b or [])
+
 
 def strategy_keep(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     """
@@ -248,6 +299,7 @@ def strategy_belief_adaptive(a: Any, b: Any, ctx: "BeliefContext") -> Any:
 #  Belief context
 # ================================================================
 
+
 @dataclass
 class BeliefContext:
     """
@@ -257,8 +309,9 @@ class BeliefContext:
     strategies can consult the agent's accumulated state without
     needing a direct reference to the full Belief object.
     """
-    fail_counts:       dict = field(default_factory=dict)
-    caution_threshold: int  = 3
+
+    fail_counts: dict = field(default_factory=dict)
+    caution_threshold: int = 3
 
     def total_failures(self) -> int:
         """Sum of all failure counters."""
@@ -269,7 +322,8 @@ class BeliefContext:
         if commitment_type is None:
             return 0
         return sum(
-            v for k, v in self.fail_counts.items()
+            v
+            for k, v in self.fail_counts.items()
             if isinstance(k, tuple) and len(k) == 2 and k[0] == commitment_type
         )
 
@@ -277,6 +331,7 @@ class BeliefContext:
 # ================================================================
 #  Claim
 # ================================================================
+
 
 @dataclass
 class Claim:
@@ -300,14 +355,15 @@ class Claim:
     outcomes, traces, fail records, expectations — are represented
     as Claims and processed through the same ⊕ operation.
     """
-    tag:      str
-    fields:   dict          = field(default_factory=dict)
-    kind:     Optional[str] = None
-    priority: int           = 0
+
+    tag: str
+    fields: dict = field(default_factory=dict)
+    kind: Optional[str] = None
+    priority: int = 0
     # ── Provenance metadata (all optional, filled by Belief.fold) ──
-    source:   str           = ""    # e.g. "step.search", "agent.react", "tool.file_read"
-    claim_id: str           = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    seq:      int           = -1    # logical clock — assigned by Belief.fold()
+    source: str = ""  # e.g. "step.search", "agent.react", "tool.file_read"
+    claim_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    seq: int = -1  # logical clock — assigned by Belief.fold()
 
     # -- field access ----------------------------------------------
 
@@ -362,6 +418,7 @@ BOTTOM = Claim(tag="⊥")
 # ================================================================
 #  merge:  ⊕_b
 # ================================================================
+
 
 def merge(
     c1: Claim,
@@ -431,8 +488,8 @@ def merge(
             strategy = registry.get(key)
             merged_fields[key] = strategy(v1, v2, ctx)
 
-    tag      = c1.tag if c1.priority >= c2.priority else c2.tag
-    kind     = c1.kind or c2.kind
+    tag = c1.tag if c1.priority >= c2.priority else c2.tag
+    kind = c1.kind or c2.kind
     priority = max(c1.priority, c2.priority)
 
     return Claim(tag, merged_fields, kind, priority)
@@ -441,6 +498,7 @@ def merge(
 # ================================================================
 #  reduce:  the single reduction rule
 # ================================================================
+
 
 def reduce(
     belief_claim: Claim,
@@ -471,6 +529,7 @@ def reduce(
 #  Default registry
 # ================================================================
 
+
 def make_default_registry() -> StrategyRegistry:
     """
     Create a :class:`StrategyRegistry` pre-loaded with strategies
@@ -483,9 +542,9 @@ def make_default_registry() -> StrategyRegistry:
     r = StrategyRegistry()
 
     # Structural fields (managed by Layer 1)
-    r.register("_history",      strategy_append)
-    r.register("_fail_log",     strategy_append)
-    r.register("_fail_counts",  strategy_counter_max)
+    r.register("_history", strategy_append)
+    r.register("_fail_log", strategy_append)
+    r.register("_fail_counts", strategy_counter_max)
     r.register("_expectations", strategy_expectations_merge)
 
     # Common domain conventions

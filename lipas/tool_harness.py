@@ -1,5 +1,5 @@
 """
-LIPAS · ToolHarness (P3.1).
+LIPAS · ToolHarness (P3.1 → P3.2).
 
 The smallest unit that combines tool invocation with auditable,
 idempotent record-keeping over the ClaimStore.  Mirrors LLMHarness
@@ -7,6 +7,14 @@ in shape; differs in that there is no retry layer (D6) and no
 streaming (D8).
 
 One call produces, depending on path:
+
+  Replay-driven paths (P3.2, RFC-001):
+    substitute  : replay_decision + effect_intent + effect_result + spend
+                  (no live execution).
+    refuse      : replay_decision + effect_intent + effect_rejected,
+                  then raises ReplayRefused.
+    fail        : replay_decision only, then raises ReplayMissing.
+    re-execute  : replay_decision + normal pipeline below.
 
   Pre-flight rejection paths:
     1. effect_intent (kind=tool_call)
@@ -30,7 +38,8 @@ One call produces, depending on path:
                                were spent regardless of outcome).
 
 Pre-flight order (top of call):
-    resolve tool → schema → guards → record_intent → execute
+    resolve tool → [replay decision] → schema → guards → budget
+                 → record_intent → execute
 
 Why no retry?
   Tools may carry side effects.  EXTERNAL_WRITE retried blindly
@@ -44,6 +53,10 @@ Spend computation:
   - other buckets: from tool.estimate_fn(arguments), per D2 contract
     (actual ≤ estimate; the harness records the estimate value)
 
+  For substitute, wall_seconds is folded as 0.0 (no live execution)
+  and tool_calls=1.0 still records (one logical call was charged to
+  the conversation).
+
 Tools that don't declare estimate_fn pay only the two system
 buckets.  Tools whose estimate_fn raises pay the system buckets
 plus a logged warning — degraded but not fatal.
@@ -53,7 +66,9 @@ The return value is an Anthropic-shaped tool_result dict:
     {"type": "tool_result", "tool_use_id": effect_id,
      "content": str, "is_error": bool}
 
-so ReActAgent's _message_from_tool_results works unchanged.
+so ReActAgent's _message_from_tool_results works unchanged. On
+``refuse`` and ``fail`` the harness does NOT return a dict; it
+raises (ReplayRefused / ReplayMissing) so the session terminates.
 """
 from __future__ import annotations
 
@@ -62,12 +77,18 @@ import logging
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from lipas.calculus import Claim
 from lipas.effect import EffectKind, ToolTarget
 from lipas.guard import Guard, GuardVerdict
+from lipas.replay_tools import (
+    ReplayDecision,
+    ReplayMissing,
+    ReplayRefused,
+    ToolReplayer,
+)
 from lipas.rows import RowSet
 from lipas.rows.capability import (
     CapabilityRow,
@@ -201,17 +222,31 @@ class ToolHarness:
         that also handle LLMTarget are run as-is; LLM-only guards
         return GuardVerdict.allow() for ToolTarget per the Guard
         protocol.
+    tool_replayer:
+        Optional ToolReplayer (P3.2, RFC-001).  When set, every call()
+        consults the replayer immediately after tool resolution and
+        before the schema gate; the returned ReplayDecision drives one
+        of substitute / re-execute / refuse / fail.  When None the
+        harness behaves identically to P3.1.
 
-    Note: there is no replay_cursor.  Tool replay (substitute /
-    re-execute / refuse, per SideEffectClass) belongs to a future
-    ToolReplayer that wraps this harness — it is a different policy
-    layer and mixing it with side-effecting execution is exactly
-    what the SideEffectClass enum guards against.
+        On the first call() against a configured replayer, the
+        harness folds the replayer's session-init claim
+        (TAG_REPLAY_DECISION, session_init=True) so the audit trail
+        records the exact replay configuration.
+
+        Tool replay is INDEPENDENT of LLMHarness's ReplayCursor; each
+        replays its own kind. Both may be active simultaneously over
+        a shared RowSet.
     """
 
     tools:  ToolRegistry
     rowset: RowSet
     guards: Sequence[Guard] = ()
+    tool_replayer: Optional[ToolReplayer] = None
+
+    # Internal: tracks whether the session-init claim has been folded
+    # for the configured replayer. One harness == one session.
+    _replay_session_started: bool = field(default=False, init=False, repr=False)
 
     # ── public API ─────────────────────────────────────────────
 
@@ -244,10 +279,10 @@ class ToolHarness:
 
         Returns
         -------
-        Anthropic-shaped tool_result dict.  ``content`` is a string
-        (success: stringified output; failure / rejection: short
-        diagnostic).  ``is_error`` is True on every non-success path
-        so the LLM observes the failure on its next iteration.
+        Anthropic-shaped tool_result dict on every non-raising path.
+        Raises ReplayMissing (STRICT_TAPE absent recording) or
+        ReplayRefused (LIVE_REROUTE refusing EXTERNAL_WRITE) when the
+        replay layer terminates the session.
         """
         eid  = effect_id or f"tool_{uuid.uuid4().hex[:12]}"
         args = dict(arguments)
@@ -268,6 +303,46 @@ class ToolHarness:
                 f"{', '.join(rej.available) or '<none>'}",
                 is_error=True,
             )
+
+        # ── 0a. Replay decision (P3.2 / RFC-001 §6.2) ──────
+        # Inserted BEFORE schema gate so substitute paths bypass
+        # schema/guards/budget entirely (the recorded run already
+        # passed those gates; re-evaluating against new state is a
+        # category error — same reasoning as LLM ReplayCursor).
+        if self.tool_replayer is not None:
+            if not self._replay_session_started:
+                self.rowset.fold(self.tool_replayer.session_init_claim())
+                self._replay_session_started = True
+
+            decision = self.tool_replayer.decide(tool, args)
+
+            # Fold the per-call decision claim regardless of the
+            # operation, so audit captures every replay choice
+            # (including fail/refuse).
+            self.rowset.fold(self.tool_replayer.decision_claim(
+                decision, target_effect_id=eid,
+            ))
+
+            if decision.operation == "fail":
+                # STRICT_TAPE found nothing matching. No intent /
+                # result folded — the session is being aborted, the
+                # decision claim alone is enough audit trail.
+                raise ReplayMissing(
+                    f"STRICT_TAPE: no recorded result for tool={tool.name!r} "
+                    f"args={args!r}"
+                )
+
+            if decision.operation == "substitute":
+                return self._do_replay_substitute(
+                    eid, tool, args, compensates, decision,
+                )
+
+            if decision.operation == "refuse":
+                self._do_replay_refuse(eid, tool, args, compensates, decision)
+                # _do_replay_refuse always raises; this point is unreachable.
+
+            # decision.operation == "re-execute": fall through to the
+            # normal pipeline below.
 
         # ── 1. Schema gate ──────────────────────────────────
         # _signature is set by Tool.__post_init__.  Bind() raises
@@ -356,6 +431,95 @@ class ToolHarness:
 
         # ── 8. Synthesize tool_result ───────────────────────
         return self._tool_result(eid, _stringify(output), is_error=False)
+
+    # ── replay execution helpers (P3.2) ────────────────────────
+
+    def _do_replay_substitute(
+        self,
+        eid: str,
+        tool: Tool,
+        args: Mapping[str, Any],
+        compensates: str | None,
+        decision: ReplayDecision,
+    ) -> dict:
+        """Mirror a recorded result into the target store without executing.
+
+        Folds:
+          - effect_intent  : built from the CURRENT tool's declaration
+                             (so the audit reflects the current
+                             SideEffectClass; class-mismatch resolution
+                             is recorded separately on the decision
+                             claim).
+          - effect_result  : copied verbatim from the recorded result,
+                             only F_EFFECT_ID overridden. F_STATUS,
+                             F_OUTPUT, F_SIDE_EFFECT, F_ATTEMPTS,
+                             F_ERROR all round-trip.
+          - resource_spent : tool_calls=1.0, wall_seconds=0.0.
+        """
+        recorded_node = decision.recorded_node
+        if recorded_node is None or recorded_node.result is None:
+            # Should never happen — the matrix only emits substitute
+            # when there is a recording with a result. Defensive.
+            raise RuntimeError(
+                f"replay substitute reached without a recorded result "
+                f"(decision={decision!r})"
+            )
+
+        self._fold_intent(eid, tool, args, compensates)
+
+        new_fields = dict(recorded_node.result.fields)
+        new_fields[F_EFFECT_ID] = eid
+        # F_KIND, F_STATUS, F_OUTPUT, F_SIDE_EFFECT, F_ATTEMPTS,
+        # F_ERROR (if present) copied verbatim.
+        self.rowset.fold(Claim(
+            tag=TAG_EFFECT_RESULT,
+            fields=new_fields,
+            source="tool_harness.replay.substitute",
+        ))
+
+        # Charge one logical tool call (it appeared in the
+        # conversation) with no wall time (no live execution).
+        self._fold_spend(eid, {"tool_calls": 1.0, "wall_seconds": 0.0})
+
+        output   = recorded_node.result.fields.get(F_OUTPUT)
+        is_error = recorded_node.result.fields.get(F_STATUS) == "error"
+        return self._tool_result(eid, _stringify(output), is_error=is_error)
+
+    def _do_replay_refuse(
+        self,
+        eid: str,
+        tool: Tool,
+        args: Mapping[str, Any],
+        compensates: str | None,
+        decision: ReplayDecision,
+    ) -> None:
+        """Fold intent + rejection for a refused replay, then raise.
+
+        Always raises ReplayRefused; never returns.
+        """
+        self._fold_intent(eid, tool, args, compensates)
+        mode_value = (
+            self.tool_replayer.mode.value
+            if self.tool_replayer is not None else "?"
+        )
+        self.rowset.fold(Claim(
+            tag=TAG_EFFECT_REJECTED,
+            fields={
+                F_EFFECT_ID: eid,
+                F_KIND:      EffectKind.TOOL_CALL.value,
+                F_REASON:    decision.reason,
+                F_DETAIL: {
+                    "declared_class":  decision.declared_class.value,
+                    "effective_class": decision.effective_class.value,
+                    "mode":            mode_value,
+                    "tool_name":       tool.name,
+                },
+            },
+            source="tool_harness.replay.refuse",
+        ))
+        raise ReplayRefused(
+            f"replay refused tool={tool.name!r} (reason={decision.reason})"
+        )
 
     # ── pre-flight: guards ─────────────────────────────────────
 
