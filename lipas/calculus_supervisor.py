@@ -1,30 +1,59 @@
 """
-lipas.calculus_supervisor — fold strategies for supervisor_* claims.
+lipas.calculus_supervisor — DEFERRED to Phase 5β.
 
-These strategies are A3-pure. They maintain a small projection that the
-agent loop can query to decide whether to honor a supervisor recommendation.
+This module is INTENTIONALLY non-functional in v0.1. Its original goal
+was to register tag-based fold strategies for supervisor_* claims and
+maintain a ``SupervisorState`` projection. But ``lipas.calculus``
+registers strategies by FIELD NAME, not by TAG — the two registration
+machineries are not aligned. Reconciling them is a Phase 5β design
+question (see B3-NOTES.md): it touches the meaning of "projection" as
+a primitive of the calculus.
 
-The projection itself is NOT the source of truth. The log is the source
-of truth. The projection is a convenience: equivalent to refolding from
-log on every read, but cheaper.
+Until that reconciliation lands:
+
+  - This module RAISES on import (tripwire). Any code that imports it,
+    including a future accidental ``__init__.py`` re-export, fails
+    loudly rather than silently registering nothing.
+
+  - The projection dataclasses (``RetryRec`` / ``EscalationRec`` /
+    ``SupervisorState``) are preserved BELOW the raise as future
+    reference. They are unreachable in v0.1 but stable as a type
+    sketch for 5β.
+
+  - Source of truth for supervisor recommendations remains the log
+    itself: ``store.filter(tag=TAG_SUPERVISOR_RETRY)`` etc. This is
+    O(N) per query but acceptable in v0.1 (tick frequency is low and
+    log sizes are bounded by the agent run).
+
+History
+-------
+Earlier drafts had:
+
+    from lipas.calculus import register_strategy   # symbol does not exist
+
+which made this module dead-on-arrival. The broken import is now
+removed; the raise below replaces it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional
 
-# TODO(B3-api): align registration mechanism with calculus.py.
-from lipas.calculus import register_strategy      # type: ignore
 
-from lipas.supervisor import (
-    TAG_SUPERVISOR_RETRY,
-    TAG_SUPERVISOR_TERMINATE,
-    TAG_SUPERVISOR_ESCALATE,
+# ── Tripwire ────────────────────────────────────────────────────────
+
+raise NotImplementedError(
+    "lipas.calculus_supervisor is deferred to Phase 5β: tag-based "
+    "projection registration. See module docstring and "
+    "docs/B3-NOTES.md. Use store.filter(tag=...) directly until then."
 )
 
 
-# --- Projection ------------------------------------------------------------
+# ── Preserved for future use (unreachable in v0.1) ─────────────────
+# Anything below this point is documentation, not live code. The
+# raise above unconditionally aborts module execution.
+
 
 @dataclass(frozen=True)
 class RetryRec:
@@ -45,59 +74,12 @@ class EscalationRec:
 class SupervisorState:
     """Rolling projection of supervisor recommendations.
 
-    Field semantics:
-      - `pending_retries` is append-only across folds. The loop is
-        responsible for matching honored retries to their originating
-        recommendations via lineage; this projection does not mutate
-        once an entry is in.
-      - `terminated` is monotone — once true, stays true. v0.1 does not
-        support un-terminate (same rationale as A4 §4.4 on un-revoke).
-      - `escalations` is append-only.
+    Field semantics (for 5β reference):
+      - ``pending_retries`` is append-only across folds.
+      - ``terminated`` is monotone — once true, stays true.
+      - ``escalations`` is append-only.
     """
-    pending_retries: tuple[RetryRec, ...] = ()
-    terminated:      bool                  = False
-    terminate_reason: Optional[str]        = None
-    escalations:     tuple[EscalationRec, ...] = ()
-
-
-# --- Strategies ------------------------------------------------------------
-
-# All three strategies are pure of (state, claim, ctx, registry). They
-# satisfy A3 trivially: only tuple/dataclass replacement, no I/O, no
-# clock, no env.
-
-@register_strategy(TAG_SUPERVISOR_RETRY)
-def _fold_supervisor_retry(state, claim, ctx, registry):
-    s: SupervisorState = state if state is not None else SupervisorState()
-    f = claim.fields
-    rec = RetryRec(
-        target_effect_id=f["target_effect_id"],
-        idempotency_key=f["idempotency_key"],
-        attempt_index=f["attempt_index"],
-        max_attempts=f["max_attempts"],
-        reason=f["reason"],
-    )
-    return replace(s, pending_retries=s.pending_retries + (rec,))
-
-
-@register_strategy(TAG_SUPERVISOR_TERMINATE)
-def _fold_supervisor_terminate(state, claim, ctx, registry):
-    s: SupervisorState = state if state is not None else SupervisorState()
-    if s.terminated:
-        # idempotent: first terminate wins. Multiple terminate claims
-        # are tolerated (predicates may double-fire across ticks); only
-        # the first reason is preserved for audit clarity.
-        return s
-    return replace(
-        s,
-        terminated=True,
-        terminate_reason=claim.fields["reason"],
-    )
-
-
-@register_strategy(TAG_SUPERVISOR_ESCALATE)
-def _fold_supervisor_escalate(state, claim, ctx, registry):
-    s: SupervisorState = state if state is not None else SupervisorState()
-    f = claim.fields
-    rec = EscalationRec(reason=f["reason"], payload=f.get("payload", {}))
-    return replace(s, escalations=s.escalations + (rec,))
+    pending_retries:  tuple[RetryRec, ...]    = ()
+    terminated:       bool                     = False
+    terminate_reason: Optional[str]            = None
+    escalations:      tuple[EscalationRec, ...] = ()

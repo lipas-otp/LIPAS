@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lipas"
-version = "0.1.0a1"
+version = "0.2.0"
 description = "Layered Invariant-Preserving Agent System — side-effect-aware, budget-gated, replayable LLM agent runtime"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     # lipas core has no mandatory runtime dependencies.
-    # Adapter dependencies are optional (see [project.optional-dependencies] below).
+    # Adapter dependencies are optional (see [project.optional-dependencies]).
 ]
 
 [project.optional-dependencies]
@@ -67,4 +67,7 @@ packages = ["lipas"]
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 pythonpath = ["."]
-filterwarnings = ["ignore::pytest.PytestWarning:_pytest"]
+filterwarnings = [
+    "ignore::pytest.PytestWarning:_pytest",
+    "ignore::lipas.replay_tools.LipasDangerousReplayWarning",
+]

@@ -1,6 +1,28 @@
 # Changelog
 
-## [0.1.0a1] — 2026 · First alpha
+## [0.2.0] — 2026-05-20
+
+Two themes: aligned the store's contract with database conventions
+(trust the substrate; stop re-checking invariants in callers), and
+added a thin testing layer that makes strategies cheaper to write
+correctly. No breaking changes since 0.1.0a1.
+
+### Added
+- **Initial SQLite-backed `ClaimStore`** — serializable persistence
+  for claim logs. In-memory store remains the default.
+- **`lipas.testing.deterministic_fold`** — context manager that traps
+  `time.time` and `os.environ` access inside fold strategies and
+  raises `StrategyContractViolation`. Drop it into a test to prove a
+  strategy is pure; no boilerplate, no framework buy-in.
+
+### Changed
+- Store contract realigned with database-style guarantees: callers
+  trust the substrate's consistency rather than re-asserting it.
+  Reduces ceremony in user-written strategies and agents.
+
+---
+
+## [0.1.0a1] — 2026-05-01 · First alpha
 
 This is the first public release of lipas. It is an alpha: the core
 algebra and harness contract are stable, but adapters are limited to

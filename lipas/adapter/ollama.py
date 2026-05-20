@@ -97,7 +97,7 @@ _DONE_REASON_MAP: dict[str, StopReason] = {
 }
 
 _DEFAULT_HOST = "http://localhost:11434"
-_DEFAULT_TIMEOUT_S = 120.0
+_DEFAULT_TIMEOUT_S = 500.0
 
 
 class OllamaAdapter:

@@ -49,6 +49,12 @@ from .types import (
     Usage,
 )
 
+from .session import (
+    open_session,
+    replay,
+    ReplaySession
+)
+
 __all__ = [
     # Core types
     "Message", "Usage", "ThinkingBlock", "ToolCall", "Reply",

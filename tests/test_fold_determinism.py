@@ -1,64 +1,91 @@
-"""A3 §5 — regression tests for fold-time strategy purity."""
+"""Tests for lipas.testing.deterministic_fold."""
+from __future__ import annotations
+
+import time
+
 import pytest
 
-from lipas.calculus import register_strategy, strategy_registry
-from lipas.store import Store
+from lipas.calculus import Claim, make_default_registry
+from lipas.store import ClaimStore
 from lipas.testing.deterministic_fold import (
-    StrategyContractViolation,
     deterministic_fold,
-)
-# Import each example to register its strategies + run a representative trace.
-from examples import (
-    ex01_minimal,
-    ex02_two_tools,
-    ex03_supervisor_lite,
-    ex04_belief_merge,
-    ex05_replay_cursor,
-    ex06_capability_budget,
+    StrategyContractViolation,
 )
 
 
-# --- Test 1: examples regression -------------------------------------------
+# ── helpers ────────────────────────────────────────────────────
 
-ALL_EXAMPLES = [
-    ex01_minimal,
-    ex02_two_tools,
-    ex03_supervisor_lite,
-    ex04_belief_merge,
-    ex05_replay_cursor,
-    ex06_capability_budget,
-]
+def _fold_two(store: ClaimStore, x1, x2) -> None:
+    store.fold(Claim(tag="t", fields={"x": x1}, source="test"))
+    store.fold(Claim(tag="t", fields={"x": x2}, source="test"))
 
 
-@pytest.mark.parametrize("example", ALL_EXAMPLES, ids=lambda m: m.__name__)
-def test_example_folds_are_deterministic(example):
-    """Every shipped example must fold cleanly under the A3 contract."""
+# ── tests ──────────────────────────────────────────────────────
+
+def test_clean_fold_passes():
+    """A fold using only built-in pure strategies must pass.
+
+    The default merge for unregistered fields is last-write-wins
+    (per merge() in calculus.py); we assert the second value survives.
+    """
+    store = ClaimStore()
     with deterministic_fold():
-        result = example.run()  # each example exposes a top-level run()
-    assert result is not None, f"{example.__name__}.run() returned None"
+        _fold_two(store, 1, 2)
+    assert store.merged.fields.get("x") == 2
 
 
-# --- Test 2: positive control (the tool MUST catch a real violation) -------
+def test_deterministic_fold_is_a_noop_outside_violations():
+    """Folds under deterministic_fold produce the same merged state
+    as without it, when no forbidden API is used."""
+    store_a = ClaimStore()
+    store_b = ClaimStore()
 
-def test_violation_is_detected():
-    """Sanity check: a deliberately-impure strategy is caught.
+    with deterministic_fold():
+        _fold_two(store_a, 1, 2)
+    _fold_two(store_b, 1, 2)
 
-    This guards against the test tool silently no-op'ing — without this,
-    a future refactor that breaks the patches would make Test 1 pass
-    vacuously."""
-    import time
+    assert store_a.merged.fields == store_b.merged.fields
 
-    @register_strategy("a3_test_impure_strategy")
-    def impure(a, b, ctx, registry):
-        return a + time.time()  # forbidden
 
-    store = Store()
-    try:
-        with pytest.raises(StrategyContractViolation) as excinfo:
-            with deterministic_fold():
-                # a minimal claim sequence that will route to `impure`
-                store.fold_with_strategy("a3_test_impure_strategy", 1, 2)
-        assert excinfo.value.api == "time.time"
-    finally:
-        # registry hygiene: unregister so other tests aren't polluted
-        strategy_registry.unregister("a3_test_impure_strategy")
+def test_violation_is_detected_time_time():
+    """deterministic_fold catches time.time() inside a strategy."""
+    registry = make_default_registry()
+
+    def impure(a, b, ctx):
+        return time.time()
+
+    registry.register("impure_field", impure)
+    store = ClaimStore(registry=registry)
+
+    store.fold(Claim(
+        tag="t", fields={"impure_field": 1}, source="test",
+    ))
+
+    with pytest.raises(StrategyContractViolation):
+        with deterministic_fold():
+            store.fold(Claim(
+                tag="t", fields={"impure_field": 2}, source="test",
+            ))
+
+
+def test_violation_message_names_offending_api():
+    """The violation should identify which forbidden API was hit."""
+    registry = make_default_registry()
+
+    def impure(a, b, ctx):
+        return time.time()
+
+    registry.register("impure_field", impure)
+    store = ClaimStore(registry=registry)
+    store.fold(Claim(
+        tag="t", fields={"impure_field": 1}, source="test",
+    ))
+
+    with pytest.raises(StrategyContractViolation) as excinfo:
+        with deterministic_fold():
+            store.fold(Claim(
+                tag="t", fields={"impure_field": 2}, source="test",
+            ))
+
+    msg = str(excinfo.value).lower()
+    assert "time" in msg

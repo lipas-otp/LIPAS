@@ -50,16 +50,26 @@ C4. **Determinism**. Predicates MUST be pure functions of ``(view, ctx)``
     ``attempt_index`` is computed from the rowset's prior supervisor_retry
     count plus retries proposed earlier in the same tick.
 
+C5. **Goal-blocked pairing (P4)**. Every ``supervisor_terminate`` and
+    ``supervisor_escalate`` claim folded by ``_emit_batch`` MUST be
+    immediately followed by a ``goal_blocked`` claim within the same
+    batch (i.e. the next ``seq``) whose ``source_claim_seq`` equals the
+    triggering claim's seq and whose ``source_tactic`` matches the
+    triggering tactic. This is a STRUCTURAL invariant, not a
+    convention — it is the substrate the ``goal_blocked_pairing`` lint
+    relies on, and it can only be enforced at the fold site (``_emit_batch``)
+    because no loop-layer ordering guarantees can recover it post-hoc.
+
 The first batch of tactics is ``retry / terminate / escalate_human``.
 The second batch (``degrade / circuit_break / compensate``) is deferred
 until concrete use cases land.
 
 Schema notes
 ------------
-Each supervisor_* claim carries ``F_SUP_SCHEMA_VERSION`` in ``fields`` to
-anticipate A2 (Claim Schema Evolution). When A2 lands, this field becomes
-the canonical entry point for upcasters. Until then it is purely
-informational.
+Each supervisor_* / goal_blocked claim carries ``schema_version`` in
+``fields`` to anticipate A2 (Claim Schema Evolution). When A2 lands,
+this field becomes the canonical entry point for upcasters. Until then
+it is purely informational.
 """
 
 from __future__ import annotations
@@ -79,11 +89,13 @@ __all__ = [
     "TAG_SUPERVISOR_RETRY",
     "TAG_SUPERVISOR_TERMINATE",
     "TAG_SUPERVISOR_ESCALATE",
+    "TAG_GOAL_BLOCKED",
     # Schema versions
     "SUPERVISOR_RETRY_V",
     "SUPERVISOR_TERMINATE_V",
     "SUPERVISOR_ESCALATE_V",
-    # Field-name constants
+    "GOAL_BLOCKED_V",
+    # supervisor_* field-name constants
     "F_SUP_SCHEMA_VERSION",
     "F_SUP_TARGET_EFFECT_ID",
     "F_SUP_IDEMPOTENCY_KEY",
@@ -91,6 +103,15 @@ __all__ = [
     "F_SUP_MAX_ATTEMPTS",
     "F_SUP_REASON",
     "F_SUP_PAYLOAD",
+    # goal_blocked field-name constants
+    "F_GB_SCHEMA_VERSION",
+    "F_GB_SOURCE_TACTIC",
+    "F_GB_SOURCE_CLAIM_SEQ",
+    "F_GB_REASON",
+    "F_GB_PAYLOAD",
+    # goal_blocked tactic values
+    "GB_TACTIC_TERMINATE",
+    "GB_TACTIC_ESCALATE_HUMAN",
     # Action / Policy types
     "Tactic",
     "RetryAction",
@@ -173,11 +194,14 @@ class Policy:
 TAG_SUPERVISOR_RETRY     = "supervisor_retry"
 TAG_SUPERVISOR_TERMINATE = "supervisor_terminate"
 TAG_SUPERVISOR_ESCALATE  = "supervisor_escalate"
+TAG_GOAL_BLOCKED         = "goal_blocked"
 
 SUPERVISOR_RETRY_V     = 1
 SUPERVISOR_TERMINATE_V = 1
 SUPERVISOR_ESCALATE_V  = 1
+GOAL_BLOCKED_V         = 1
 
+# supervisor_* fields
 F_SUP_SCHEMA_VERSION   = "schema_version"
 F_SUP_TARGET_EFFECT_ID = "target_effect_id"
 F_SUP_IDEMPOTENCY_KEY  = "idempotency_key"
@@ -185,6 +209,19 @@ F_SUP_ATTEMPT_INDEX    = "attempt_index"
 F_SUP_MAX_ATTEMPTS     = "max_attempts"
 F_SUP_REASON           = "reason"
 F_SUP_PAYLOAD          = "payload"
+
+# goal_blocked fields
+F_GB_SCHEMA_VERSION   = "schema_version"
+F_GB_SOURCE_TACTIC    = "source_tactic"
+F_GB_SOURCE_CLAIM_SEQ = "source_claim_seq"
+F_GB_REASON           = "reason"
+F_GB_PAYLOAD          = "payload"
+
+# goal_blocked tactic value-set (mirrors Tactic.*.value for the two
+# tactics that can produce a goal-block; kept as plain constants to
+# avoid coupling tape readers to the Tactic enum).
+GB_TACTIC_TERMINATE      = "terminate"
+GB_TACTIC_ESCALATE_HUMAN = "escalate_human"
 
 
 # ── Snapshot ────────────────────────────────────────────────────────
@@ -228,7 +265,7 @@ def _gen_idempotency_key(
 
 
 class Supervisor:
-    """See module docstring for normative contracts C1–C4.
+    """See module docstring for normative contracts C1–C5.
 
     Construction
     ------------
@@ -236,12 +273,10 @@ class Supervisor:
         Ordered ``(name, predicate)`` pairs. Order is for audit
         determinism only; predicates MUST NOT depend on it.
     rowset:
-        Sink for supervisor_* claims; also the source of truth for the
-        retry-cap tally. The rowset's HistoryRow SHOULD list
-        ``TAG_SUPERVISOR_*`` in its namespace (see ``rows/history.py``).
-        Folding into a rowset whose HistoryRow lacks them is permitted
-        — RowSet silently accepts tags outside any namespace — but
-        ``HistoryRow.event_count`` will under-report.
+        Sink for supervisor_* / goal_blocked claims; also the source of
+        truth for the retry-cap tally. The rowset's HistoryRow SHOULD
+        list ``TAG_SUPERVISOR_*`` and ``TAG_GOAL_BLOCKED`` in its
+        namespace (see ``rows/history.py``).
     session_id:
         Opaque scope for idempotency-key hashing. Two Supervisors with
         different session_ids over the same target produce different
@@ -257,9 +292,12 @@ class Supervisor:
         ctx     = rowset.store.ctx
         emitted = supervisor.tick(view, ctx)
 
-    The returned list is the claims folded in this tick, in the order
-    their predicates fired. Behaviours MAY scan it for terminate /
-    escalate to perform early loop exit (see ReActAgent).
+    The returned list is the claims folded in this tick, in fold order.
+    It INCLUDES auto-paired ``goal_blocked`` claims that immediately
+    follow ``supervisor_terminate`` / ``supervisor_escalate``.
+    Behaviours MAY scan it for terminate / escalate to perform early
+    loop exit (see ReActAgent) — goal_blocked claims appear after their
+    triggers and are transparent to loop-exit logic.
     """
 
     def __init__(
@@ -279,10 +317,11 @@ class Supervisor:
     def tick(self, view: EffectView, ctx: BeliefContext) -> list[Claim]:
         """One supervisor pass.
 
-        Returns the claims that were folded, in firing order. Source of
-        truth is still the rowset's store; the return value is a
-        convenience for behaviours that want to react to terminate /
-        escalate without re-querying.
+        Returns the claims that were folded, in fold order, including
+        auto-paired goal_blocked claims. Source of truth is still the
+        rowset's store; the return value is a convenience for
+        behaviours that want to react to terminate / escalate without
+        re-querying.
         """
         snapshot = _TickSnapshot(view=view, ctx=ctx)
 
@@ -322,13 +361,12 @@ class Supervisor:
 
             pending.append((action, rule.name, attempt_index))
 
-        # Phase 2 — convert to claims and fold.
+        # Phase 2 — convert to claims and fold (with goal_blocked pairing).
         claims = [
             self._action_to_claim(a, name, idx)
             for (a, name, idx) in pending
         ]
-        self._emit_batch(claims)
-        return claims
+        return self._emit_batch(claims)
 
     # ----- private -----
 
@@ -344,14 +382,94 @@ class Supervisor:
                 out[tgt] = out.get(tgt, 0) + 1
         return out
 
-    def _emit_batch(self, claims: list[Claim]) -> None:
-        # Atomicity caveat: ``RowSet.fold`` is per-claim. A crash mid-loop
-        # leaves a partial batch. B1 (durable storage) collapses this to
-        # an atomic write; until then, recovery from the log is sufficient
-        # because every supervisor_* claim is independently meaningful
-        # (no cross-claim invariants within a single tick's emissions).
+    def _emit_batch(self, claims: list[Claim]) -> list[Claim]:
+        """Fold all claims; auto-pair terminate/escalate with goal_blocked.
+
+        STRUCTURAL INVARIANT (C5)
+        -------------------------
+        For every terminate/escalate claim folded here, the very next
+        claim folded MUST be a ``goal_blocked`` whose
+        ``source_claim_seq`` equals the triggering claim's seq.
+
+        This is the only fold site that can guarantee adjacency-by-seq
+        between the trigger and its goal_blocked. Other layers (loops,
+        replay) MUST NOT inject claims between them; doing so will
+        trip the ``goal_blocked_pairing`` lint.
+
+        Atomicity caveat: ``RowSet.fold`` is per-claim. A crash mid-loop
+        between a terminate and its goal_blocked leaves an unpaired
+        terminate. B1 (durable storage) will collapse this to an atomic
+        write; until then, the lint flags such orphans on recovery.
+
+        Implementation note
+        -------------------
+        ``Claim`` is frozen; ``RowSet.fold`` does NOT write ``seq`` back
+        into the caller's instance — it stores a seq-assigned copy in
+        ``store.log``. We therefore re-fetch from ``store.log[-1]``
+        after each fold so both (a) the goal_blocked's
+        ``source_claim_seq`` and (b) the returned list see the correct seq.
+        """
+        out: list[Claim] = []
         for c in claims:
             self._rowset.fold(c)
+            folded = self._rowset.store.log[-1]
+            out.append(folded)
+            if folded.tag in (TAG_SUPERVISOR_TERMINATE, TAG_SUPERVISOR_ESCALATE):
+                gb = self._build_goal_blocked(folded, folded.seq)
+                self._rowset.fold(gb)
+                out.append(self._rowset.store.log[-1])
+        return out
+
+    # def _last_folded_seq(self) -> int:
+    #     """Return the seq of the most-recently-folded claim.
+    #
+    #     Reads from ``store.log[-1]`` so we don't depend on whether
+    #     ``Claim`` instances are mutated in place by fold.
+    #     """
+    #     return self._rowset.store.log[-1].seq
+
+    def _build_goal_blocked(self, source: Claim, source_seq: int) -> Claim:
+        """Construct the goal_blocked claim paired to a terminate/escalate.
+
+        Field choices (P4, locked):
+          - source_tactic    : the tactic string of the triggering claim;
+                               used by lint to verify trigger/pair tag
+                               consistency.
+          - source_claim_seq : the seq of the triggering claim; the
+                               primary back-reference. Mandatory.
+          - reason           : copied verbatim from the triggering claim
+                               so tape readers don't have to cross-ref.
+          - payload          : present iff the trigger is escalate;
+                               carries the same payload (defensively
+                               copied through the trigger already).
+        """
+        if source.tag == TAG_SUPERVISOR_TERMINATE:
+            tactic = GB_TACTIC_TERMINATE
+            payload = None
+        elif source.tag == TAG_SUPERVISOR_ESCALATE:
+            tactic = GB_TACTIC_ESCALATE_HUMAN
+            payload = dict(source.fields.get(F_SUP_PAYLOAD, {}))
+        else:
+            # Defensive — only the two tags above reach this builder.
+            raise AssertionError(
+                f"_build_goal_blocked called with unexpected tag "
+                f"{source.tag!r}"
+            )
+
+        fields: dict = {
+            F_GB_SCHEMA_VERSION:   GOAL_BLOCKED_V,
+            F_GB_SOURCE_TACTIC:    tactic,
+            F_GB_SOURCE_CLAIM_SEQ: source_seq,
+            F_GB_REASON:           source.fields.get(F_SUP_REASON, ""),
+        }
+        if payload is not None:
+            fields[F_GB_PAYLOAD] = payload
+
+        return Claim(
+            tag=TAG_GOAL_BLOCKED,
+            fields=fields,
+            source=f"supervisor:{self._session_id}",
+        )
 
     @staticmethod
     def _validate_action(action: object, rule_name: str) -> None:

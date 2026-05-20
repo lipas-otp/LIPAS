@@ -1,120 +1,96 @@
 # lipas
 
-lipas is an LLM agent runtime where every effect is a recorded fact.
-Tool calls declare their side-effect class. Budgets are enforced
-pre-flight. LLM calls can be replayed deterministically.
+An LLM agent runtime where every effect is a recorded fact —
+**so you can replay any run, audit any decision, and never get a
+surprise bill.**
 
-Status: alpha — Ollama tested, single-agent, in-memory store. See
-Known limits below.
+```python
+from lipas.tools import tool, SideEffectClass, ToolHarness
+from lipas.store import ClaimStore
 
----
+@tool(side_effect=SideEffectClass.PURE)
+def add(a: float, b: float) -> float:
+    return a + b
 
-## What makes lipas different
+store = ClaimStore()
+harness = ToolHarness(store=store, tools=[add])
 
-**Side-effect classification is required, not optional.**
-Every tool declares `PURE` / `READ_ONLY` / `IDEMPOTENT_WRITE` /
-`EXTERNAL_WRITE` at registration. The harness uses this to gate retries,
-enforce guards, and determine replay safety — without any user code.
+result = harness.call("add", {"a": 2, "b": 3})
+print(result)                       # 5
+print(len(store.claims))            # 3 — intent, result, spend
+```
 
-**Budgets are enforced before the call fires.**
-A pre-flight check compares current spend + estimated cost against your
-declared limit. If it would exceed, the call is not issued, and a typed
-rejection claim is folded. You get a bill-shaped surprise exactly never.
+That's it. Three claims in an append-only store, queryable by tag,
+ready to replay. No decorator soup, no config file, no daemon.
 
-**LLM calls are deterministically replayable.**
-Record a run. Replay it. The LLM adapter is short-circuited — no network,
-no tokens, no variance. Use this for debugging, counterfactual testing,
-or re-running a session against tighter budgets to see where it would
-have been rejected.
-
-**The audit trail is structural, not textual.**
-Every call produces `effect_intent` → `effect_result` → `resource_spent`
-claims in an append-only store. Query by tag, filter by tool name,
-walk effect lineage — without parsing logs.
+> **Status:** Single-agent, in-memory/SQLite, Ollama-tested.
+> See [Known limits](#known-limits-alpha) before production use.
 
 ---
 
-## What's in this alpha version
+## Why lipas
 
-- Single-agent ReAct loop with full effect-log audit trail
-- Side-effect-aware tool harness with pre-flight budget gate
-- Deterministic LLM replay via `ReplayCursor` and `ReplayingAdapter`
-- Custom policy guards — `allow` / `deny` with structured reason,
-  uniform across LLM and tool calls
+Four things you get for free, just by registering a tool:
 
-**Not in the alpha version:** streaming output, multi-agent orchestration,
-supervision tree (Phase 4), tool-side replay substitution (Phase 4+),
-persistent claim store (in-memory only).
+| You write | lipas gives you |
+|---|---|
+| `@tool(side_effect=PURE)` | retries are safe, replay is deterministic |
+| `CapabilityRow(budgets={...})` | pre-flight rejection — never overrun |
+| `Guard.check(...)` | typed deny reasons folded as claims |
+| `harness.call(...)` | full `intent → result → spend` audit trail |
+
+Each maps to a runnable example — see [Quickstart](#quickstart).
 
 ---
 
 ## Quickstart
 
-Requires [Ollama](https://ollama.com) for the default examples.
-No API key needed.
-
 ```bash
-# 1. Start Ollama and pull a model
-ollama serve &
-ollama pull gemma4           # or: the other models
-
-# 2. Install lipas
 pip install -e .
-pip install httpx            # required by OllamaAdapter
-
-# 3. Run demos in order
-python examples/01_single_call.py        # happy path + audit trail
-python examples/02_budget.py             # pre-flight budget rejection
-python examples/03_guard.py              # guard rejection
-python examples/04_replay.py             # single-call LLM replay
-python examples/05_react_calculator.py   # ReAct + ToolHarness end-to-end
-python examples/06_react_replay.py       # replay an entire ReAct run
+python examples/0x_xxx.py
 ```
 
-> **Ollama version:** tested with Ollama ≥ 0.3. If `gemma4` is
-> unavailable on your version, substitute any chat model you have
-> pulled (`ollama list` to check).
+Note, you may need to install ollama and pull models:
+
+```bash
+ollama serve &
+ollama pull gemma4  # or any chat model you have
+```
+
+> If `gemma4` isn't on your version, run `ollama list` and substitute.
+
 
 ---
 
-## Core concepts
+## Five-minute tour
 
-### Claim
+### Claims — the only state primitive
 
-The atomic unit of state. Every event in lipas — an LLM call, a tool
-result, a resource spend, a guard rejection — is a `Claim` folded into
-an append-only `ClaimStore`. Claims are idempotent: re-delivering the
-same claim is always a no-op, and the delivery order does not matter.
+Every event is a `Claim` folded into an append-only `ClaimStore`.
+LLM call, tool result, budget spend, guard rejection — same shape,
+same merge rule, same query API. Claims are idempotent: redelivery
+is a no-op, order doesn't matter.
 
-Guarantees are neither bolted on nor feature list — they're consequences.
-An algebraic operation (claim merge, ⊕) and a three-row partition of
-agent state. You don't need to read the foundations to use lipas —
-but if you want to know why deterministic replay is achievable at
-all, or convince yourself the invariants actually hold, start with
-assist/one-calculus.md and assist/three-rows.md .
+If you want to know **why** that gives you deterministic replay,
+read `assist/one-calculus.md`. If you just want to use lipas,
+you don't have to.
 
-### SideEffectClass
+### SideEffectClass — required, not optional
 
 ```python
-from lipas.tools import tool, SideEffectClass
-
 @tool(side_effect=SideEffectClass.PURE)
-def add(a: float, b: float) -> float:
-    """Return the sum of two numbers."""
-    return a + b
+def add(a: float, b: float) -> float: ...
 
 @tool(side_effect=SideEffectClass.EXTERNAL_WRITE)
-def send_email(to: str, subject: str, body: str) -> dict:
-    """Send email. Non-idempotent — requires guard approval."""
-    ...
+def send_email(to: str, subject: str, body: str) -> dict: ...
 ```
 
-`side_effect` is **required**. The harness uses it to decide:
-- whether to retry on failure (only `PURE`, `READ_ONLY`, `IDEMPOTENT_WRITE`)
-- whether to run guards (always for `EXTERNAL_WRITE`)
-- whether replay is safe (see [Replay](#replay))
+The harness reads `side_effect` and decides — without your code —
+whether to retry, whether to run guards, whether replay is safe.
+Forgetting the annotation is a registration-time error, not a
+runtime surprise.
 
-### Budgets
+### Budgets — enforced before the call fires
 
 ```python
 from lipas.rows.capability import CapabilityRow
@@ -127,53 +103,45 @@ CapabilityRow(budgets={
 })
 ```
 
-Budgets are per-bucket hard limits. The pre-flight check runs before
-every call. The fold-time gate catches any bypass (e.g. out-of-band
-claims). Overruns are recorded truthfully — the ledger is never falsified.
+Pre-flight: `current_spend + estimated_cost > limit` ⇒ call is
+rejected and a typed claim is folded. The fold-time gate catches
+any out-of-band bypass. The ledger is never falsified.
 
-### Guards
+### Guards — uniform across LLM and tool
 
 ```python
-from lipas.guard import Guard, GuardVerdict, LLMTarget, ToolTarget
-
 class NoExternalOnWeekends(Guard):
     def check(self, target, rowset) -> GuardVerdict:
-        if isinstance(target, ToolTarget):
-            if target.tool.side_effect == SideEffectClass.EXTERNAL_WRITE:
-                if datetime.now().weekday() >= 5:
-                    return GuardVerdict.deny(
-                        "weekend_policy", detail={"day": "weekend"}
-                    )
+        if isinstance(target, ToolTarget) \
+                and target.tool.side_effect == SideEffectClass.EXTERNAL_WRITE \
+                and datetime.now().weekday() >= 5:
+            return GuardVerdict.deny("weekend_policy", detail={"day": "weekend"})
         return GuardVerdict.allow()
 ```
 
-Guards run in the pre-flight pipeline, after budget checks. First
-`deny` wins. The reason and detail are folded as a typed claim.
+First `deny` wins. Reason and detail are folded as claims, not logged.
 
 ---
 
 ## Replay
 
-**One-line summary:** LLM calls replay deterministically; tool calls
-re-execute (in this alpha version).
+**One-line summary:** LLM calls replay deterministically;
+tool calls re-execute.
 
 ### LLM replay
 
-`ReplayCursor` short-circuits the LLM harness: the recorded `Reply`
-is returned without invoking the adapter, without folding new effect
-claims, without touching the network.
+- `ReplayCursor` short-circuits the harness — recorded `Reply`
+  returned, no network, no token spend, no new claims.
+- `ReplayingAdapter` drives the harness normally with recorded
+  replies, folding a fresh audit trail. Use this to re-run against
+  tighter budgets or stricter guards.
+- `strict_match=True` (default) rejects replays whose `model` or
+  `system` don't match the recorded intent.
+  See `examples/06_react_replay.py` Run 3.
 
-`ReplayingAdapter` is the alternative: drive the harness normally with
-recorded replies as a fake adapter. A fresh audit trail is folded into
-a new store — useful for re-running against changed budgets or guards.
+### Tool re-execution
 
-`strict_match=True` (default) rejects replays where `model` or
-`system` don't match the recorded intent. See `examples/06_react_replay.py`
-Run 3 for the rejection demo.
-
-### Tool re-execution (alpha version)
-
-| Class | Re-execution behavior | Safe to replay? |
+| Class | Behavior | Safe to replay? |
 |---|---|---|
 | `PURE` | Recomputed; result identical | ✅ Yes |
 | `READ_ONLY` | Re-fetched; result may differ | ⚠️ Idempotent, not deterministic |
@@ -181,25 +149,23 @@ Run 3 for the rejection demo.
 | `EXTERNAL_WRITE` | **Re-fires the side-effect** | ❌ Re-sends email, re-charges card |
 
 `examples/06_react_replay.py` uses only `PURE` tools, so its replay
-is fully deterministic. For runs with `EXTERNAL_WRITE` tools, treat
-replay as LLM-deterministic-only until v0.2.
+is fully deterministic. For `EXTERNAL_WRITE` tools, treat replay as
+LLM-deterministic-only until v0.2.
 
 `ToolReplayer` — which substitutes recorded outputs for non-`PURE`
 tools — arrives in Phase 4 alongside the supervision tree and
-write-ahead log. The side-effect algebra is already in place; only the
-policy layer is missing.
+write-ahead log. The side-effect algebra is already in place; only
+the policy layer is missing.
 
 ---
 
-## Known limits (alpha)
+## Known limits
 
 - **Crash-safety window:** the gap between tool execution and
   `effect_result` fold is documented but not closed. Phase 4's
   write-ahead log closes it.
-- **In-memory store only:** `ClaimStore` does not persist across
-  process restarts. Persistent backends in a future release.
-- **No streaming to caller:** the harness assembles streamed LLM
-  responses internally; the caller receives the completed `Reply`.
+- **No streaming to caller:** streamed LLM responses are assembled
+  internally; the caller receives the completed `Reply`.
 - **Single agent only:** multi-agent orchestration is out of scope
   until the supervision tree (Phase 4) is stable.
 
@@ -222,4 +188,3 @@ policy layer is missing.
 ## License
 
 [Apache License 2.0](LICENSE)
-

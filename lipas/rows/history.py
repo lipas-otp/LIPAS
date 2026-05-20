@@ -20,6 +20,14 @@ human escalations). No invariant; first-write-wins under the default
 strategy. The Supervisor module (lipas.supervisor) is the canonical
 producer; readers consume them via store.filter(tag=...) or
 HistoryRow.project()['event_count'].
+
+P4 — goal_blocked is the structural pair to supervisor_terminate /
+supervisor_escalate: every terminate/escalate is followed by a
+goal_blocked in the same _emit_batch call (see Supervisor C5). It is
+also pure audit; row-side validation lives in lipas.lint
+(``goal_blocked_pairing``) rather than here, because the invariant is
+cross-claim (next-seq adjacency + back-reference equality) and
+HistoryRow's check_invariants signature only sees one claim at a time.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from ..supervisor import (
     TAG_SUPERVISOR_RETRY,
     TAG_SUPERVISOR_TERMINATE,
     TAG_SUPERVISOR_ESCALATE,
+    TAG_GOAL_BLOCKED,
 )
 from ..store import ClaimStore
 
@@ -54,6 +63,12 @@ class HistoryRow:
             TAG_SUPERVISOR_RETRY,
             TAG_SUPERVISOR_TERMINATE,
             TAG_SUPERVISOR_ESCALATE,
+            # P4 — goal_blocked: structural pair to terminate/escalate.
+            # Lives here so it counts toward event_count and is visible
+            # to readers walking the history namespace; cross-claim
+            # pairing invariant is enforced by lipas.lint, not by
+            # this row.
+            TAG_GOAL_BLOCKED,
         })
     )
 
@@ -69,9 +84,11 @@ class HistoryRow:
     def check_invariants(self, claim: Claim, store: ClaimStore) -> list[str]:
         # The epistemic row has no hard gates.  Under semilattice
         # semantics, accepting a duplicate observation is a no-op.
-        # Replay-decision and supervisor_* claims also need no
-        # validation: their producers (ToolReplayer, Supervisor) build
-        # them and they are pure audit.
+        # Replay-decision / supervisor_* / goal_blocked claims also
+        # need no validation: their producers (ToolReplayer,
+        # Supervisor) build them and they are pure audit.  Cross-claim
+        # invariants (e.g. terminate ↔ goal_blocked pairing) are
+        # checked by lipas.lint, not here.
         return []
 
     def project(self, store: ClaimStore) -> dict:
