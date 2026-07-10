@@ -31,8 +31,6 @@ from lipas.rows.history import HistoryRow
 from lipas.tool_harness import ToolHarness
 
 
-pytestmark = pytest.mark.asyncio
-
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -91,6 +89,7 @@ def make_replay_harness(tools, rs_live, fresh_rowset):
 
 class TestSubstitute:
 
+    @pytest.mark.asyncio
     async def test_output_byte_equivalent(
         self, tools, fresh_rowset, recorded,
     ):
@@ -103,6 +102,7 @@ class TestSubstitute:
         assert rep_a["content"] == out_a["content"]
         assert rep_b["content"] == out_b["content"]
 
+    @pytest.mark.asyncio
     async def test_full_effect_triple_mirrored(
         self, tools, fresh_rowset, recorded,
     ):
@@ -119,6 +119,7 @@ class TestSubstitute:
         assert counts.get("call_result")  == 2
         assert counts.get("resource_spent", 0) >= 2  # tool_calls × 2
 
+    @pytest.mark.asyncio
     async def test_charges_tool_calls_not_wall_seconds(
         self, tools, fresh_rowset, recorded,
     ):
@@ -135,6 +136,7 @@ class TestSubstitute:
         assert proj["tool_calls"]["spent"]   == 2.0
         assert proj["wall_seconds"]["spent"] == 0.0
 
+    @pytest.mark.asyncio
     async def test_decision_per_substituted_call(
         self, tools, fresh_rowset, recorded,
     ):
@@ -151,6 +153,7 @@ class TestSubstitute:
 
 class TestStrictTapeMiss:
 
+    @pytest.mark.asyncio
     async def test_raises_replay_missing(
         self, tools, fresh_rowset, recorded,
     ):
@@ -162,6 +165,7 @@ class TestStrictTapeMiss:
                 tool_name="add", arguments={"a": 999, "b": 999},
             )
 
+    @pytest.mark.asyncio
     async def test_fail_decision_logged(
         self, tools, fresh_rowset, recorded,
     ):
@@ -175,6 +179,7 @@ class TestStrictTapeMiss:
 
         assert "fail" in operations(rs_replay.store)
 
+    @pytest.mark.asyncio
     async def test_no_effect_triple_on_miss(
         self, tools, fresh_rowset, recorded,
     ):
@@ -193,6 +198,7 @@ class TestStrictTapeMiss:
         assert counts.get("call_result",  0) == 0
         assert counts.get("resource_spent", 0) == 0
 
+    @pytest.mark.asyncio
     async def test_miss_does_not_consume_remaining_recordings(
         self, tools, fresh_rowset, recorded,
     ):
@@ -216,6 +222,7 @@ class TestStrictTapeMiss:
 
 class TestSessionInit:
 
+    @pytest.mark.asyncio
     async def test_logged_before_first_per_call_decision(
         self, tools, fresh_rowset, recorded,
     ):
@@ -228,6 +235,7 @@ class TestSessionInit:
         assert ops, "expected at least one decision claim"
         assert ops[0] == "session_init"
 
+    @pytest.mark.asyncio
     async def test_logged_exactly_once(
         self, tools, fresh_rowset, recorded,
     ):
@@ -239,6 +247,7 @@ class TestSessionInit:
 
         assert operations(rs_replay.store).count("session_init") == 1
 
+    @pytest.mark.asyncio
     async def test_present_even_when_first_call_misses(
         self, tools, fresh_rowset, recorded,
     ):
@@ -263,6 +272,7 @@ class TestHistoryRowIntegration:
     def test_namespace_owns_replay_decision_tag(self):
         assert TAG_REPLAY_DECISION in HistoryRow().namespace
 
+    @pytest.mark.asyncio
     async def test_decisions_visible_in_projection(
         self, tools, fresh_rowset, recorded,
     ):
@@ -278,6 +288,7 @@ class TestHistoryRowIntegration:
         proj = hist.project(rs_replay.store)
         assert proj["event_count"] >= 3
 
+    @pytest.mark.asyncio
     async def test_decision_claims_carry_operation_field(
         self, tools, fresh_rowset, recorded,
     ):
@@ -295,6 +306,7 @@ class TestHistoryRowIntegration:
 
 class TestStoreIsolation:
 
+    @pytest.mark.asyncio
     async def test_replay_does_not_mutate_live_store(
         self, tools, fresh_rowset, recorded,
     ):
@@ -369,6 +381,7 @@ class TestDecidePresent:
         ("IDEMPOTENT_WRITE", "upsert_thing", {"key": "k", "value": "v"}),
         ("EXTERNAL_WRITE",   "send_thing",   {"target": "t", "payload": "p"}),
     ])
+    @pytest.mark.asyncio
     async def test_strict_tape_substitutes_every_class(
         self, all_tools, recorded_all_classes, class_name, tool_name, args,
     ):
@@ -384,6 +397,7 @@ class TestDecidePresent:
         ("upsert_thing", {"key": "k", "value": "v"}),
         ("send_thing",   {"target": "t", "payload": "p"}),
     ])
+    @pytest.mark.asyncio
     async def test_best_effort_substitutes_every_class(
         self, all_tools, recorded_all_classes, tool_name, args,
     ):
@@ -391,6 +405,7 @@ class TestDecidePresent:
         d = r.decide(get_tool(all_tools, tool_name), args)
         assert d.operation == "substitute"
 
+    @pytest.mark.asyncio
     async def test_live_reroute_pure_re_executes(
         self, all_tools, recorded_all_classes,
     ):
@@ -399,6 +414,7 @@ class TestDecidePresent:
         assert d.operation == "re-execute"
         assert d.recorded_node is not None  # match was found, just not used
 
+    @pytest.mark.asyncio
     async def test_live_reroute_read_only_re_executes(
         self, all_tools, recorded_all_classes,
     ):
@@ -406,6 +422,7 @@ class TestDecidePresent:
         d = r.decide(get_tool(all_tools, "read_thing"), {"q": "Q1"})
         assert d.operation == "re-execute"
 
+    @pytest.mark.asyncio
     async def test_live_reroute_idempotent_downgrades_to_substitute(
         self, all_tools, recorded_all_classes,
     ):
@@ -423,6 +440,7 @@ class TestDecidePresent:
             for w in caught
         )
 
+    @pytest.mark.asyncio
     async def test_live_reroute_external_write_refuses_by_default(
         self, all_tools, recorded_all_classes,
     ):
@@ -434,6 +452,7 @@ class TestDecidePresent:
         assert d.operation == "refuse"
         assert d.reason == "replay:refused_external"
 
+    @pytest.mark.asyncio
     async def test_live_reroute_external_write_with_optin_re_executes(
         self, all_tools, recorded_all_classes,
     ):
@@ -462,6 +481,7 @@ class TestDecidePresent:
 class TestDecideAbsent:
     """RFC-001 §4: no recording matches (tool, args)."""
 
+    @pytest.mark.asyncio
     async def test_strict_tape_fails_on_any_class(
         self, all_tools, recorded_all_classes,
     ):
@@ -479,6 +499,7 @@ class TestDecideAbsent:
     @pytest.mark.parametrize("mode", [
         ReplayMode.BEST_EFFORT, ReplayMode.LIVE_REROUTE,
     ])
+    @pytest.mark.asyncio
     async def test_pure_and_read_only_re_execute_when_absent(
         self, all_tools, recorded_all_classes, mode,
     ):
@@ -493,6 +514,7 @@ class TestDecideAbsent:
     @pytest.mark.parametrize("mode", [
         ReplayMode.BEST_EFFORT, ReplayMode.LIVE_REROUTE,
     ])
+    @pytest.mark.asyncio
     async def test_external_write_refuses_when_absent(
         self, all_tools, recorded_all_classes, mode,
     ):
@@ -507,6 +529,7 @@ class TestDecideAbsent:
     @pytest.mark.parametrize("mode", [
         ReplayMode.BEST_EFFORT, ReplayMode.LIVE_REROUTE,
     ])
+    @pytest.mark.asyncio
     async def test_external_write_with_optin_re_executes_when_absent(
         self, all_tools, recorded_all_classes, mode,
     ):
@@ -530,6 +553,7 @@ class TestDecideAbsent:
     @pytest.mark.parametrize("mode", [
         ReplayMode.BEST_EFFORT, ReplayMode.LIVE_REROUTE,
     ])
+    @pytest.mark.asyncio
     async def test_idempotent_warns_and_re_executes_when_absent(
         self, all_tools, recorded_all_classes, mode,
     ):
@@ -569,6 +593,7 @@ class TestClassMismatch:
         object.__setattr__(clone, "side_effect", new_class)
         return clone
 
+    @pytest.mark.asyncio
     async def test_upgrade_warns_and_uses_stricter(
         self, all_tools, recorded_all_classes,
     ):
@@ -587,6 +612,7 @@ class TestClassMismatch:
             for w in caught
         )
 
+    @pytest.mark.asyncio
     async def test_strict_tape_rejects_downgrade(
         self, all_tools, recorded_all_classes,
     ):
@@ -598,6 +624,7 @@ class TestClassMismatch:
         with pytest.raises(LipasReplayClassDowngradeError):
             r.decide(flipped, {"target": "t", "payload": "p"})
 
+    @pytest.mark.asyncio
     async def test_non_strict_downgrade_requires_optin(
         self, all_tools, recorded_all_classes,
     ):
@@ -608,6 +635,7 @@ class TestClassMismatch:
         with pytest.raises(LipasReplayClassDowngradeError):
             r.decide(flipped, {"target": "t", "payload": "p"})
 
+    @pytest.mark.asyncio
     async def test_non_strict_downgrade_with_optin_warns(
         self, all_tools, recorded_all_classes,
     ):
@@ -634,6 +662,7 @@ class TestClassMismatch:
 
 class TestObservabilityOnly:
 
+    @pytest.mark.asyncio
     async def test_external_write_with_obs_only_treated_as_read_only(
         self, all_tools, recorded_all_classes,
     ):
@@ -655,6 +684,7 @@ class TestObservabilityOnly:
 
 class TestFrozenWindow:
 
+    @pytest.mark.asyncio
     async def test_explicit_low_cap_hides_all_recordings(
         self, all_tools, recorded_all_classes,
     ):
@@ -668,6 +698,7 @@ class TestFrozenWindow:
         d = r.decide(get_tool(all_tools, "add"), {"a": 1, "b": 2})
         assert d.operation == "fail"
 
+    @pytest.mark.asyncio
     async def test_construction_captures_view_max_seq(
         self, all_tools, recorded_all_classes,
     ):
@@ -675,6 +706,7 @@ class TestFrozenWindow:
         assert isinstance(r.frozen_max_seq, int)
         assert r.frozen_max_seq >= 0
 
+    @pytest.mark.asyncio
     async def test_post_construction_recordings_invisible(
         self, all_tools, fresh_rowset,
     ):
@@ -722,6 +754,7 @@ class TestConstruction:
         )
         assert r.frozen_max_seq is None
 
+    @pytest.mark.asyncio
     async def test_live_reroute_with_external_optin_warns_at_construction(
         self, all_tools, recorded_all_classes,
     ):
@@ -743,6 +776,7 @@ class TestConstruction:
 
 class TestClaimShape:
 
+    @pytest.mark.asyncio
     async def test_session_init_claim_fields(
         self, all_tools, recorded_all_classes,
     ):
@@ -754,6 +788,7 @@ class TestClaimShape:
         assert c.fields[F_DECISION_MODE]         == "strict_tape"
         assert c.fields[F_DECISION_FROZEN_MAX_SEQ] == r.frozen_max_seq
 
+    @pytest.mark.asyncio
     async def test_decision_claim_carries_target_and_source_eids(
         self, all_tools, recorded_all_classes,
     ):
@@ -769,6 +804,7 @@ class TestClaimShape:
         assert c.fields[F_DECISION_DECLARED_CLASS]  == "pure"
         assert c.fields[F_DECISION_EFFECTIVE_CLASS] == "pure"
 
+    @pytest.mark.asyncio
     async def test_decision_claim_fail_has_no_source_eid(
         self, all_tools, recorded_all_classes,
     ):
@@ -783,11 +819,13 @@ class TestClaimShape:
 
 class TestLookup:
 
+    @pytest.mark.asyncio
     async def test_exact_args_match(self, all_tools, recorded_all_classes):
         r = replayer_for(recorded_all_classes, ReplayMode.STRICT_TAPE)
         node = r.lookup(get_tool(all_tools, "add"), {"a": 1, "b": 2})
         assert node is not None
 
+    @pytest.mark.asyncio
     async def test_arg_order_does_not_affect_match(
         self, all_tools, recorded_all_classes,
     ):
@@ -796,12 +834,14 @@ class TestLookup:
         node = r.lookup(get_tool(all_tools, "add"), {"b": 2, "a": 1})
         assert node is not None
 
+    @pytest.mark.asyncio
     async def test_arg_value_diff_misses(
         self, all_tools, recorded_all_classes,
     ):
         r = replayer_for(recorded_all_classes, ReplayMode.STRICT_TAPE)
         assert r.lookup(get_tool(all_tools, "add"), {"a": 1, "b": 3}) is None
 
+    @pytest.mark.asyncio
     async def test_tool_name_diff_misses(
         self, all_tools, recorded_all_classes,
     ):

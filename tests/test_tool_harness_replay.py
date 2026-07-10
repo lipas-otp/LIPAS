@@ -11,6 +11,9 @@ import warnings
 from dataclasses import replace
 
 import pytest
+import pytest_asyncio
+
+pytestmark = pytest.mark.asyncio
 
 from lipas.calculus import Claim
 from lipas.replay_tools import (
@@ -37,6 +40,7 @@ from lipas.rows.capability import (
     TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
+    EffectRow,
     F_ARGUMENTS,
     F_DETAIL,
     F_EFFECT_ID,
@@ -61,6 +65,10 @@ def claims_with_eid(store, tag, eid):
         c for c in store.filter(tag=tag)
         if c.fields.get(F_EFFECT_ID) == eid
     ]
+
+
+def effect_view(rowset):
+    return next(r for r in rowset.rows if isinstance(r, EffectRow)).project(rowset.store)
 
 
 def decision_claims(store, *, session_init=None):
@@ -102,7 +110,7 @@ def spy_tools(call_log):
     return ToolRegistry([spy_add, spy_send, spy_fail])
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def recording(spy_tools, call_log, fresh_rowset):
     """Build a recorded EffectView with spy_add(ok), spy_send(ok),
     spy_fail(err); reset call_log to zero before returning."""

@@ -15,6 +15,10 @@ from lipas.tools import SideEffectClass, ToolRegistry, tool
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# A few older tests import shared helpers as top-level modules while
+# newer ones use ``tests.<module>``.  Make both forms resolve to this
+# checkout instead of an unrelated installed ``tests`` package.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 
 # ── Tools (PURE) ──────────────────────────────────────────────────────

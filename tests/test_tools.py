@@ -1,7 +1,7 @@
 import pytest
 from typing import Annotated, Literal, Optional, Union
 
-from lipas.tools import Tool, ValidationError, tool
+from lipas.tools import SideEffectClass, Tool, ValidationError, tool
 
 
 # ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ from lipas.tools import Tool, ValidationError, tool
 # ---------------------------------------------------------------------------
 
 def test_simplest_tool():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def add(x: int, y: int) -> int:
         """Add two numbers."""
         return x + y
@@ -29,7 +29,7 @@ def test_simplest_tool():
 
 
 def test_tool_not_directly_callable():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def add(x: int) -> int:
         """Add."""
         return x
@@ -43,7 +43,7 @@ def test_tool_not_directly_callable():
 # ---------------------------------------------------------------------------
 
 def test_annotated_description_and_defaults():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def search(
         query: Annotated[str, "The search query"],
         limit: Annotated[int, "Max results"] = 10,
@@ -61,7 +61,7 @@ def test_annotated_multiple_metadata_first_string_wins():
     class Ge:  # validator-style metadata (ignored)
         def __init__(self, v): self.v = v
 
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(x: Annotated[int, Ge(0), "the x value", Ge(10), "ignored second"]) -> None:
         """F."""
 
@@ -76,7 +76,7 @@ def test_annotated_multiple_metadata_first_string_wins():
 # ---------------------------------------------------------------------------
 
 def test_optional_emits_anyof():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def fetch(url: str, timeout: Optional[float] = None) -> str:
         """Fetch."""
         return ""
@@ -88,7 +88,7 @@ def test_optional_emits_anyof():
 
 
 def test_pep604_union_syntax():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def fetch(url: str, timeout: float | None = None) -> str:
         """Fetch."""
         return ""
@@ -103,7 +103,7 @@ def test_pep604_union_syntax():
 # ---------------------------------------------------------------------------
 
 def test_literal():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def set_status(
         issue_id: int,
         status: Annotated[Literal["open", "in_progress", "closed"], "New status"],
@@ -117,7 +117,7 @@ def test_literal():
 
 
 def test_optional_literal_composes_via_anyof():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(x: Optional[Literal["a", "b"]] = None) -> None:
         """F."""
 
@@ -127,7 +127,7 @@ def test_optional_literal_composes_via_anyof():
 
 
 def test_list_of_optional_composes_via_anyof():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(xs: list[Optional[str]]) -> None:
         """F."""
 
@@ -148,7 +148,7 @@ def test_schema_escape_hatch():
         "required": ["filter"],
     }
 
-    @tool(name="run_query", description="Run a query.", schema=custom)
+    @tool(side_effect=SideEffectClass.PURE, name="run_query", description="Run a query.", schema=custom)
     def query(filter: dict) -> list[dict]:
         return []
 
@@ -159,7 +159,7 @@ def test_schema_escape_hatch():
 
 def test_schema_skips_annotated_inference():
     """schema= is a full off switch: Annotated hints are NOT consulted."""
-    @tool(
+    @tool(side_effect=SideEffectClass.PURE,
         description="Custom.",
         schema={"type": "object", "properties": {}, "required": []},
     )
@@ -177,14 +177,14 @@ def test_schema_skips_annotated_inference():
 
 def test_no_docstring_raises():
     with pytest.raises(ValidationError, match="no description"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x: int) -> int:
             return x
 
 
 def test_no_type_annotation_raises():
     with pytest.raises(ValidationError, match="no type annotation"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x) -> int:
             """F."""
             return x
@@ -192,7 +192,7 @@ def test_no_type_annotation_raises():
 
 def test_var_positional_rejected_with_targeted_message():
     with pytest.raises(ValidationError, match=r"\*args/\*\*kwargs"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(*args: int) -> int:
             """F."""
             return 0
@@ -200,37 +200,37 @@ def test_var_positional_rejected_with_targeted_message():
 
 def test_var_keyword_rejected_with_targeted_message():
     with pytest.raises(ValidationError, match=r"\*args/\*\*kwargs"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(**kwargs: int) -> int:
             """F."""
             return 0
 
 
-def test_async_rejected_with_p1_3_pointer():
-    with pytest.raises(NotImplementedError, match="P1.3"):
-        @tool
-        async def f(x: int) -> int:
-            """F."""
-            return x
+def test_async_tools_are_supported_by_acall():
+    @tool(side_effect=SideEffectClass.PURE)
+    async def f(x: int) -> int:
+        """F."""
+        return x
+    assert f.name == "f"
 
 
 def test_non_optional_union_rejected():
     with pytest.raises(ValidationError, match="Union types without None"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x: Union[int, str]) -> None:
             """F."""
 
 
 def test_union_with_multiple_non_none_rejected():
     with pytest.raises(ValidationError, match="multiple non-None"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x: Union[int, str, None] = None) -> None:
             """F."""
 
 
 def test_dict_non_str_key_rejected():
     with pytest.raises(ValidationError, match="str"):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x: dict[int, str]) -> None:
             """F."""
 
@@ -240,14 +240,14 @@ def test_unsupported_type_points_to_escape_hatch():
         pass
 
     with pytest.raises(ValidationError, match=r"schema="):
-        @tool
+        @tool(side_effect=SideEffectClass.PURE)
         def f(x: Foo) -> None:
             """F."""
 
 
 def test_empty_description_override_rejected():
     with pytest.raises(ValidationError, match="empty description"):
-        @tool(description="   ")
+        @tool(side_effect=SideEffectClass.PURE, description="   ")
         def f(x: int) -> int:
             """Has docstring but override is empty."""
             return x
@@ -258,7 +258,7 @@ def test_empty_description_override_rejected():
 # ---------------------------------------------------------------------------
 
 def test_repr_excludes_handler():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def add(x: int) -> int:
         """Add."""
         return x
@@ -276,15 +276,15 @@ def test_equality_ignores_handler_identity():
 
     t1 = Tool(name="f", description="d",
               parameters_schema={"type": "object", "properties": {}, "required": []},
-              _handler=h1)
+              side_effect=SideEffectClass.PURE, _handler=h1)
     t2 = Tool(name="f", description="d",
               parameters_schema={"type": "object", "properties": {}, "required": []},
-              _handler=h2)
+              side_effect=SideEffectClass.PURE, _handler=h2)
     assert t1 == t2
 
 
 def test_name_override():
-    @tool(name="custom")
+    @tool(side_effect=SideEffectClass.PURE, name="custom")
     def f(x: int) -> int:
         """F."""
         return x
@@ -293,7 +293,7 @@ def test_name_override():
 
 
 def test_description_override_wins_over_docstring():
-    @tool(description="Override.")
+    @tool(side_effect=SideEffectClass.PURE, description="Override.")
     def f(x: int) -> int:
         """Ignored."""
         return x
@@ -302,7 +302,7 @@ def test_description_override_wins_over_docstring():
 
 
 def test_description_is_first_paragraph_only():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(x: int) -> int:
         """Short summary.
 
@@ -314,7 +314,7 @@ def test_description_is_first_paragraph_only():
 
 
 def test_boolean_not_misdetected_as_int():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(flag: bool) -> None:
         """F."""
 
@@ -322,7 +322,7 @@ def test_boolean_not_misdetected_as_int():
 
 
 def test_nested_list_dict():
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def f(data: dict[str, list[int]]) -> None:
         """F."""
 

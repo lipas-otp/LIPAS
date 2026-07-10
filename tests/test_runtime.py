@@ -1,7 +1,7 @@
 import logging
 import pytest
 
-from lipas.tools import tool, ToolRegistry, InvalidArgumentsError
+from lipas.tools import SideEffectClass, tool, ToolRegistry, InvalidArgumentsError
 from lipas.runtime import ToolCall, ToolResult, run_tools
 
 
@@ -10,13 +10,13 @@ def reg():
     r = ToolRegistry()
 
     @r.register
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def echo(msg: str) -> str:
         """Return msg."""
         return msg
 
     @r.register
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def boom(x: int) -> int:
         """Always raises."""
         raise RuntimeError("kaboom")
@@ -26,7 +26,7 @@ def reg():
 
 def test_success(reg):
     [res] = run_tools(reg, [ToolCall("c1", "echo", {"msg": "hi"})])
-    assert res == ToolResult("c1", "hi", False, None)
+    assert res == ToolResult("c1", "hi", None)
 
 
 def test_unknown_tool(reg):
@@ -64,7 +64,7 @@ def test_batch_isolation(reg):
 
 def test_base_exception_propagates(reg):
     @reg.register
-    @tool
+    @tool(side_effect=SideEffectClass.PURE)
     def interrupt_me() -> None:
         """Simulates Ctrl-C."""
         raise KeyboardInterrupt

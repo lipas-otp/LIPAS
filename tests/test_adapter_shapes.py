@@ -162,7 +162,7 @@ class TestReply:
         r = self._make_reply()
         assert r.stop_reason == "end_turn"
         assert r.usage.total == 15
-        assert r.id == ""
+        assert r.model == "test-model"
 
     def test_reply_with_tool_use(self):
         r = self._make_reply(
@@ -180,6 +180,7 @@ class TestReply:
         r = self._make_reply(
             content=[TextBlock(text="partial...")],
             stop_reason="error",
+            error_detail={"type": "provider_error", "message": "partial failure"},
         )
         assert r.stop_reason == "error"
         assert r.content  # partial content preserved

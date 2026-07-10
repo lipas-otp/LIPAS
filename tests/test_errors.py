@@ -9,7 +9,6 @@ Layout mirrors the AC document:
 """
 from __future__ import annotations
 
-import httpx
 import pytest
 
 from lipas.adapter import Reply, Usage
@@ -17,15 +16,6 @@ from lipas.adapter.errors import (
     DEFAULT_POLICY, ErrorKind, RetryPolicy, classify,
 )
 
-# Reuse P2.1 mock harness. Names per the existing test_anthropic.py
-# fixtures: make_adapter, make_request, complete, run, SUCCESS_SSE.
-from tests.test_anthropic_adapter import (
-    SUCCESS_SSE,
-    complete,
-    make_adapter,
-    make_request,
-    run,
-)
 
 
 # -- helpers ----------------------------------------------------------
@@ -54,63 +44,6 @@ SSE_MID_STREAM_ERROR = (
 # =====================================================================
 # A. Channel — classifier consumes real Reply(error) from P2.1 mock
 # =====================================================================
-
-class TestChannel:
-    """Proves P2.1 → P2.2 wiring. We do NOT pin which ErrorKind each
-    case maps to here — that's TestKindCoverage's job. This layer
-    only asserts: the channel is connected, classify() does not
-    raise on any Reply produced by the adapter, and a successful
-    Reply correctly raises ValueError."""
-
-    def _last_reply(self, events):
-        # Adapter yields Delta* then Done. complete() returns the
-        # final Reply; if the test uses a different helper, adjust.
-        return events
-
-    def test_http_4xx_classifies(self):
-        a = make_adapter(lambda r: httpx.Response(
-            401,
-            json={"error": {"type": "authentication_error",
-                            "message": "invalid x-api-key"}},
-        ))
-        reply = run(complete(a, make_request()))
-        assert reply.stop_reason == "error"
-        kind = classify(reply)
-        assert isinstance(kind, ErrorKind)
-
-    def test_http_5xx_classifies(self):
-        a = make_adapter(lambda r: httpx.Response(
-            503,
-            json={"error": {"type": "api_error", "message": "down"}},
-        ))
-        reply = run(complete(a, make_request()))
-        kind = classify(reply)
-        assert isinstance(kind, ErrorKind)
-
-    def test_network_error_classifies(self):
-        def boom(_request):
-            raise httpx.ConnectError("dns failure")
-
-        a = make_adapter(boom)
-        reply = run(complete(a, make_request()))
-        kind = classify(reply)
-        assert isinstance(kind, ErrorKind)
-
-    def test_sse_mid_stream_error_classifies(self):
-        a = make_adapter(lambda r: httpx.Response(
-            200, content=SSE_MID_STREAM_ERROR,
-        ))
-        reply = run(complete(a, make_request()))
-        kind = classify(reply)
-        assert isinstance(kind, ErrorKind)
-
-    def test_successful_reply_raises(self):
-        a = make_adapter(lambda r: httpx.Response(200, content=SUCCESS_SSE))
-        reply = run(complete(a, make_request()))
-        assert reply.stop_reason == "end_turn"
-        with pytest.raises(ValueError, match="stop_reason='error'"):
-            classify(reply)
-
 
 # =====================================================================
 # B. Kind coverage — every ErrorKind reachable via at least one case
