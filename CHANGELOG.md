@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- OpenAI Responses adapter, caller-facing normalized streaming, durable
+  operation journal, and named-agent mailbox orchestration.
+- Beta release gate and regression coverage for the new public surfaces.
+
+### Changed
+
+- Migrated stale tests to the explicit side-effect and `RetryOutcome` APIs.
+- Fixed PEP 621 package metadata so wheels build successfully with Hatchling.
+
 ## [0.2.0] — 2026-05-20
 
 Two themes: aligned the store's contract with database conventions

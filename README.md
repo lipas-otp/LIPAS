@@ -1,30 +1,15 @@
 # lipas
 
-An LLM agent runtime where every effect is a recorded fact —
-**so you can replay any run, audit any decision, and never get a
-surprise bill.**
+An auditable Python agent runtime: every LLM call, tool invocation,
+rejection, replay choice, and budget charge is an append-only claim. This
+makes a run inspectable and replayable without hiding side effects behind an
+opaque framework.
 
-```python
-from lipas.tools import tool, SideEffectClass, ToolHarness
-from lipas.store import ClaimStore
-
-@tool(side_effect=SideEffectClass.PURE)
-def add(a: float, b: float) -> float:
-    return a + b
-
-store = ClaimStore()
-harness = ToolHarness(store=store, tools=[add])
-
-result = harness.call("add", {"a": 2, "b": 3})
-print(result)                       # 5
-print(len(store.claims))            # 3 — intent, result, spend
-```
-
-That's it. Three claims in an append-only store, queryable by tag,
-ready to replay. No decorator soup, no config file, no daemon.
-
-> **Status:** Single-agent, in-memory/SQLite, Ollama-tested.
-> See [Known limits](#known-limits-alpha) before production use.
+> **Status: alpha.** Single-agent ReAct, SQLite persistence, side-effect-aware
+> tool replay, Ollama and injected-client Anthropic adapters are implemented.
+> OpenAI Responses, auditable handoffs, and recovery-oriented external-operation
+> journals are available. Provider-level exactly-once remains impossible without
+> provider idempotency and reconciliation support.
 
 ---
 
@@ -43,21 +28,41 @@ Each maps to a runnable example — see [Quickstart](#quickstart).
 
 ---
 
-## Quickstart
+## Quickstart: natural Python agent code
 
 ```bash
-pip install -e .
-python examples/0x_xxx.py
+pip install -e '.[ollama,dev]'
+ollama serve
+ollama pull qwen2.5
 ```
 
-Note, you may need to install ollama and pull models:
+```python
+import asyncio
+from lipas import Agent
+from lipas.adapter import OllamaAdapter
+from lipas.tools import SideEffectClass, tool
 
-```bash
-ollama serve &
-ollama pull gemma4  # or any chat model you have
+@tool(side_effect=SideEffectClass.READ_ONLY)
+def lookup_customer(customer_id: str) -> str:
+    """Look up a customer without changing external state."""
+    return f"customer={customer_id}"
+
+agent = Agent(
+    adapter=OllamaAdapter(),
+    model="qwen2.5",
+    instructions="Answer concisely; use tools when useful.",
+    tools=[lookup_customer],
+    session_path="runs/support.db",  # omit for in-memory use
+)
+
+result = asyncio.run(agent("Find customer C-42"))
+print(result.text)
+agent.close()
 ```
 
-> If `gemma4` isn't on your version, run `ollama list` and substitute.
+`Agent` is deliberately thin. Use `DeclarativeAgent`, `LLMHarness`, and
+`ToolHarness` directly when you need custom rows, guards, replay wiring, or a
+different behaviour loop.
 
 
 ---
@@ -89,6 +94,49 @@ The harness reads `side_effect` and decides — without your code —
 whether to retry, whether to run guards, whether replay is safe.
 Forgetting the annotation is a registration-time error, not a
 runtime surprise.
+
+### Portable Markdown skills
+
+`lipas` reads `SKILL.md` with YAML front matter. It requires only the portable
+`name` and `description` fields and preserves all other front matter verbatim.
+That means a skill directory can be shared with Claude Code-style skills and
+Codex/ChatGPT-oriented Markdown skill tooling; fields such as `allowed-tools`,
+`user-invocable`, `metadata`, or framework-specific fields are not rejected or
+silently discarded. LangGraph applications can consume the same Markdown files
+and inject their body into their own prompts.
+
+```markdown
+---
+name: finance-review
+description: Review financial changes carefully.
+---
+Always state assumptions and flag irreversible actions.
+```
+
+```python
+from lipas import SkillRegistry, discover_skills
+
+skills = SkillRegistry(discover_skills("./skills"))
+agent = Agent(..., instructions="You are helpful.", skills=skills)
+```
+
+Skills are appended to the system prompt in deterministic path order. LIPAS
+does not execute tool permissions from Markdown front matter: tool authority
+continues to be declared and audited in Python, preventing prompt text from
+silently expanding side-effect permissions.
+
+### Readable audit logs
+
+The claim tape remains the source of truth, but it can now be rendered for
+people or exported to any log pipeline without a provider SDK:
+
+```python
+from lipas import render_trace, write_jsonl
+
+print(render_trace(rowset.store))       # concise Markdown table
+with open("run.jsonl", "w", encoding="utf-8") as out:
+    write_jsonl(rowset.store, out)       # one structured claim per line
+```
 
 ### Budgets — enforced before the call fires
 
@@ -125,8 +173,9 @@ First `deny` wins. Reason and detail are folded as claims, not logged.
 
 ## Replay
 
-**One-line summary:** LLM calls replay deterministically;
-tool calls re-execute.
+**One-line summary:** LLM replies replay deterministically; tool replay is
+policy-driven and defaults to substituting a recorded result rather than
+touching the live system.
 
 ### LLM replay
 
@@ -139,7 +188,7 @@ tool calls re-execute.
   `system` don't match the recorded intent.
   See `examples/06_react_replay.py` Run 3.
 
-### Tool re-execution
+### Tool replay
 
 | Class | Behavior | Safe to replay? |
 |---|---|---|
@@ -148,40 +197,44 @@ tool calls re-execute.
 | `IDEMPOTENT_WRITE` | Second write is a no-op | ✅ Safe in steady state |
 | `EXTERNAL_WRITE` | **Re-fires the side-effect** | ❌ Re-sends email, re-charges card |
 
-`examples/06_react_replay.py` uses only `PURE` tools, so its replay
-is fully deterministic. For `EXTERNAL_WRITE` tools, treat replay as
-LLM-deterministic-only until v0.2.
-
-`ToolReplayer` — which substitutes recorded outputs for non-`PURE`
-tools — arrives in Phase 4 alongside the supervision tree and
-write-ahead log. The side-effect algebra is already in place; only
-the policy layer is missing.
+`ToolReplayer` is implemented. The default `replay(...)` session uses strict
+tape substitution: a recorded tool output is returned without live execution.
+`BEST_EFFORT` may re-execute missing calls; `LIVE_REROUTE` is explicit and
+refuses external writes unless the caller opts in. This is replay safety, not
+an exactly-once delivery guarantee.
 
 ---
 
-## Known limits
+## Current limitations and compatibility
 
-- **Crash-safety window:** the gap between tool execution and
-  `effect_result` fold is documented but not closed. Phase 4's
-  write-ahead log closes it.
-- **No streaming to caller:** streamed LLM responses are assembled
-  internally; the caller receives the completed `Reply`.
-- **Single agent only:** multi-agent orchestration is out of scope
-  until the supervision tree (Phase 4) is stable.
+- **External effects:** `OperationJournal` persists a caller-provided idempotency
+  key before submission and marks interrupted submissions as `uncertain`.
+  Reconciliation remains mandatory; exactly-once is only as strong as the
+  provider's idempotency contract.
+- **Streaming:** `LLM.stream(...)` yields normalized `Delta`, `ToolUseDelta`,
+  and terminal `Done` events while preserving the final audit record. A stream
+  is not retried after visible output.
+- **Multi-agent:** `Mailbox` and `AgentOrchestrator` provide named, auditable,
+  at-least-once handoffs. Receivers must use the stable message id for replay
+  and idempotency; distributed ownership is deliberately explicit.
+- **Provider support:** Ollama, injected-client Anthropic, and the optional-SDK
+  OpenAI Responses adapter are supported.
 
 ---
 
 ## Roadmap
 
-| Phase | Contents | Status |
-|---|---|---|
-| 0 | Claim calculus, store | ✅ Done |
-| 1 | Rows, basic types, tool harness | ✅ Done |
-| 2 | Side-effect algebra, LLM harness, guards, replay | ✅ Done |
-| 3 | ReAct agent, ToolHarness, effect log, Ollama adapter | ✅ Done |
-| 4 | Supervision tree, policy DSL, ToolReplayer, write-ahead log | 🔲 Next |
-| 5 | OpenAI / Anthropic adapters, CLI trace viewer, OTel export | 🔲 Planned |
-| 6 | Multi-agent, persistent store, compensation | 🔲 Future |
+1. **Compatibility and test convergence:** finish migration of the remaining
+   pre-P3 test assertions and unify provider content shapes.
+2. **OpenAI hardening:** add provider contract fixtures, current pricing data,
+   and optional SDK convenience construction.
+3. **Operation recovery:** add provider-specific reconciliation and explicit
+   compensation adapters on top of `OperationJournal`.
+4. **Multi-agent hardening:** add delegated capability policies and replay
+   fixtures across mailbox delivery boundaries.
+5. **Supervisor projection:** replace the deferred
+   `lipas.calculus_supervisor` tripwire with a tag-aware projection API and
+   migrate retry/escalation queries from O(N) log scans to that projection.
 
 ---
 
