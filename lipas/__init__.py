@@ -54,6 +54,11 @@ from .session import (
     replay,
     ReplaySession
 )
+from .skills import Skill, SkillError, SkillRegistry, discover_skills, load_skill
+from .trace import iter_trace, render_trace, write_jsonl
+from .agent import Agent
+from .operations import Operation, OperationJournal, PendingOperation
+from .orchestration import AgentOrchestrator, Mailbox, MailboxMessage
 
 __all__ = [
     # Core types
@@ -74,4 +79,11 @@ __all__ = [
     # Tool surface
     "Tool", "tool", "ValidationError", "InvalidArgumentsError",
     "ToolRegistry",
+    # Portable Markdown skills
+    "Skill", "SkillError", "SkillRegistry", "load_skill", "discover_skills",
+    # Audit-log views
+    "iter_trace", "render_trace", "write_jsonl",
+    "Agent",
+    "Operation", "OperationJournal", "PendingOperation",
+    "AgentOrchestrator", "Mailbox", "MailboxMessage",
 ]

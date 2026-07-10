@@ -31,12 +31,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 from lipas.adapter import Reply as AdapterReply, Request
 from lipas.adapter.content import TextBlock, ToolUseBlock
 from lipas.adapter.errors import DEFAULT_POLICY, ErrorKind, RetryPolicy
 from lipas.adapter.protocol import LLMAdapter
+from lipas.adapter.streaming import StreamEvent
 from lipas.guard import Guard
 from lipas.harness import BucketExtractor, LLMHarness, default_bucket_extractor
 from lipas.replay import ReplayCursor
@@ -305,6 +306,25 @@ class LLM:
             request, compensates=compensates,
         )
         return Reply(_raw=adapter_reply, _tool_harness=harness)
+
+    async def stream(
+        self, messages: Sequence[Mapping[str, Any]], **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        """Yield token/tool deltas to the caller and durably fold final Done.
+
+        Keyword arguments mirror ``__call__`` except ``compensates`` is also
+        accepted. Streaming does not retry after a visible event.
+        """
+        tools = kwargs.pop("tools", None)
+        effective = self.tools if tools is None else tools
+        request = self._build_request(messages, effective_tools=effective,
+            model=kwargs.pop("model", None), max_tokens=kwargs.pop("max_tokens", None),
+            system=kwargs.pop("system", None), temperature=kwargs.pop("temperature", None),
+            stop_sequences=kwargs.pop("stop_sequences", None))
+        if kwargs:
+            raise TypeError(f"unexpected stream keyword(s): {', '.join(kwargs)}")
+        async for event in self._llm_harness.stream(request):
+            yield event
 
     # ── internals ──────────────────────────────────────────────
 

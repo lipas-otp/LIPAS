@@ -486,7 +486,21 @@ def tool(
 
 @dataclass(frozen=True)
 class ToolRegistry:
-    """Immutable, name-indexed collection of Tools."""
+    """Name-indexed collection of explicitly classified tools.
+
+    Construction from an iterable is preferred for static applications, while
+    ``register`` supports the natural decorator spelling used in small agent
+    modules::
+
+        tools = ToolRegistry()
+
+        @tools.register
+        @tool(side_effect=SideEffectClass.READ_ONLY)
+        def search(query: str) -> str: ...
+
+    The registry shell is frozen but its private index is intentionally owned
+    by the registry, making registration a controlled compatibility operation.
+    """
 
     _tools: dict[str, Tool] = field(default_factory=dict, init=False, repr=False)
 
@@ -509,6 +523,25 @@ class ToolRegistry:
             raise ToolNotFoundError(
                 f"no tool named {name!r}. available: {available}"
             ) from None
+
+    def register(self, item: Tool) -> Tool:
+        """Add ``item`` and return it, so this works as a decorator.
+
+        Registration deliberately accepts only an already-created ``Tool``;
+        callers must still choose ``side_effect=`` at the ``@tool`` boundary.
+        """
+        if not isinstance(item, Tool):
+            raise TypeError(
+                "ToolRegistry.register expects a Tool. Decorate the function "
+                "with @tool(side_effect=...) first."
+            )
+        existing = self._tools.get(item.name)
+        if existing is not None:
+            raise DuplicateToolError(
+                f"duplicate tool name {item.name!r}: {existing!r} vs {item!r}"
+            )
+        self._tools[item.name] = item
+        return item
 
     def __contains__(self, name: object) -> bool:
         return name in self._tools

@@ -65,6 +65,16 @@ class RetryOutcome:
     reply: Reply
     attempts: int
 
+    # Read-only convenience projections preserve the useful part of the old
+    # ``Reply``-only call site without hiding the new audit-critical attempt
+    # count. New code should use ``.reply`` when passing a Reply onward.
+    @property
+    def stop_reason(self) -> str: return self.reply.stop_reason
+    @property
+    def error_detail(self): return self.reply.error_detail
+    @property
+    def usage(self): return self.reply.usage
+
 
 async def call_with_retry(
     adapter: LLMAdapter,

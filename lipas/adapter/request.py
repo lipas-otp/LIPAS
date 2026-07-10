@@ -16,7 +16,7 @@ and Messages in the same call is allowed.
 """
 from __future__ import annotations
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Literal, Mapping, Sequence
 
 from .content import ContentBlock
@@ -41,12 +41,16 @@ class Message:
                 out_blocks.append(b)
             elif hasattr(b, "as_dict"):
                 out_blocks.append(b.as_dict())
+            elif is_dataclass(b):
+                # Content blocks are frozen slot dataclasses, so they do
+                # not expose __dict__.  asdict works for both slot and
+                # regular dataclasses and preserves the canonical shape.
+                out_blocks.append(asdict(b))
             else:
-                # Last resort: dataclass-to-dict via __dict__
-                out_blocks.append({
-                    k: v for k, v in vars(b).items()
-                    if not k.startswith("_")
-                })
+                raise TypeError(
+                    "Message.content entries must be mappings or content "
+                    f"block dataclasses, got {type(b).__name__}"
+                )
         return {"role": self.role, "content": out_blocks}
 
 

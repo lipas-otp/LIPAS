@@ -31,6 +31,8 @@ from .streaming import (
 )
 from .usage import Usage
 from .ollama import OllamaAdapter
+from .anthropic import AnthropicAdapter
+from .openai import OpenAIResponsesAdapter
 
 __all__ = [
     # usage / errors
@@ -66,4 +68,6 @@ __all__ = [
     "complete",
     # ollama
     "OllamaAdapter",
+    "AnthropicAdapter",
+    "OpenAIResponsesAdapter",
 ]

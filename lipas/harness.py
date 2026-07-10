@@ -47,13 +47,14 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, AsyncIterator
 
 from lipas.adapter import Reply, Request, ResourceEstimate, Usage
 from lipas.adapter.errors import (
     DEFAULT_POLICY, ErrorKind, RetryPolicy, classify,
 )
-from lipas.adapter.protocol import LLMAdapter
+from lipas.adapter.protocol import LLMAdapter, StreamProtocolError
+from lipas.adapter.streaming import Done, StreamEvent
 
 from lipas.calculus import Claim
 from lipas.effect import EffectKind, LLMTarget
@@ -246,6 +247,41 @@ class LLMHarness:
             self._fold_spend(effect_id, reply)
 
         return reply
+
+    async def stream(
+        self, request: Request, *, compensates: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Caller-facing event stream with the same audit boundary as ``call``.
+
+        A streamed attempt is intentionally not retried after any event has
+        been exposed: token delivery cannot be rolled back. Provider errors
+        still end in a durable error ``Reply`` inside ``Done``.
+        """
+        if self.replay_cursor is not None and not self.replay_cursor.exhausted():
+            yield Done(self.replay_cursor.advance(request))
+            return
+        effect_id = f"call_{uuid.uuid4().hex[:12]}"
+        target = LLMTarget(request=request)
+        cache: list[ResourceEstimate] = []
+        async def estimate() -> ResourceEstimate:
+            if not cache: cache.append(await self.adapter.estimate_cost(request))
+            return cache[0]
+        rejection = await self._preflight_budget(request, estimate)
+        if rejection is None:
+            rejection = await self._preflight_guards(target, estimate)
+        if rejection is not None:
+            yield Done(self._record_rejection(effect_id=effect_id, request=request, compensates=compensates, rejection=rejection))
+            return
+        self._fold_intent(effect_id, request, compensates)
+        async for event in self.adapter.stream(request):
+            yield event
+            if isinstance(event, Done):
+                outcome = RetryOutcome(reply=event.reply, attempts=1)
+                self._fold_result(effect_id, outcome)
+                if event.reply.stop_reason != "error" or event.reply.usage.input or event.reply.usage.output:
+                    self._fold_spend(effect_id, event.reply)
+                return
+        raise StreamProtocolError("adapter stream ended without terminal Done")
 
     # ── pre-flight: budget (P2.6) ──────────────────────────────
 

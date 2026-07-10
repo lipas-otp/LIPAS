@@ -37,6 +37,7 @@ from .behaviour import AgentState, FinalResult
 from .harness import LLMHarness
 from .react import ReActAgent
 from .rows import RowSet
+from .skills import Skill, SkillRegistry
 from .tool_harness import ToolHarness
 from .tools import ToolRegistry
 
@@ -86,6 +87,10 @@ class DeclarativeAgent:
     harness_kwargs: Mapping[str, Any]   = field(default_factory=dict)
     tool_guards:    Sequence[Any]       = ()
     request_extras: Mapping[str, Any]   = field(default_factory=dict)
+    # Markdown SKILL.md instructions.  Accepting a registry keeps the
+    # runtime independent of where skills came from (local files,
+    # LangGraph configuration, or an application database).
+    skills:         SkillRegistry | Sequence[Skill] = field(default_factory=SkillRegistry)
     behaviour_cls:  type                = ReActAgent
 
     _harness:      LLMHarness  = field(init=False, repr=False)
@@ -100,6 +105,11 @@ class DeclarativeAgent:
                 "rowset is required. Build one with "
                 "RowSet(store, rows=[...]) and pass it in."
             )
+
+        skill_registry = (
+            self.skills if isinstance(self.skills, SkillRegistry)
+            else SkillRegistry(self.skills)
+        )
 
         # 1. LLM harness (Reason side).
         self._harness = LLMHarness(
@@ -123,7 +133,7 @@ class DeclarativeAgent:
             model=self.model,
             messages=(),
             max_tokens=self.max_tokens,
-            system=self.system,
+            system=skill_registry.system_prompt(self.system),
             extra=dict(self.request_extras),
         )
 
