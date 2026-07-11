@@ -68,7 +68,7 @@ from lipas.rows.capability import (
     TAG_BUDGET_OVERRUN, TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
-    F_ATTEMPTS, F_COMPENSATES, F_DETAIL, F_EFFECT_ID, F_ERROR,
+    F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DETAIL, F_EFFECT_ID, F_ERROR,
     F_KIND, F_MODEL, F_REASON, F_REPLY, F_REQUEST, F_STATUS,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
@@ -194,6 +194,7 @@ class LLMHarness:
         request: Request,
         *,
         compensates: str | None = None,
+        caused_by: str | None = None,
         _replay_call_id: str | None = None,
     ) -> Reply:
         """Execute one LLM call.
@@ -219,7 +220,7 @@ class LLMHarness:
         if bud_rej is not None:
             return self._record_rejection(
                 effect_id=effect_id, request=request,
-                compensates=compensates, rejection=bud_rej,
+                compensates=compensates, caused_by=caused_by, rejection=bud_rej,
             )
 
         # 2. Pre-flight: guards (P2.8 / P3.0).
@@ -227,11 +228,11 @@ class LLMHarness:
         if guard_rej is not None:
             return self._record_rejection(
                 effect_id=effect_id, request=request,
-                compensates=compensates, rejection=guard_rej,
+                compensates=compensates, caused_by=caused_by, rejection=guard_rej,
             )
 
         # 3. Record intent.
-        self._fold_intent(effect_id, request, compensates)
+        self._fold_intent(effect_id, request, compensates, caused_by)
 
         # 4. Drive the adapter.
         outcome: RetryOutcome = await call_with_retry(
@@ -250,6 +251,7 @@ class LLMHarness:
 
     async def stream(
         self, request: Request, *, compensates: str | None = None,
+        caused_by: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Caller-facing event stream with the same audit boundary as ``call``.
 
@@ -270,9 +272,9 @@ class LLMHarness:
         if rejection is None:
             rejection = await self._preflight_guards(target, estimate)
         if rejection is not None:
-            yield Done(self._record_rejection(effect_id=effect_id, request=request, compensates=compensates, rejection=rejection))
+            yield Done(self._record_rejection(effect_id=effect_id, request=request, compensates=compensates, caused_by=caused_by, rejection=rejection))
             return
-        self._fold_intent(effect_id, request, compensates)
+        self._fold_intent(effect_id, request, compensates, caused_by)
         async for event in self.adapter.stream(request):
             yield event
             if isinstance(event, Done):
@@ -356,6 +358,7 @@ class LLMHarness:
         effect_id: str,
         request: Request,
         compensates: str | None,
+        caused_by: str | None,
     ) -> None:
         intent_fields: dict = {
             F_EFFECT_ID: effect_id,
@@ -365,6 +368,8 @@ class LLMHarness:
         }
         if compensates is not None:
             intent_fields[F_COMPENSATES] = compensates
+        if caused_by is not None:
+            intent_fields[F_CAUSED_BY] = caused_by
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=intent_fields,
@@ -449,10 +454,11 @@ class LLMHarness:
         effect_id: str,
         request: Request,
         compensates: str | None,
+        caused_by: str | None,
         rejection: BudgetRejection | GuardRejection,
     ) -> Reply:
         """Fold effect_intent + effect_rejected; return synthesized Reply."""
-        self._fold_intent(effect_id, request, compensates)
+        self._fold_intent(effect_id, request, compensates, caused_by)
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_REJECTED,
             fields={

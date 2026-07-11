@@ -10,6 +10,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .orchestration import AgentOrchestrator, Mailbox
+from .rows import RowSet
+from .rows.capability import CapabilityRow
+from .rows.effect import EffectRow
+from .rows.history import HistoryRow
+from .session import open_session
+from .store import ClaimStore
 
 __all__ = ["Team"]
 
@@ -29,6 +35,7 @@ class Team:
     caller needs a stable idempotency/replay key across process restarts.
     """
     mailbox: Mailbox
+    rowset: RowSet
     lease_seconds: float = 60.0
     _orchestrator: AgentOrchestrator = field(init=False, repr=False)
 
@@ -36,8 +43,18 @@ class Team:
         self._orchestrator = AgentOrchestrator(self.mailbox, lease_seconds=self.lease_seconds)
 
     @classmethod
-    def open(cls, path: str = ":memory:", *, lease_seconds: float = 60.0) -> "Team":
-        return cls(Mailbox(path), lease_seconds=lease_seconds)
+    def open(cls, path: str = ":memory:", *, audit_path: str | None = None,
+             lease_seconds: float = 60.0) -> "Team":
+        """Open a Team and its durable audit session.
+
+        ``path`` is the mailbox database. Unless ``audit_path`` is supplied,
+        a sibling ``<path>.claims.db`` records handoff/lease/ack transitions.
+        """
+        if path == ":memory:":
+            rowset = RowSet(ClaimStore(), [HistoryRow(), CapabilityRow(), EffectRow()])
+        else:
+            rowset = open_session(audit_path or f"{path}.claims.db")
+        return cls(Mailbox(path, rowset=rowset), rowset=rowset, lease_seconds=lease_seconds)
 
     def add(self, name: str, handler: Any) -> "Team":
         """Add a named team member.
@@ -51,6 +68,15 @@ class Team:
 
         async def receive(message):
             prompt = message.payload.get("prompt", message.payload)
+            # An Agent retains its normal public call surface. At a mailbox
+            # boundary we additionally seed its state with the stable message
+            # id, making every LLM/tool intent traceable to this handoff.
+            from .agent import Agent
+            if isinstance(handler, Agent):
+                from .behaviour import AgentState
+                return await handler.run(
+                    prompt, state=AgentState(metadata={"caused_by": message.id}),
+                )
             return await handler(prompt)
 
         self._orchestrator.register(name, receive)
@@ -73,3 +99,6 @@ class Team:
 
     def close(self) -> None:
         self.mailbox.close()
+        close = getattr(self.rowset.store, "close", None)
+        if callable(close):
+            close()

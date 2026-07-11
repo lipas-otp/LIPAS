@@ -69,6 +69,16 @@ class HistoryRow:
             # pairing invariant is enforced by lipas.lint, not by
             # this row.
             TAG_GOAL_BLOCKED,
+            # Team coordination is audit history, not a separate workflow
+            # state machine. These tags link mailbox lifecycle to a Team's
+            # durable claim session.
+            "agent_handoff", "agent_mail_claim", "agent_mail_ack",
+            "agent_mail_released", "agent_mail_recovered",
+            # OperationJournal transition audit. The journal deliberately
+            # lives at the external boundary; these claims associate its
+            # durable idempotency state with an effect/tape when supplied.
+            "operation_prepared", "operation_uncertain",
+            "operation_succeeded", "operation_failed",
         })
     )
 

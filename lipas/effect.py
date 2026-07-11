@@ -66,6 +66,7 @@ __all__ = [
     "F_EFFECT_ID",
     "F_KIND",
     "F_COMPENSATES",
+    "F_CAUSED_BY",
     "F_STATUS",
     "F_ATTEMPTS",
     "F_ERROR",
@@ -167,6 +168,10 @@ TAG_EFFECT_REJECTED = "call_rejected"
 F_EFFECT_ID    = "call_id"          # historical; opaque str
 F_KIND         = "kind"             # value: EffectKind member's str
 F_COMPENSATES  = "compensates"      # str | absent
+# Causal parent outside the effect graph (for example, a Team mailbox id).
+# This deliberately stays separate from ``compensates``: compensation is an
+# effect-to-effect semantic relation, while causation may begin at a handoff.
+F_CAUSED_BY    = "caused_by"         # str | absent
 
 # Shared on result / rejected ─────────────────────────────────────────
 F_STATUS   = "status"               # "ok" | "error"

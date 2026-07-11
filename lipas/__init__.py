@@ -1,6 +1,8 @@
-"""lipas — a thin, provider-agnostic LLM interface.
+"""lipas — claim-based execution primitives for reliable AI agents.
 
-Public surface (v1). For normative invariants, see lipas.types module docstring.
+The provider-neutral interchange surface is ``lipas.adapter``.  Historic
+``lipas.types`` remains an internal migration module and is intentionally not
+re-exported here.
 """
 from __future__ import annotations
 
@@ -32,21 +34,10 @@ from .tools import (
     InvalidArgumentsError,
     ToolRegistry,
 )
-from .types import (
-    STOP_REASONS,
-    Done,
-    Message,
-    ProviderEvent,
-    Reply,
-    StopReason,
-    StreamEvent,
-    TextDelta,
-    ThinkingBlock,
-    ThinkingDelta,
-    ToolCall,
-    ToolCallReady,
-    ToolCallStart,
-    Usage,
+from .adapter import (
+    Delta, Done, LLMAdapter, Message, Reply, Request, StopReason, StreamEvent,
+    TextBlock, Thinking, ToolResultBlock, ToolSpec, ToolUseBlock, ToolUseDelta,
+    Usage, complete,
 )
 
 from .session import (
@@ -62,12 +53,11 @@ from .team import Team
 from .supervisor_projection import SupervisorProjection, project_supervisor
 
 __all__ = [
-    # Core types
-    "Message", "Usage", "ThinkingBlock", "ToolCall", "Reply",
-    "StopReason", "STOP_REASONS",
-    # Stream events
-    "StreamEvent", "TextDelta", "ThinkingDelta",
-    "ToolCallStart", "ToolCallReady", "Done", "ProviderEvent",
+    # Canonical provider-neutral interchange shapes
+    "Message", "Request", "ToolSpec", "Usage", "Reply", "StopReason",
+    "TextBlock", "ToolUseBlock", "ToolResultBlock",
+    "StreamEvent", "Delta", "ToolUseDelta", "Thinking", "Done",
+    "LLMAdapter", "complete",
     # Exceptions & warnings
     "LipasError", "ToolAlreadyInvoked", "LipasStreamError",
     "LipasDesyncWarning", "LipasStaleNativeWarning",

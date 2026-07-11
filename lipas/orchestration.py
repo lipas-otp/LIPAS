@@ -11,7 +11,17 @@ from typing import Any, Awaitable, Callable, Mapping
 from .calculus import Claim
 from .rows import RowSet
 
-__all__ = ["MailboxMessage", "Mailbox", "AgentOrchestrator", "MailboxLeaseError"]
+TAG_AGENT_HANDOFF = "agent_handoff"
+TAG_AGENT_MAIL_CLAIM = "agent_mail_claim"
+TAG_AGENT_MAIL_ACK = "agent_mail_ack"
+TAG_AGENT_MAIL_RELEASED = "agent_mail_released"
+TAG_AGENT_MAIL_RECOVERED = "agent_mail_recovered"
+
+__all__ = [
+    "MailboxMessage", "Mailbox", "AgentOrchestrator", "MailboxLeaseError",
+    "TAG_AGENT_HANDOFF", "TAG_AGENT_MAIL_CLAIM", "TAG_AGENT_MAIL_ACK",
+    "TAG_AGENT_MAIL_RELEASED", "TAG_AGENT_MAIL_RECOVERED",
+]
 
 
 class MailboxLeaseError(RuntimeError): pass
@@ -61,14 +71,14 @@ class Mailbox:
             if (existing.sender, existing.recipient, dict(existing.payload)) != (sender, recipient, dict(payload)):
                 raise ValueError("message id was reused for a different handoff")
             return existing
-        self._audit("agent_handoff", {"message_id": mid, "sender": sender, "recipient": recipient, "payload": dict(payload)})
+        self._audit(TAG_AGENT_HANDOFF, {"message_id": mid, "sender": sender, "recipient": recipient, "payload": dict(payload)})
         return self.get(mid)  # type: ignore[return-value]
 
     def recover_expired(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now
         with self._conn:
             cur = self._conn.execute("UPDATE mailbox SET status='pending',lease_token=NULL,lease_expires=NULL WHERE status='leased' AND lease_expires<=?", (now,))
-        if cur.rowcount: self._audit("agent_mail_recovered", {"count": cur.rowcount})
+        if cur.rowcount: self._audit(TAG_AGENT_MAIL_RECOVERED, {"count": cur.rowcount})
         return cur.rowcount
 
     def claim(self, recipient: str, *, limit: int = 1, lease_seconds: float = 60.0) -> tuple[MailboxMessage, ...]:
@@ -84,20 +94,20 @@ class Mailbox:
                 message = self.get(mid)
                 assert message is not None
                 claimed.append(message)
-                self._audit("agent_mail_claim", {"message_id": mid, "recipient": recipient, "attempt": message.attempts})
+                self._audit(TAG_AGENT_MAIL_CLAIM, {"message_id": mid, "recipient": recipient, "attempt": message.attempts})
         return tuple(claimed)
 
     def acknowledge(self, message_id: str, *, lease_token: str) -> None:
         with self._conn:
             cur = self._conn.execute("UPDATE mailbox SET status='acknowledged',acknowledged_at=?,lease_token=NULL,lease_expires=NULL WHERE id=? AND status='leased' AND lease_token=?", (time.time(), message_id, lease_token))
         if not cur.rowcount: raise MailboxLeaseError("message is not owned by this lease")
-        self._audit("agent_mail_ack", {"message_id": message_id})
+        self._audit(TAG_AGENT_MAIL_ACK, {"message_id": message_id})
 
     def release(self, message_id: str, *, lease_token: str) -> None:
         with self._conn:
             cur = self._conn.execute("UPDATE mailbox SET status='pending',lease_token=NULL,lease_expires=NULL WHERE id=? AND status='leased' AND lease_token=?", (message_id, lease_token))
         if not cur.rowcount: raise MailboxLeaseError("message is not owned by this lease")
-        self._audit("agent_mail_released", {"message_id": message_id})
+        self._audit(TAG_AGENT_MAIL_RELEASED, {"message_id": message_id})
 
     def _audit(self, tag: str, fields: Mapping[str, Any]) -> None:
         if self.rowset is not None: self.rowset.fold(Claim(tag=tag, fields=dict(fields), source="orchestration.mailbox"))

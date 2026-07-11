@@ -50,7 +50,7 @@ from ..calculus import Claim, StrategyRegistry
 from ..store    import ClaimStore
 from ..effect import (
     EffectKind,
-    F_ARGUMENTS, F_ATTEMPTS, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
+    F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
     F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_MODEL, F_OUTPUT,
     F_REASON, F_REPLY, F_REQUEST, F_SIDE_EFFECT, F_STATUS,
     F_TOOL_NAME,
@@ -62,7 +62,7 @@ __all__ = [
     "EffectRow", "EffectNode", "EffectView",
     # Re-exports for convenience (canonical home: lipas.effect):
     "TAG_EFFECT_INTENT", "TAG_EFFECT_RESULT", "TAG_EFFECT_REJECTED",
-    "F_EFFECT_ID", "F_KIND", "F_COMPENSATES",
+    "F_EFFECT_ID", "F_KIND", "F_COMPENSATES", "F_CAUSED_BY",
     "F_STATUS", "F_ATTEMPTS", "F_ERROR", "F_REASON", "F_DETAIL",
     "F_MODEL", "F_REQUEST", "F_REPLY",
     "F_TOOL_NAME", "F_ARGUMENTS", "F_DECLARED_SIDE_EFFECT",

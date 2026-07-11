@@ -133,7 +133,8 @@ class ReActAgent:
 
             # 1. Reason
             request = self._build_request(state)
-            reply   = await self.harness.call(request)
+            caused_by = state.metadata.get("caused_by")
+            reply   = await self.harness.call(request, caused_by=caused_by)
 
             # 2. Error path
             if reply.stop_reason == "error":
@@ -181,6 +182,7 @@ class ReActAgent:
                     tool_name=tc["name"],
                     arguments=dict(tc.get("input") or {}),
                     effect_id=tc["id"],
+                    caused_by=caused_by,
                 )
                 tool_results.append(result_dict)
 

@@ -96,7 +96,7 @@ from lipas.rows.capability import (
     TAG_BUDGET_OVERRUN, TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
-    F_ARGUMENTS, F_ATTEMPTS, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
+    F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
     F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_OUTPUT, F_REASON,
     F_SIDE_EFFECT, F_STATUS, F_TOOL_NAME,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
@@ -257,6 +257,7 @@ class ToolHarness:
         arguments: Mapping[str, Any],
         effect_id: str | None = None,
         compensates: str | None = None,
+        caused_by: str | None = None,
     ) -> dict:
         """Execute one tool call.
 
@@ -295,7 +296,7 @@ class ToolHarness:
                 tool_name=tool_name,
                 available=tuple(self.tools.names()),
             )
-            self._fold_intent_unknown(eid, tool_name, args, compensates)
+            self._fold_intent_unknown(eid, tool_name, args, compensates, caused_by)
             self._fold_rejection(eid, rej)
             return self._tool_result(
                 eid,
@@ -334,11 +335,11 @@ class ToolHarness:
 
             if decision.operation == "substitute":
                 return self._do_replay_substitute(
-                    eid, tool, args, compensates, decision,
+                    eid, tool, args, compensates, caused_by, decision,
                 )
 
             if decision.operation == "refuse":
-                self._do_replay_refuse(eid, tool, args, compensates, decision)
+                self._do_replay_refuse(eid, tool, args, compensates, caused_by, decision)
                 # _do_replay_refuse always raises; this point is unreachable.
 
             # decision.operation == "re-execute": fall through to the
@@ -351,7 +352,7 @@ class ToolHarness:
             tool._signature.bind(**args).apply_defaults()
         except TypeError as e:
             rej = SchemaRejection(tool_name=tool.name, detail=str(e))
-            self._fold_intent(eid, tool, args, compensates)
+            self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, rej)
             return self._tool_result(
                 eid, f"Schema violation: {e}", is_error=True,
@@ -362,7 +363,7 @@ class ToolHarness:
         # ── 2. Guard gate ───────────────────────────────────
         guard_rej = await self._preflight_guards(target)
         if guard_rej is not None:
-            self._fold_intent(eid, tool, args, compensates)
+            self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, guard_rej)
             return self._tool_result(
                 eid,
@@ -375,7 +376,7 @@ class ToolHarness:
         estimate = self._estimate_dict(tool, args)
         bud_rej  = self._preflight_budget(estimate)
         if bud_rej is not None:
-            self._fold_intent(eid, tool, args, compensates)
+            self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, bud_rej)
             return self._tool_result(
                 eid,
@@ -385,7 +386,7 @@ class ToolHarness:
             )
 
         # ── 4. Record intent ────────────────────────────────
-        self._fold_intent(eid, tool, args, compensates)
+        self._fold_intent(eid, tool, args, compensates, caused_by)
 
         # ── 5. Execute ──────────────────────────────────────
         t0           = time.monotonic()
@@ -440,6 +441,7 @@ class ToolHarness:
         tool: Tool,
         args: Mapping[str, Any],
         compensates: str | None,
+        caused_by: str | None,
         decision: ReplayDecision,
     ) -> dict:
         """Mirror a recorded result into the target store without executing.
@@ -465,7 +467,7 @@ class ToolHarness:
                 f"(decision={decision!r})"
             )
 
-        self._fold_intent(eid, tool, args, compensates)
+        self._fold_intent(eid, tool, args, compensates, caused_by)
 
         new_fields = dict(recorded_node.result.fields)
         new_fields[F_EFFECT_ID] = eid
@@ -491,13 +493,14 @@ class ToolHarness:
         tool: Tool,
         args: Mapping[str, Any],
         compensates: str | None,
+        caused_by: str | None,
         decision: ReplayDecision,
     ) -> None:
         """Fold intent + rejection for a refused replay, then raise.
 
         Always raises ReplayRefused; never returns.
         """
-        self._fold_intent(eid, tool, args, compensates)
+        self._fold_intent(eid, tool, args, compensates, caused_by)
         mode_value = (
             self.tool_replayer.mode.value
             if self.tool_replayer is not None else "?"
@@ -642,6 +645,7 @@ class ToolHarness:
         tool: Tool,
         args: Mapping[str, Any],
         compensates: str | None,
+        caused_by: str | None,
     ) -> None:
         fields: dict = {
             F_EFFECT_ID:             eid,
@@ -652,6 +656,8 @@ class ToolHarness:
         }
         if compensates is not None:
             fields[F_COMPENSATES] = compensates
+        if caused_by is not None:
+            fields[F_CAUSED_BY] = caused_by
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=fields,
@@ -664,6 +670,7 @@ class ToolHarness:
         tool_name: str,
         args: Mapping[str, Any],
         compensates: str | None,
+        caused_by: str | None,
     ) -> None:
         """Intent for a tool we couldn't resolve.
 
@@ -683,6 +690,8 @@ class ToolHarness:
         }
         if compensates is not None:
             fields[F_COMPENSATES] = compensates
+        if caused_by is not None:
+            fields[F_CAUSED_BY] = caused_by
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=fields,
