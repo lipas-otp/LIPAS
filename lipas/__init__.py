@@ -1,4 +1,4 @@
-"""lipas — claim-based execution primitives for reliable AI agents.
+"""LIPAS — claim-based execution primitives for reliable AI agents.
 
 The provider-neutral interchange surface is ``lipas.adapter``.  Historic
 ``lipas.types`` remains an internal migration module and is intentionally not
