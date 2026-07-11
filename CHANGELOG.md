@@ -1,8 +1,14 @@
 # Changelog
 
-## [0.9.5] — 2026-07-11
+## [0.9.6] — 2026-07-11
 
 ### Added
+
+- `lipas` CLI: `init` creates an ordinary Python prototype; `chat` runs an
+  Ollama-backed Agent or an explicit Python factory; `trace` and `effects`
+  inspect the same durable claim session used by library code.
+- `docs/cli.md`, documenting the CLI as an onboarding and operations surface,
+  not a second DSL.
 
 - Claim-linked coordination: `Team` now owns a durable audit session, and an
   Agent invoked by a Team handoff records its stable `message_id` as
@@ -24,11 +30,14 @@
 - `Team.add(name, handler)`, the direct registration API for named members.
 - Agent-and-Team mental-model guide and a progressive documentation path.
 - `assist/README.md`, which classifies the design notes as conceptual,
-  historical, or unimplemented so they cannot be mistaken for the 0.9.5
+  historical, or unimplemented so they cannot be mistaken for the 0.9.6
   runtime contract.
 
 ### Changed
 
+- Project-facing prose and headings now use the LIPAS brand; Python imports,
+  distribution name, module paths, and the `lipas` CLI intentionally remain
+  lowercase.
 - The public vocabulary is now `Agent` / `Tool` / `Team`; Team is a small
   durable-handoff facade, not a graph or workflow DSL.
 - Ollama quickstart and examples now default to `gemma4:12b`; lower-level
@@ -93,13 +102,13 @@ correctly. No breaking changes since 0.1.0a1.
 
 ## [0.1.0a1] — 2026-05-01 · First alpha
 
-This is the first public release of lipas. It is an alpha: the core
+This is the first public release of LIPAS. It is an alpha: the core
 algebra and harness contract are stable, but adapters are limited to
 Ollama and APIs may evolve before 0.1.0 final.
 
 ### What this release is
 
-lipas is an LLM agent runtime built around three guarantees that no
+LIPAS is an LLM agent runtime built around three guarantees that no
 current framework provides together:
 
 - **Side-effect classification is enforced, not optional.** Every tool
@@ -111,7 +120,7 @@ current framework provides together:
   observations.** A budget check runs before every LLM and tool call.
   If the estimated cost would exceed your declared limit, the call is
   not issued — a typed rejection claim is folded instead. You cannot
-  accidentally overspend a budget that lipas knows about.
+  accidentally overspend a budget that LIPAS knows about.
 
 - **LLM calls are deterministically replayable.** Record a run, replay
   it, and the adapter is short-circuited: no network, no tokens, no

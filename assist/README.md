@@ -4,7 +4,7 @@ This directory preserves the reasoning that shaped LIPAS. It is useful for
 contributors and for discussing future work, but it is **not** the public API
 or semantic contract.
 
-For the current 0.9.5 runtime, read [Execution Model](../docs/execution-model.md)
+For the current 0.9.6 runtime, read [Execution Model](../docs/execution-model.md)
 first, then the public README and `STABILITY.md`. Code and contract tests win
 whenever an archived note differs from the implementation.
 

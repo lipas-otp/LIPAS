@@ -1,6 +1,6 @@
 # Beta release gate
 
-Current release target: **0.9.5**. The runtime is suitable for public beta
+Current release target: **0.9.6**. The runtime is suitable for public beta
 use: all in-repository tests pass and package wheel construction is verified.
 The remaining gates below are the release work required before calling the API
 stable enough for 1.0.

@@ -1,4 +1,4 @@
-# lipas
+# LIPAS
 
 **LIPAS is a claim-based execution model for reliable AI agents**, with a
 small Python runtime as its reference implementation. Every LLM call, tool
@@ -11,7 +11,7 @@ agents, communicate through messages, make supervision visible, and treat
 failure recovery as a first-class part of the runtime. It is a Python agent
 runtime, not a BEAM replacement.
 
-> **Status: public beta — 0.9.5.** ReAct is the default single-agent runner;
+> **Status: public beta — 0.9.6.** ReAct is the default single-agent runner;
 > named multi-agent handoffs run through a durable leased mailbox. SQLite
 > persistence, side-effect-aware tool replay, Ollama, injected-client Anthropic,
 > and OpenAI Responses are available. Provider-level exactly-once remains
@@ -19,7 +19,7 @@ runtime, not a BEAM replacement.
 
 ---
 
-## Why lipas
+## Why LIPAS
 
 **LIPAS is an auditable agent runtime.** You write ordinary Python
 code; LIPAS adds explicit side effects, budgets, replay, supervision, and
@@ -47,7 +47,7 @@ halt the normal ReAct lifecycle.
 
 Four things you get for free, just by registering a tool:
 
-| You write | lipas gives you |
+| You write | LIPAS gives you |
 |---|---|
 | `@tool(side_effect=PURE)` | an explicit replay-safety classification |
 | `CapabilityRow(budgets={...})` | pre-flight rejection — never overrun |
@@ -55,6 +55,24 @@ Four things you get for free, just by registering a tool:
 | `harness.call(...)` | full `intent → result → spend` audit trail |
 
 Each maps to a runnable example — see [Quickstart](#quickstart).
+
+### Try it before you write an application
+
+The optional `lipas` command is an interactive prototype and inspection
+surface. It generates ordinary Python and reads the same
+claim sessions as the library:
+
+```bash
+lipas init support-demo --model gemma4:12b
+cd support-demo
+lipas chat --factory agent:build_agent
+lipas trace runs/chat.db
+lipas effects runs/chat.db
+```
+
+See [CLI: prototype and inspect](docs/cli.md) for the complete small surface.
+Before installing the package, use `python -m lipas.cli` from a source checkout
+instead of the `lipas` executable.
 
 ---
 
@@ -137,7 +155,7 @@ is a no-op, order doesn't matter.
 If you want the algebraic motivation, read
 [the conceptual Claim Algebra note](assist/one-calculus.md). The current
 contract is [Execution Model](docs/execution-model.md), not the archived
-design notes. If you just want to use lipas, you don't have to read either.
+design notes. If you just want to use LIPAS, you don't have to read either.
 
 ### SideEffectClass — required, not optional
 
@@ -157,7 +175,7 @@ runtime surprise.
 
 ### Portable Markdown skills
 
-`lipas` reads `SKILL.md` with YAML front matter. It requires only the portable
+LIPAS reads `SKILL.md` with YAML front matter. It requires only the portable
 `name` and `description` fields and preserves all other front matter verbatim.
 That means a skill directory can be shared with Claude Code-style skills and
 Codex/ChatGPT-oriented Markdown skill tooling; fields such as `allowed-tools`,
@@ -295,20 +313,6 @@ an exactly-once delivery guarantee.
 ---
 
 ## Roadmap
-
-1. **Provider hardening:** add recorded OpenAI/Anthropic/Ollama fixtures for
-   rate limits, malformed responses, interruption, current pricing, and SDK
-   convenience construction where it adds value.
-2. **Operation integrations:** add provider-specific reconciliation and
-   compensation adapters on top of `OperationJournal`.
-3. **Multi-agent policy:** add delegated capability boundaries, mailbox replay
-   fixtures, and cross-agent budget policy.
-4. **1.0 convergence:** stabilize the normalized adapter types, claim/session
-   migration rules, and the public Python API without introducing a DSL.
-
-`Team` and `project_supervisor(...)` provide the supervision path today.
-The remaining work is policy enforcement across agent boundaries and API
-stability, not another workflow engine.
 
 For a complete first project using ordinary Python functions, an agent, replay,
 and a mailbox team member, see [Getting started](docs/getting-started.md).
