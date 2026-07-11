@@ -15,7 +15,7 @@ without a model provider unless noted.
 | `07_tool_replay.py` | Strict tool tape substitution | No provider |
 | `08_supervisor.py` | Supervisor recommendation claims | No provider |
 | `09_loop_with_supervisor.py` | Manual LLM loop plus gate | Ollama |
-| `10_agentcell_mailbox.py` | Named worker handoff and durable mailbox | No provider |
+| `10_team_mailbox.py` | Named Team-member handoff and durable mailbox | No provider |
 | `11_operation_journal.py` | Uncertain external operation and reconciliation | No provider |
 | `12_supervised_agent.py` | High-level `Agent(supervisor_policy=...)` | No provider |
 

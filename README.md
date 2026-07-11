@@ -6,11 +6,11 @@ makes a run inspectable and replayable without hiding side effects behind an
 opaque framework.
 
 LIPAS takes a small cue from OTP-style systems: isolate work into explicit
-workers, communicate through messages, make supervision visible, and treat
+agents, communicate through messages, make supervision visible, and treat
 failure recovery as a first-class part of the runtime. It is a Python agent
 runtime, not a BEAM replacement.
 
-> **Status: public beta — 0.9.0b1.** ReAct is the default single-agent runner;
+> **Status: public beta — 0.9.3.** ReAct is the default single-agent runner;
 > named multi-agent handoffs run through a durable leased mailbox. SQLite
 > persistence, side-effect-aware tool replay, Ollama, injected-client Anthropic,
 > and OpenAI Responses are available. Provider-level exactly-once remains
@@ -20,9 +20,23 @@ runtime, not a BEAM replacement.
 
 ## Why lipas
 
+**LIPAS is an auditable agent runtime.** You write ordinary Python
+code; LIPAS adds explicit side effects, budgets, replay, supervision, and
+durable handoffs only where you need them. Start with `Agent`; add `Team` only
+when work must be delegated.
+
+```text
+Agent       = one assistant that thinks and uses tools
+@tool       = an explicit capability/effect
+Team        = named assistants/functions communicating through a durable mailbox
+```
+
+Read the [Agent and Team mental model](docs/mental-model.md) before choosing an
+API. It is the shortest route to understanding how the pieces fit together.
+
 ### Reliable-core guarantees
 
-Within one agent cell, LIPAS closes the normal reason/act loop around the same
+Within one Agent, LIPAS closes the normal reason/act loop around the same
 audited rowset: guards decide authority before calls, capability budgets gate
 spend, effect claims record intent/result, and replay policy decides what may
 touch the live world. `Supervisor` policies are now available directly on
@@ -74,47 +88,35 @@ print(result.text)
 agent.close()
 ```
 
-`Agent` is deliberately thin and represents one ReAct worker. Use
+`Agent` is deliberately thin and represents one ReAct loop. Use
 `DeclarativeAgent`, `LLMHarness`, and `ToolHarness` directly when you need
 custom rows, guards, replay wiring, or a different behaviour loop.
 
-### Multi-agent handoff
-
-For multi-agent work, agents remain ordinary independently configured workers.
-`AgentOrchestrator` adds the coordination boundary: named recipients, a
-durable mailbox, leases, acknowledgement ownership, and recovery of abandoned
-work. The message id is the stable idempotency/replay key for the receiving
-agent's external operations.
+For a small team, the same ordinary-Python style is enough:
 
 ```python
-from lipas import AgentOrchestrator, Mailbox
+from lipas import Team
 
-mailbox = Mailbox("runs/team-mailbox.db")
-team = AgentOrchestrator(mailbox)
+async def researcher(prompt):
+    return {"finding": f"researched: {prompt}"}
 
-async def researcher(message):
-    # Delegate to a separately configured Agent here. Use message.id as the
-    # idempotency key for any provider operation it initiates.
-    return {"finding": f"researched {message.payload['topic']}"}
-
-team.register("researcher", researcher)
-result = await team.handoff(
-    sender="supervisor",
-    recipient="researcher",
-    payload={"topic": "LIPAS release risks"},
-    message_id="research-001",
-)
+team = Team.open("runs/team.db").add("research", researcher)
+finding = await team.ask("research", "release risks")
+team.close()
 ```
 
-Delivery is at-least-once, intentionally: a crashed worker's lease expires and
-the message can be reclaimed. An acknowledged message cannot be run again.
+### Team handoff
 
-### Supervised agent cells
+`Team` gives named members a durable mailbox. Delivery is at-least-once: a
+crashed member's lease expires and the message can be reclaimed. An
+acknowledged message cannot be run again. Pass `message_id=` whenever a
+handoff must retain a stable idempotency/replay key.
 
-`AgentCell` is the small composition unit for a worker that participates in a
-team. It accepts an ordinary async Python function or an `Agent`-compatible
-callable; there is no graph or workflow DSL to learn. Attach a
-`SupervisorGate` only when that worker needs advisory retry, halt, or human
+### Supervised agents and team members
+
+Each named Team member can be an ordinary async Python function or an `Agent`-
+compatible callable. There is no graph or workflow DSL to learn. Attach a
+`SupervisorGate` only when that member needs advisory retry, halt, or human
 escalation policy. `project_supervisor(rowset.store)` then gives application
 code an indexed view of the recommendations.
 
@@ -296,12 +298,12 @@ an exactly-once delivery guarantee.
 4. **1.0 convergence:** stabilize the normalized adapter types, claim/session
    migration rules, and the public Python API without introducing a DSL.
 
-`AgentCell` and `project_supervisor(...)` provide the supervision path today.
+`Team` and `project_supervisor(...)` provide the supervision path today.
 The remaining work is policy enforcement across agent boundaries and API
 stability, not another workflow engine.
 
 For a complete first project using ordinary Python functions, an agent, replay,
-and a mailbox worker, see [Getting started](docs/getting-started.md).
+and a mailbox team member, see [Getting started](docs/getting-started.md).
 For focused runnable scenarios, see the [examples guide](examples/README.md).
 
 ---

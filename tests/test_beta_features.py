@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from lipas.adapter import Done, OpenAIResponsesAdapter, Request, ToolSpec, complete
-from lipas.cell import AgentCell
+from lipas.team import Team
 from lipas.calculus import Claim
 from lipas.agent import Agent
 from lipas.operations import OperationJournal, PendingOperation
@@ -92,13 +92,21 @@ def test_mailbox_expired_lease_is_recoverable(tmp_path):
     assert recovered.id == "m1" and recovered.attempts == 2
 
 
-def test_agent_cell_adapts_an_ordinary_async_function(tmp_path):
+def test_team_adapts_an_ordinary_async_function(tmp_path):
     mailbox, team = Mailbox(str(tmp_path / "mailbox.db")), None
     async def echo(prompt): return {"echo": prompt}
-    cell = AgentCell("echo", echo)
     team = AgentOrchestrator(mailbox)
-    team.register(cell.name, cell.handle)
+    team.register("echo", lambda message: echo(message.payload["prompt"]))
     assert asyncio.run(team.handoff(sender="root", recipient="echo", payload={"prompt": "hello"})) == {"echo": "hello"}
+
+
+def test_team_is_a_small_facade_over_agent_cells(tmp_path):
+    async def upper(prompt): return str(prompt).upper()
+    team = Team.open(str(tmp_path / "team.db")).add("upper", upper)
+    try:
+        assert asyncio.run(team.ask("upper", "hello", message_id="upper-1")) == "HELLO"
+    finally:
+        team.close()
 
 
 def test_supervisor_projection_reads_tag_indexed_recommendations():

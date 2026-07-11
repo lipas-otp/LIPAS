@@ -2,7 +2,7 @@
 
 LIPAS is intentionally a normal Python library. A user should be able to
 construct an `Agent`, decorate ordinary Python functions as tools, and call an
-agent or an `AgentCell` without adopting a graph DSL, generated configuration,
+agent or a Team member without adopting a graph DSL, generated configuration,
 or a hosted control plane.
 
 ## 1.0 candidate core
@@ -14,7 +14,7 @@ The APIs being stabilized first are the smallest reliable kernel:
 - append-only ClaimStore/RowSet semantics and effect intent/result/spend audit;
 - `replay()` / `ToolReplayer` safety semantics;
 - normalized adapter-layer `Request`, `Reply`, `Usage`, and stream events;
-- `Mailbox`, `AgentOrchestrator`, and `AgentCell` at-least-once semantics.
+- `Team` at-least-once handoff semantics.
 - `Supervisor` policy integration with the default `Agent` ReAct lifecycle and
   tag-indexed `project_supervisor(...)` queries.
 

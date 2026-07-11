@@ -86,35 +86,35 @@ with replay("runs/support.db") as run:
 Use live reroute only deliberately. An `EXTERNAL_WRITE` is refused unless you
 explicitly opt in; replay safety is not a claim of exactly-once delivery.
 
-## 4. Add a second worker without a workflow DSL
+## 4. Add a team member without a workflow DSL
 
-`AgentCell` adapts an ordinary async function to the durable mailbox. A
-message is leased while it is handled, acknowledged on success, released on
-failure, and reclaimable after lease expiry.
+`Team` adapts an ordinary async function or an Agent to the durable mailbox.
+is the small convenience entry point; a message is leased while it is handled,
+acknowledged on success, released on failure, and reclaimable after lease
+expiry.
 
 ```python
-from lipas import AgentCell, AgentOrchestrator, Mailbox
+from lipas import Team
 
 
 async def researcher(prompt):
     return {"finding": f"research complete: {prompt}"}
 
 
-mailbox = Mailbox("runs/team.db")
-team = AgentOrchestrator(mailbox)
-cell = AgentCell("researcher", researcher)
-team.register(cell.name, cell.handle)
+team = Team.open("runs/team.db")
+team.add("researcher", researcher)
 
-result = await team.handoff(
+result = await team.ask(
+    "researcher",
+    "check release risks",
     sender="planner",
-    recipient="researcher",
-    payload={"prompt": "check release risks"},
     message_id="release-risk-001",
 )
 print(result)
+team.close()
 ```
 
-Treat `message_id` as the idempotency/replay key when the worker initiates an
+Treat `message_id` as the idempotency/replay key when the member initiates an
 external operation. Delivery is at-least-once by design.
 
 ## 5. Add supervision when policy matters

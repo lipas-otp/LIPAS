@@ -1,20 +1,22 @@
 # Changelog
 
-## [0.9.0b1] — 2026-07-11
+## [0.9.3] — 2026-07-11
 
 ### Added
 
-- `AgentCell`: a small adapter that makes ordinary async Python workers and
-  agents mailbox recipients without introducing a workflow DSL.
+- `Team`: a small facade that makes ordinary async Python functions and
+  Agents durable named team members without introducing a workflow DSL.
 - `project_supervisor(store)`: a tag-indexed read model for retry,
   termination, and escalation recommendations.
 - `STABILITY.md`, defining the 1.0 candidate core and experimental boundary.
 - Default `Agent(supervisor_policy=...)` wiring, so advisory supervisor
   termination/escalation is evaluated in the ReAct lifecycle.
+- `Team.add(name, handler)`, the direct registration API for named members.
+- Agent-and-Team mental-model guide and a progressive documentation path.
 
 ### Verified
 
-- 376 tests pass across the audit, replay, budget, supervision, mailbox, and
+- 377 tests pass across the audit, replay, budget, supervision, mailbox, and
   provider-adapter contracts.
 
 ## [0.8.0b1] — 2026-07-11
