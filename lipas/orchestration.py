@@ -31,7 +31,7 @@ class MailboxMessage:
 class Mailbox:
     """SQLite mailbox with explicit claim/ack lease ownership.
 
-    A worker crash leaves a lease behind. ``recover_expired`` makes it pending
+    A member crash leaves a lease behind. ``recover_expired`` makes it pending
     again, which gives at-least-once delivery without pretending duplicates are
     impossible.  Handlers must use ``message.id`` as their operation key.
     """
@@ -120,7 +120,7 @@ class AgentOrchestrator:
         if sent.status == "acknowledged": raise MailboxLeaseError(f"message {sent.id!r} was already acknowledged")
         messages = self.mailbox.claim(recipient, limit=1, lease_seconds=self.lease_seconds)
         message = next((m for m in messages if m.id == sent.id), None)
-        if message is None: raise MailboxLeaseError(f"message {sent.id!r} is currently leased by another worker")
+        if message is None: raise MailboxLeaseError(f"message {sent.id!r} is currently leased by another member")
         try:
             result = await self._agents[recipient](message)
         except BaseException:
