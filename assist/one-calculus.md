@@ -1,5 +1,10 @@
 # LIPAS Foundation: The Claim Algebra
 
+> **Conceptual foundation, not a literal API schema.** The current `Claim`
+> object uses a tag plus a field mapping and is specified operationally in
+> [`docs/execution-model.md`](../docs/execution-model.md). This note preserves
+> the algebraic motivation for claims and folds.
+
 
 ## 1. Purpose
 

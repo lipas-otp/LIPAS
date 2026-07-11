@@ -1,5 +1,10 @@
 # B3 — Supervisor: Design Notes
 
+> **Current design background.** This explains the implemented Supervisor
+> integration; the public entry point is `Agent(supervisor_policy=...)` and
+> the query API is `project_supervisor(...)`. It is not a broader workflow or
+> distributed-supervision contract.
+
 ## Where supervisor lives in the architecture
 
 LIPAS has no single "agent loop" file. Each `AgentBehaviour` (ReAct,
@@ -28,7 +33,7 @@ The forward direction ("every `supervisor_retry` produces an effect")
 is intentionally not required. This keeps Supervisor pure-observation
 and lets behaviours decide locally what to do.
 
-In ReActAgent v0.1:
+In the current ReActAgent:
 - `supervisor_terminate` → early `FinalResult(stop_reason="supervisor_terminate")`.
 - `supervisor_escalate`  → early `FinalResult(stop_reason="supervisor_escalate", metadata={"supervisor_payload": ...})`.
 - `supervisor_retry`     → recorded but **not** acted on. ReAct already

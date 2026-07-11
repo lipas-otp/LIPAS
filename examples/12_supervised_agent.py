@@ -1,6 +1,6 @@
 """Use a Supervisor policy from the ordinary high-level Agent API.
 
-Run: ``python examples/12_supervised_agent.py``
+Run from the repository root: ``python -m examples.12_supervised_agent``
 
 FakeAdapter keeps the example offline. Substitute OllamaAdapter or an OpenAI
 adapter in a real application; supervision still observes the same claim tape.

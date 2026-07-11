@@ -27,6 +27,7 @@ What this demo asserts about lipas v0.1:
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, AsyncIterator
 
 from lipas.adapter import Request
@@ -96,6 +97,7 @@ SYSTEM_PROMPT = (
     "You are a calculator agent. Use the provided tools to compute "
     "answers; do not do arithmetic in your head."
 )
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 
 
 def build_rowset() -> RowSet:
@@ -129,7 +131,7 @@ def build_agent(
     )
     tool_harness = ToolHarness(tools=tools, rowset=rowset)
     request_template = Request(
-        model="gemma4",
+        model=MODEL,
         messages=(),
         tools=(),
         max_tokens=1024,

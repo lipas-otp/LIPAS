@@ -8,10 +8,10 @@ Demonstrates the four core moves of LLMHarness:
 
 Prerequisite:
   $ ollama serve            # daemon listening on :11434
-  $ ollama pull gemma4      # or whatever LIPAS_OLLAMA_MODEL points at
+  $ ollama pull gemma4:12b  # or whatever LIPAS_OLLAMA_MODEL points at
 
 Run:
-  $ python examples/01_single_call.py
+  $ python -m examples.01_single_call
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from lipas.rows.effect import EffectRow
 from lipas.store import ClaimStore
 
 
-MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4")
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 
 
 def reply_text(reply) -> str:

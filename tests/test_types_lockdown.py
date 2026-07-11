@@ -16,7 +16,7 @@ STOP and revisit the design discussion before "fixing" the tests.
 import asyncio
 import threading
 import pytest
-from lipas import (
+from lipas.types import (
     ToolCall, Usage, Reply, ThinkingBlock,
     ToolAlreadyInvoked, LipasError,
 )

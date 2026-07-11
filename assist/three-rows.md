@@ -1,5 +1,10 @@
 # The three rows, and why just three
 
+> **Conceptual foundation, not a public API reference.** Row ownership and
+> supported namespaces evolve with the runtime; see the current row modules
+> and [`docs/execution-model.md`](../docs/execution-model.md) for executable
+> semantics.
+
 ## 1. What the calculus leaves unanswered
 
 The calculus gives you a single operation — a join on a field-indexed product semilattice — with three algebraic properties: idempotent, commutative, associative. From those properties you get replay safety, ordering independence, and monotone convergence. That's a lot for one symbol to buy.

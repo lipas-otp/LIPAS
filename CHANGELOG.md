@@ -1,9 +1,19 @@
 # Changelog
 
-## [0.9.3] — 2026-07-11
+## [0.9.5] — 2026-07-11
 
 ### Added
 
+- Claim-linked coordination: `Team` now owns a durable audit session, and an
+  Agent invoked by a Team handoff records its stable `message_id` as
+  `caused_by` on LLM and tool effect intents.
+- Claim-linked external operations: `OperationJournal` can fold durable
+  prepared/uncertain/succeeded/failed transitions into a supplied claim
+  session and associate them with an originating `effect_id`.
+- `docs/execution-model.md`, the concise normative description of claims,
+  folds, effects, replay, coordination, and the external-effect boundary.
+- `lipas.adapter` is now the canonical root-level provider-neutral interchange
+  surface (`Request`, `Reply`, content, usage, and stream events).
 - `Team`: a small facade that makes ordinary async Python functions and
   Agents durable named team members without introducing a workflow DSL.
 - `project_supervisor(store)`: a tag-indexed read model for retry,
@@ -13,10 +23,22 @@
   termination/escalation is evaluated in the ReAct lifecycle.
 - `Team.add(name, handler)`, the direct registration API for named members.
 - Agent-and-Team mental-model guide and a progressive documentation path.
+- `assist/README.md`, which classifies the design notes as conceptual,
+  historical, or unimplemented so they cannot be mistaken for the 0.9.5
+  runtime contract.
+
+### Changed
+
+- The public vocabulary is now `Agent` / `Tool` / `Team`; Team is a small
+  durable-handoff facade, not a graph or workflow DSL.
+- Ollama quickstart and examples now default to `gemma4:12b`; lower-level
+  examples retain `LIPAS_OLLAMA_MODEL` as an explicit local override.
+- Earlier reliable-core additions are consolidated in this release: `Team`,
+  default Agent supervisor wiring, and `project_supervisor(...)`.
 
 ### Verified
 
-- 377 tests pass across the audit, replay, budget, supervision, mailbox, and
+- 379 tests pass across the audit, replay, budget, supervision, mailbox, and
   provider-adapter contracts.
 
 ## [0.8.0b1] — 2026-07-11

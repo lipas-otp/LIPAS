@@ -10,6 +10,7 @@ Verifies the P3.1 wire-up end-to-end:
 from __future__ import annotations
 
 import asyncio
+import os
 
 from lipas.adapter import Request
 # Replace with your adapter of choice; OllamaAdapter is a good local default.
@@ -25,6 +26,8 @@ from lipas.rows.history import HistoryRow
 from lipas.store import ClaimStore
 from lipas.tool_harness import ToolHarness
 from lipas.tools import SideEffectClass, ToolRegistry, tool
+
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 
 
 # ── Tools (PURE: replay-safe re-execution, no side effects) ───────────
@@ -70,7 +73,7 @@ def build_agent() -> tuple[ReActAgent, RowSet]:
     tool_harness = ToolHarness(tools=tools, rowset=rowset)
 
     request_template = Request(
-        model="gemma4",
+        model=MODEL,
         messages=(),         # filled per-iteration by ReActAgent
         tools=(),            # filled per-iteration
         max_tokens=1024,

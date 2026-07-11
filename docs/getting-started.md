@@ -9,7 +9,7 @@ the reliability boundary; your application remains normal Python code.
 ```bash
 pip install 'lipas[ollama]'
 ollama serve
-ollama pull qwen2.5
+ollama pull gemma4:12b
 ```
 
 Use `pip install 'lipas[openai]'` when constructing an OpenAI Responses
@@ -36,7 +36,7 @@ def lookup_customer(customer_id: str) -> str:
 async def main() -> None:
     agent = Agent(
         adapter=OllamaAdapter(),
-        model="qwen2.5",
+        model="gemma4:12b",
         instructions="Use lookup_customer when a customer id is given.",
         tools=[lookup_customer],
         session_path="runs/support.db",
@@ -78,8 +78,9 @@ and tool results are used without contacting the live model or tool provider.
 from lipas import replay
 
 with replay("runs/support.db") as run:
-    # Build an Agent/LLM using run.rowset, run.replay_cursor, and
-    # run.tool_replayer. See examples/06_react_replay.py for complete wiring.
+    # Build LLMHarness and ToolHarness instances using run.rowset,
+    # run.replay_cursor, and run.tool_replayer. See
+    # examples/06_react_replay.py for complete wiring.
     pass
 ```
 
@@ -88,8 +89,8 @@ explicitly opt in; replay safety is not a claim of exactly-once delivery.
 
 ## 4. Add a team member without a workflow DSL
 
-`Team` adapts an ordinary async function or an Agent to the durable mailbox.
-is the small convenience entry point; a message is leased while it is handled,
+`Team` is the small convenience entry point that adapts an ordinary async
+function or an Agent to a durable mailbox. A message is leased while handled,
 acknowledged on success, released on failure, and reclaimable after lease
 expiry.
 

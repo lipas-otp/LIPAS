@@ -1,6 +1,6 @@
 """External-operation recovery: prepare, uncertainty, reconciliation.
 
-Run: ``python examples/11_operation_journal.py``
+Run from the repository root: ``python -m examples.11_operation_journal``
 
 This example deliberately does not pretend a failed provider call did not
 happen. It shows why the same idempotency key cannot simply be re-sent after a

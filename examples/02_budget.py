@@ -23,7 +23,7 @@ from lipas.rows.effect import EffectRow
 from lipas.store import ClaimStore
 
 
-MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4")
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 
 
 async def main() -> None:

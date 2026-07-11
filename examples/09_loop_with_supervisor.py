@@ -1,33 +1,25 @@
-"""
-examples/loop_with_supervisor.py
+"""A supervised Agent using the current high-level API.
 
-Minimal end-to-end shape with the real Supervisor / Policy API,
-running against a local Ollama model.
+Run after ``ollama serve`` and ``ollama pull gemma4:12b``:
+    python -m examples.09_loop_with_supervisor
 
-Run:
-    ollama serve            # in another terminal
-    python -m examples.loop_with_supervisor
+The policy is intentionally non-blocking. It shows that supervision observes
+the ordinary Agent effect tape without requiring a separate loop or gate.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
-
-from lipas.adapter.ollama import OllamaAdapter
-from lipas.calculus import BeliefContext
-from lipas.llm import LLM
-from lipas.rows import EffectRow, EffectView, RowSet
-from lipas.store import ClaimStore
+import os
+from lipas import Agent, project_supervisor
+from lipas.adapter import OllamaAdapter
 from lipas.supervisor import (
     Policy,
     PolicyRule,
-    Predicate,
-    Supervisor,
-    SupervisorAction,
-    TerminateAction,
+    RetryAction,
 )
-from lipas.supervisor_gate import SupervisorGate
 from lipas.tools import tool, SideEffectClass
+
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 
 
 # ── 1. Tool ─────────────────────────────────────────────────────────
@@ -38,80 +30,35 @@ def search(query: str) -> str:
     return f"(fake) top result for: {query}"
 
 
-# ── 2. A trivial predicate ──────────────────────────────────────────
-#
-# Predicates take (EffectView, BeliefContext) and return ONE action
-# (RetryAction | TerminateAction | EscalateAction) or None.
-
-def never_terminate() -> Predicate:
-    def predicate(view: EffectView, ctx: BeliefContext) -> Optional[SupervisorAction]:
+def observe_only(_view, _ctx):
+    """Recommend retry only for a genuinely interrupted effect."""
+    if not _view.orphans:
         return None
-    return predicate
-
-
-# ── 3. Loop ─────────────────────────────────────────────────────────
-
-async def run(user_question: str, *, max_turns: int = 20) -> str:
-    store  = ClaimStore()
-    rowset = RowSet(store=store, rows=[EffectRow()])
-    llm = LLM(
-        adapter = OllamaAdapter(timeout_s=500.0),                  # localhost:11434, no pricing
-        rowset  = rowset,
-        model   = "gemma4:26b",
-        system  = "You are a careful research assistant.",
-        tools   = [search],
+    return RetryAction(
+        target_effect_id=_view.orphans[0],
+        max_attempts=1,
+        reason="demonstration policy",
     )
 
-    policy = Policy.of(
-        PolicyRule(name="never_terminate", predicate=never_terminate()),
+
+async def run(user_question: str) -> str:
+    policy = Policy.of(PolicyRule("observe_only", observe_only))
+    agent = Agent(
+        adapter=OllamaAdapter(),
+        model=MODEL,
+        instructions="Use search for factual questions and answer concisely.",
+        tools=[search],
+        supervisor_policy=policy,
     )
-    supervisor = Supervisor(
-        policy     = policy,
-        rowset     = rowset,
-        session_id = "example-session-1",
-    )
-    gate = SupervisorGate(supervisor=supervisor, rowset=rowset)
-
-    ...
-    messages = [{"role": "user", "content": user_question}]
-
-
-    reply = None
-
-    for turn in range(max_turns):
-        print(f"[turn {turn}] calling llm...", flush=True)
-        reply = await llm(messages, tools=[...])
-        if reply.is_error:
-            print(f"[error] {reply.error_detail}")
-            break
-
-        print(f"[turn {turn}] stop_reason={reply.stop_reason} "
-              f"tool_calls={len(reply.tool_calls)} text={reply.text!r}",
-              flush=True)
-        messages.append(reply.as_assistant_message())
-
-        tool_results = []
-        for call in reply.tool_calls:
-            print(f"[turn {turn}] invoking tool {call.name}({call.arguments})", flush=True)
-            payload = await call.invoke()
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": call.id,
-                "content":     str(payload),
-            })
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
-
-        if not reply.tool_calls and reply.stop_reason == "end_turn":
-            print(f"[turn {turn}] end_turn, breaking", flush=True)
-            break
-
-        if not gate.should_continue():
-            print(f"[turn {turn}] gate stop", flush=True)
-            break
-
-    print(f"[done] final reply.text={reply.text if reply else None!r}", flush=True)
-    return reply.text if reply else ""
+    try:
+        result = await agent(user_question)
+        projection = project_supervisor(agent.rowset.store)
+        print("stop reason:", result.stop_reason)
+        print("answer:", result.text)
+        print("recorded retry recommendations:", len(projection.retries))
+        return result.text
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from lipas.rows.effect import EffectRow
 from lipas.store import ClaimStore
 
 
-MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma3")
+MODEL = os.environ.get("LIPAS_OLLAMA_MODEL", "gemma4:12b")
 FORBIDDEN = ("password", "secret_key")
 
 

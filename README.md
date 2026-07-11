@@ -1,16 +1,17 @@
 # lipas
 
-An auditable Python agent runtime: every LLM call, tool invocation,
-rejection, replay choice, and budget charge is an append-only claim. This
-makes a run inspectable and replayable without hiding side effects behind an
-opaque framework.
+**LIPAS is a claim-based execution model for reliable AI agents**, with a
+small Python runtime as its reference implementation. Every LLM call, tool
+invocation, rejection, replay choice, mailbox transition, and budget charge is
+an append-only claim. This makes a run inspectable and replayable without
+hiding side effects behind an opaque framework.
 
 LIPAS takes a small cue from OTP-style systems: isolate work into explicit
 agents, communicate through messages, make supervision visible, and treat
 failure recovery as a first-class part of the runtime. It is a Python agent
 runtime, not a BEAM replacement.
 
-> **Status: public beta — 0.9.3.** ReAct is the default single-agent runner;
+> **Status: public beta — 0.9.5.** ReAct is the default single-agent runner;
 > named multi-agent handoffs run through a durable leased mailbox. SQLite
 > persistence, side-effect-aware tool replay, Ollama, injected-client Anthropic,
 > and OpenAI Responses are available. Provider-level exactly-once remains
@@ -32,7 +33,8 @@ Team        = named assistants/functions communicating through a durable mailbox
 ```
 
 Read the [Agent and Team mental model](docs/mental-model.md) before choosing an
-API. It is the shortest route to understanding how the pieces fit together.
+API, then the short normative [Execution Model](docs/execution-model.md) for
+the guarantees and boundaries.
 
 ### Reliable-core guarantees
 
@@ -47,7 +49,7 @@ Four things you get for free, just by registering a tool:
 
 | You write | lipas gives you |
 |---|---|
-| `@tool(side_effect=PURE)` | retries are safe, replay is deterministic |
+| `@tool(side_effect=PURE)` | an explicit replay-safety classification |
 | `CapabilityRow(budgets={...})` | pre-flight rejection — never overrun |
 | `Guard.check(...)` | typed deny reasons folded as claims |
 | `harness.call(...)` | full `intent → result → spend` audit trail |
@@ -61,7 +63,7 @@ Each maps to a runnable example — see [Quickstart](#quickstart).
 ```bash
 pip install -e '.[ollama,dev]'
 ollama serve
-ollama pull qwen2.5
+ollama pull gemma4:12b
 ```
 
 ```python
@@ -77,7 +79,7 @@ def lookup_customer(customer_id: str) -> str:
 
 agent = Agent(
     adapter=OllamaAdapter(),
-    model="qwen2.5",
+    model="gemma4:12b",
     instructions="Answer concisely; use tools when useful.",
     tools=[lookup_customer],
     session_path="runs/support.db",  # omit for in-memory use
@@ -114,11 +116,11 @@ handoff must retain a stable idempotency/replay key.
 
 ### Supervised agents and team members
 
-Each named Team member can be an ordinary async Python function or an `Agent`-
-compatible callable. There is no graph or workflow DSL to learn. Attach a
-`SupervisorGate` only when that member needs advisory retry, halt, or human
-escalation policy. `project_supervisor(rowset.store)` then gives application
-code an indexed view of the recommendations.
+Each named Team member can be an ordinary async Python function or an `Agent`.
+There is no graph or workflow DSL to learn. Pass `supervisor_policy=` when an
+Agent needs advisory retry, halt, or human-escalation policy;
+`project_supervisor(agent.rowset.store)` gives application code an indexed view
+of the recorded recommendations.
 
 
 ---
@@ -132,9 +134,10 @@ LLM call, tool result, budget spend, guard rejection — same shape,
 same merge rule, same query API. Claims are idempotent: redelivery
 is a no-op, order doesn't matter.
 
-If you want to know **why** that gives you deterministic replay,
-read `assist/one-calculus.md`. If you just want to use lipas,
-you don't have to.
+If you want the algebraic motivation, read
+[the conceptual Claim Algebra note](assist/one-calculus.md). The current
+contract is [Execution Model](docs/execution-model.md), not the archived
+design notes. If you just want to use lipas, you don't have to read either.
 
 ### SideEffectClass — required, not optional
 
@@ -146,8 +149,9 @@ def add(a: float, b: float) -> float: ...
 def send_email(to: str, subject: str, body: str) -> dict: ...
 ```
 
-The harness reads `side_effect` and decides — without your code —
-whether to retry, whether to run guards, whether replay is safe.
+The harness reads `side_effect` to enforce replay policy and record the
+declared effect class. Tools are never blindly retried: a retry decision is
+application/behaviour policy because a live tool may have changed the world.
 Forgetting the annotation is a registration-time error, not a
 runtime surprise.
 
@@ -214,8 +218,10 @@ any out-of-band bypass. The ledger is never falsified.
 ### Guards — uniform across LLM and tool
 
 ```python
-class NoExternalOnWeekends(Guard):
-    def check(self, target, rowset) -> GuardVerdict:
+class NoExternalOnWeekends:
+    name = "no_external_on_weekends"
+
+    async def check(self, target, estimate) -> GuardVerdict:
         if isinstance(target, ToolTarget) \
                 and target.tool.side_effect == SideEffectClass.EXTERNAL_WRITE \
                 and datetime.now().weekday() >= 5:
@@ -248,10 +254,10 @@ touching the live system.
 
 | Class | Behavior | Safe to replay? |
 |---|---|---|
-| `PURE` | Recomputed; result identical | ✅ Yes |
-| `READ_ONLY` | Re-fetched; result may differ | ⚠️ Idempotent, not deterministic |
-| `IDEMPOTENT_WRITE` | Second write is a no-op | ✅ Safe in steady state |
-| `EXTERNAL_WRITE` | **Re-fires the side-effect** | ❌ Re-sends email, re-charges card |
+| `PURE` | May be live-rerouted only when you choose to do so | ✅ Usually safe |
+| `READ_ONLY` | A new read may observe different data | ⚠️ Safe, not deterministic |
+| `IDEMPOTENT_WRITE` | Requires the provider's idempotency contract | ⚠️ Provider-dependent |
+| `EXTERNAL_WRITE` | Refused by live reroute unless explicitly opted in | ❌ Default refusal |
 
 `ToolReplayer` is implemented. The default `replay(...)` session uses strict
 tape substitution: a recorded tool output is returned without live execution.
@@ -267,18 +273,20 @@ an exactly-once delivery guarantee.
   key before submission. A crashed/failed submission is `uncertain` and cannot
   be resent under the same key until reconciliation; a proven absent provider
   operation becomes `failed` and requires an intentional new key. Exactly-once
-  remains only as strong as the provider's idempotency contract.
-- **Streaming:** `LLM.stream(...)` yields normalized `Delta`, `ToolUseDelta`,
-  and terminal `Done` events while preserving the final audit record. A stream
-  is not retried after visible output.
+  remains only as strong as the provider's idempotency contract. Its durable
+  transitions can be folded into a claim tape and linked to an `effect_id`.
+- **Streaming:** `LLMHarness.stream(...)` yields normalized `Delta`,
+  `ToolUseDelta`, and terminal `Done` events while preserving the final audit
+  record. A stream is not retried after visible output.
 - **Multi-agent:** `Mailbox` and `AgentOrchestrator` provide named, auditable,
   at-least-once handoffs with claim leases, acknowledgement ownership, release
-  on handler failure, and expired-lease recovery. Receivers must use the stable
-  message id for replay and idempotency; distributed ownership is explicit.
+  on handler failure, and expired-lease recovery. `Team` owns a durable audit
+  session; Agent member effects carry the stable message id as `caused_by`.
+  Distributed ownership is still explicit.
 - **Provider support:** Ollama, injected-client Anthropic, and the SDK-optional
   OpenAI Responses adapter are supported.
-- **Team boundaries:** authority and budgets are enforced within each agent
-  cell today. Delegated cross-cell capability/budget policy and mailbox replay
+- **Team boundaries:** authority and budgets are enforced within each Agent
+  today. Delegated cross-Team capability/budget policy and mailbox replay
   are not yet part of the default runtime contract.
 - **Provider operations:** `OperationJournal` supplies durable state and
   reconciliation semantics, but provider-specific external-write tools must

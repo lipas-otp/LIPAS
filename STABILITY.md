@@ -28,8 +28,8 @@ hole.
 - `OperationJournal` provider reconciliation/compensation adapters;
 - cross-agent delegated capability and budget policy;
 - SQLite multi-process ownership and claim-schema migrations;
-- the legacy compatibility types exported from `lipas.types`.
+- the private `lipas.types` migration module and its legacy runner.
 
-New integrations should use the provider-neutral shapes from `lipas.adapter`.
-The legacy root type surface remains available during beta while it is
-converged deliberately, rather than silently changing a public import.
+New integrations should use the provider-neutral shapes from `lipas.adapter`
+(also re-exported from `lipas`). `lipas.types` is not a public runtime
+contract and will be removed once its serialization migration is complete.

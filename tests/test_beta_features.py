@@ -12,6 +12,7 @@ from lipas.calculus import Claim
 from lipas.agent import Agent
 from lipas.operations import OperationJournal, PendingOperation
 from lipas.orchestration import AgentOrchestrator, Mailbox, MailboxLeaseError
+from lipas.orchestration import TAG_AGENT_HANDOFF, TAG_AGENT_MAIL_ACK, TAG_AGENT_MAIL_CLAIM
 from lipas.store import ClaimStore
 from lipas.supervisor import (
     F_SUP_ATTEMPT_INDEX, F_SUP_IDEMPOTENCY_KEY, F_SUP_MAX_ATTEMPTS,
@@ -21,6 +22,10 @@ from lipas.supervisor import (
 )
 from lipas.supervisor_projection import project_supervisor
 from lipas.testing.fake_adapter import FakeAdapter
+from lipas.rows import RowSet
+from lipas.rows.capability import CapabilityRow
+from lipas.rows.effect import EffectRow, F_CAUSED_BY, F_EFFECT_ID, TAG_EFFECT_INTENT
+from lipas.rows.history import HistoryRow
 
 
 def test_openai_responses_normalizes_text_and_tool_calls():
@@ -66,6 +71,20 @@ def test_operation_journal_refuses_pending_row_after_restart(tmp_path):
         assert restarted.reconcile("charge-1", lambda _: (False, None, None)).state == "failed"
 
 
+def test_operation_journal_transitions_are_claims_linked_to_effect(tmp_path):
+    rowset = RowSet(ClaimStore(), [HistoryRow(), CapabilityRow(), EffectRow()])
+    journal = OperationJournal(str(tmp_path / "operations.db"), rowset=rowset)
+    journal.prepare(key="mail-1", kind="email", request={"to": "a"}, effect_id="call_aaaaaaaaaaaa")
+    journal.mark_uncertain("mail-1", error={"type": "timeout"})
+    journal.reconcile("mail-1", lambda _: (True, {"sent": True}, "provider-1"))
+    claims = list(rowset.store)
+    assert [claim.tag for claim in claims] == [
+        "operation_prepared", "operation_uncertain", "operation_succeeded",
+    ]
+    assert {claim.fields["effect_id"] for claim in claims} == {"call_aaaaaaaaaaaa"}
+    journal.close()
+
+
 def test_mailbox_is_idempotent_and_acknowledges_after_handler(tmp_path):
     mailbox = Mailbox(str(tmp_path / "mailbox.db"))
     orchestrator = AgentOrchestrator(mailbox)
@@ -100,13 +119,28 @@ def test_team_adapts_an_ordinary_async_function(tmp_path):
     assert asyncio.run(team.handoff(sender="root", recipient="echo", payload={"prompt": "hello"})) == {"echo": "hello"}
 
 
-def test_team_is_a_small_facade_over_agent_cells(tmp_path):
+def test_team_is_a_small_facade_over_named_members(tmp_path):
     async def upper(prompt): return str(prompt).upper()
     team = Team.open(str(tmp_path / "team.db")).add("upper", upper)
     try:
         assert asyncio.run(team.ask("upper", "hello", message_id="upper-1")) == "HELLO"
+        tags = [claim.tag for claim in team.rowset.store]
+        assert [TAG_AGENT_HANDOFF, TAG_AGENT_MAIL_CLAIM, TAG_AGENT_MAIL_ACK] == tags
     finally:
         team.close()
+
+
+def test_team_message_id_causes_agent_effect_trace(tmp_path):
+    agent = Agent(adapter=FakeAdapter.echoing(), model="fake")
+    team = Team.open(str(tmp_path / "team.db")).add("assistant", agent)
+    try:
+        asyncio.run(team.ask("assistant", "hello", message_id="research-1"))
+        intents = agent.rowset.store.filter(tag=TAG_EFFECT_INTENT)
+        assert intents and intents[0].fields[F_CAUSED_BY] == "research-1"
+        assert F_EFFECT_ID in intents[0].fields
+    finally:
+        team.close()
+        agent.close()
 
 
 def test_supervisor_projection_reads_tag_indexed_recommendations():
