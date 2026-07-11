@@ -141,13 +141,14 @@ class ReActAgent:
                     "react: harness returned error reply, terminating: %r",
                     reply.error_detail,
                 )
-                return FinalResult(
+                result = FinalResult(
                     text="",
                     state=state,
                     stop_reason=TerminationReason.ERROR,
                     error=reply.error_detail or {"type": "unknown"},
                     metadata={"iterations": state.iteration},
                 )
+                return self._maybe_supervisor_tick(state) or result
 
             # 3. Extract tool calls
             tool_calls = self._extract_tool_calls(reply)
@@ -165,12 +166,13 @@ class ReActAgent:
                     "react: natural stop at iteration %d",
                     next_state.iteration,
                 )
-                return FinalResult(
+                result = FinalResult(
                     text=final_text,
                     state=next_state,
                     stop_reason=TerminationReason.NATURAL_STOP,
                     metadata={"iterations": next_state.iteration},
                 )
+                return self._maybe_supervisor_tick(next_state) or result
 
             # 4. Act — dispatch via ToolHarness, one call at a time.
             tool_results: list[Mapping[str, Any]] = []

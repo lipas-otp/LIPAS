@@ -21,6 +21,7 @@ from .rows.history import HistoryRow
 from .session import open_session
 from .skills import Skill, SkillRegistry
 from .store import ClaimStore
+from .supervisor import Policy, Supervisor
 from .tools import Tool, ToolRegistry
 
 __all__ = ["Agent"]
@@ -52,6 +53,8 @@ class Agent:
     tool_guards: Sequence[Any] = ()
     request_extras: Mapping[str, Any] = field(default_factory=dict)
     registry: StrategyRegistry | None = None
+    supervisor_policy: Policy | None = None
+    supervisor_session_id: str | None = None
 
     rowset: RowSet = field(init=False)
     _delegate: DeclarativeAgent = field(init=False, repr=False)
@@ -67,12 +70,19 @@ class Agent:
             self.rowset = RowSet(ClaimStore(registry=self.registry), [
                 HistoryRow(), CapabilityRow(budgets=dict(self.budgets or {})), EffectRow(),
             ])
+        supervisor = None
+        if self.supervisor_policy is not None:
+            supervisor = Supervisor(
+                self.supervisor_policy, self.rowset,
+                self.supervisor_session_id or self.session_path or "in-memory-agent",
+            )
         self._delegate = DeclarativeAgent(
             adapter=self.adapter, tools=tool_registry, rowset=self.rowset,
             model=self.model, system=system, max_tokens=self.max_tokens,
             max_iterations=self.max_iterations, skills=self.skills,
             harness_kwargs=self.harness_kwargs, tool_guards=self.tool_guards,
             request_extras=self.request_extras,
+            supervisor=supervisor,
         )
 
     async def run(self, prompt: str | tuple[Any, ...] | list[Any], *, state: AgentState | None = None) -> FinalResult:

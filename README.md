@@ -5,15 +5,29 @@ rejection, replay choice, and budget charge is an append-only claim. This
 makes a run inspectable and replayable without hiding side effects behind an
 opaque framework.
 
-> **Status: alpha.** Single-agent ReAct, SQLite persistence, side-effect-aware
-> tool replay, Ollama and injected-client Anthropic adapters are implemented.
-> OpenAI Responses, auditable handoffs, and recovery-oriented external-operation
-> journals are available. Provider-level exactly-once remains impossible without
-> provider idempotency and reconciliation support.
+LIPAS takes a small cue from OTP-style systems: isolate work into explicit
+workers, communicate through messages, make supervision visible, and treat
+failure recovery as a first-class part of the runtime. It is a Python agent
+runtime, not a BEAM replacement.
+
+> **Status: public beta — 0.9.0b1.** ReAct is the default single-agent runner;
+> named multi-agent handoffs run through a durable leased mailbox. SQLite
+> persistence, side-effect-aware tool replay, Ollama, injected-client Anthropic,
+> and OpenAI Responses are available. Provider-level exactly-once remains
+> impossible without provider idempotency and reconciliation support.
 
 ---
 
 ## Why lipas
+
+### Reliable-core guarantees
+
+Within one agent cell, LIPAS closes the normal reason/act loop around the same
+audited rowset: guards decide authority before calls, capability budgets gate
+spend, effect claims record intent/result, and replay policy decides what may
+touch the live world. `Supervisor` policies are now available directly on
+`Agent`, so termination and escalation recommendations are recorded and can
+halt the normal ReAct lifecycle.
 
 Four things you get for free, just by registering a tool:
 
@@ -60,9 +74,49 @@ print(result.text)
 agent.close()
 ```
 
-`Agent` is deliberately thin. Use `DeclarativeAgent`, `LLMHarness`, and
-`ToolHarness` directly when you need custom rows, guards, replay wiring, or a
-different behaviour loop.
+`Agent` is deliberately thin and represents one ReAct worker. Use
+`DeclarativeAgent`, `LLMHarness`, and `ToolHarness` directly when you need
+custom rows, guards, replay wiring, or a different behaviour loop.
+
+### Multi-agent handoff
+
+For multi-agent work, agents remain ordinary independently configured workers.
+`AgentOrchestrator` adds the coordination boundary: named recipients, a
+durable mailbox, leases, acknowledgement ownership, and recovery of abandoned
+work. The message id is the stable idempotency/replay key for the receiving
+agent's external operations.
+
+```python
+from lipas import AgentOrchestrator, Mailbox
+
+mailbox = Mailbox("runs/team-mailbox.db")
+team = AgentOrchestrator(mailbox)
+
+async def researcher(message):
+    # Delegate to a separately configured Agent here. Use message.id as the
+    # idempotency key for any provider operation it initiates.
+    return {"finding": f"researched {message.payload['topic']}"}
+
+team.register("researcher", researcher)
+result = await team.handoff(
+    sender="supervisor",
+    recipient="researcher",
+    payload={"topic": "LIPAS release risks"},
+    message_id="research-001",
+)
+```
+
+Delivery is at-least-once, intentionally: a crashed worker's lease expires and
+the message can be reclaimed. An acknowledged message cannot be run again.
+
+### Supervised agent cells
+
+`AgentCell` is the small composition unit for a worker that participates in a
+team. It accepts an ordinary async Python function or an `Agent`-compatible
+callable; there is no graph or workflow DSL to learn. Attach a
+`SupervisorGate` only when that worker needs advisory retry, halt, or human
+escalation policy. `project_supervisor(rowset.store)` then gives application
+code an indexed view of the recommendations.
 
 
 ---
@@ -208,33 +262,47 @@ an exactly-once delivery guarantee.
 ## Current limitations and compatibility
 
 - **External effects:** `OperationJournal` persists a caller-provided idempotency
-  key before submission and marks interrupted submissions as `uncertain`.
-  Reconciliation remains mandatory; exactly-once is only as strong as the
-  provider's idempotency contract.
+  key before submission. A crashed/failed submission is `uncertain` and cannot
+  be resent under the same key until reconciliation; a proven absent provider
+  operation becomes `failed` and requires an intentional new key. Exactly-once
+  remains only as strong as the provider's idempotency contract.
 - **Streaming:** `LLM.stream(...)` yields normalized `Delta`, `ToolUseDelta`,
   and terminal `Done` events while preserving the final audit record. A stream
   is not retried after visible output.
 - **Multi-agent:** `Mailbox` and `AgentOrchestrator` provide named, auditable,
-  at-least-once handoffs. Receivers must use the stable message id for replay
-  and idempotency; distributed ownership is deliberately explicit.
-- **Provider support:** Ollama, injected-client Anthropic, and the optional-SDK
+  at-least-once handoffs with claim leases, acknowledgement ownership, release
+  on handler failure, and expired-lease recovery. Receivers must use the stable
+  message id for replay and idempotency; distributed ownership is explicit.
+- **Provider support:** Ollama, injected-client Anthropic, and the SDK-optional
   OpenAI Responses adapter are supported.
+- **Team boundaries:** authority and budgets are enforced within each agent
+  cell today. Delegated cross-cell capability/budget policy and mailbox replay
+  are not yet part of the default runtime contract.
+- **Provider operations:** `OperationJournal` supplies durable state and
+  reconciliation semantics, but provider-specific external-write tools must
+  explicitly pass its idempotency key until first-party adapters are added.
 
 ---
 
 ## Roadmap
 
-1. **Compatibility and test convergence:** finish migration of the remaining
-   pre-P3 test assertions and unify provider content shapes.
-2. **OpenAI hardening:** add provider contract fixtures, current pricing data,
-   and optional SDK convenience construction.
-3. **Operation recovery:** add provider-specific reconciliation and explicit
+1. **Provider hardening:** add recorded OpenAI/Anthropic/Ollama fixtures for
+   rate limits, malformed responses, interruption, current pricing, and SDK
+   convenience construction where it adds value.
+2. **Operation integrations:** add provider-specific reconciliation and
    compensation adapters on top of `OperationJournal`.
-4. **Multi-agent hardening:** add delegated capability policies and replay
-   fixtures across mailbox delivery boundaries.
-5. **Supervisor projection:** replace the deferred
-   `lipas.calculus_supervisor` tripwire with a tag-aware projection API and
-   migrate retry/escalation queries from O(N) log scans to that projection.
+3. **Multi-agent policy:** add delegated capability boundaries, mailbox replay
+   fixtures, and cross-agent budget policy.
+4. **1.0 convergence:** stabilize the normalized adapter types, claim/session
+   migration rules, and the public Python API without introducing a DSL.
+
+`AgentCell` and `project_supervisor(...)` provide the supervision path today.
+The remaining work is policy enforcement across agent boundaries and API
+stability, not another workflow engine.
+
+For a complete first project using ordinary Python functions, an agent, replay,
+and a mailbox worker, see [Getting started](docs/getting-started.md).
+For focused runnable scenarios, see the [examples guide](examples/README.md).
 
 ---
 

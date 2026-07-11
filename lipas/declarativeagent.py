@@ -38,6 +38,7 @@ from .harness import LLMHarness
 from .react import ReActAgent
 from .rows import RowSet
 from .skills import Skill, SkillRegistry
+from .supervisor import Supervisor
 from .tool_harness import ToolHarness
 from .tools import ToolRegistry
 
@@ -92,6 +93,9 @@ class DeclarativeAgent:
     # LangGraph configuration, or an application database).
     skills:         SkillRegistry | Sequence[Skill] = field(default_factory=SkillRegistry)
     behaviour_cls:  type                = ReActAgent
+    # Optional advisory supervision over this agent's own audited rowset.
+    # The caller constructs Supervisor with the same rowset explicitly.
+    supervisor:     Supervisor | None   = None
 
     _harness:      LLMHarness  = field(init=False, repr=False)
     _tool_harness: ToolHarness = field(init=False, repr=False)
@@ -146,6 +150,7 @@ class DeclarativeAgent:
             rowset=self.rowset,
             request_template=template,
             max_iterations=self.max_iterations,
+            supervisor=self.supervisor,
         )
 
     # ── public API ─────────────────────────────────────────────

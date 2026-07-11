@@ -59,6 +59,8 @@ from .trace import iter_trace, render_trace, write_jsonl
 from .agent import Agent
 from .operations import Operation, OperationJournal, PendingOperation
 from .orchestration import AgentOrchestrator, Mailbox, MailboxMessage
+from .cell import AgentCell
+from .supervisor_projection import SupervisorProjection, project_supervisor
 
 __all__ = [
     # Core types
@@ -86,4 +88,5 @@ __all__ = [
     "Agent",
     "Operation", "OperationJournal", "PendingOperation",
     "AgentOrchestrator", "Mailbox", "MailboxMessage",
+    "AgentCell", "SupervisorProjection", "project_supervisor",
 ]

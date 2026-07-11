@@ -1,6 +1,11 @@
 # Beta release gate
 
-LIPAS is ready for a public beta when every item below is true:
+Current release target: **0.9.0b1**. The runtime is suitable for public beta
+use: all in-repository tests pass and package wheel construction is verified.
+The remaining gates below are the release work required before calling the API
+stable enough for 1.0.
+
+LIPAS is ready for 1.0 when every item below is true:
 
 - `pytest -q` is green, with no skipped safety or adapter contract tests.
 - The supported Python versions are tested in CI, including a clean optional

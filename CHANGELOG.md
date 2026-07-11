@@ -1,6 +1,38 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0b1] — 2026-07-11
+
+### Added
+
+- `AgentCell`: a small adapter that makes ordinary async Python workers and
+  agents mailbox recipients without introducing a workflow DSL.
+- `project_supervisor(store)`: a tag-indexed read model for retry,
+  termination, and escalation recommendations.
+- `STABILITY.md`, defining the 1.0 candidate core and experimental boundary.
+- Default `Agent(supervisor_policy=...)` wiring, so advisory supervisor
+  termination/escalation is evaluated in the ReAct lifecycle.
+
+### Verified
+
+- 376 tests pass across the audit, replay, budget, supervision, mailbox, and
+  provider-adapter contracts.
+
+## [0.8.0b1] — 2026-07-11
+
+### Changed
+
+- Operation journal now has explicit `pending` / `uncertain` / `failed` /
+  `succeeded` recovery states and refuses accidental re-submission.
+- Agent mailbox delivery now uses durable leases, ownership-checked
+  acknowledgement, failure release, and expired-lease recovery.
+- Public package metadata now declares beta maturity.
+
+### Verified
+
+- 373 tests passed, including restart recovery for operation journals and
+  mailboxes.
+
+## [0.5.0b1] — 2026-07-11
 
 ### Added
 
