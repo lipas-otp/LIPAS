@@ -7,8 +7,32 @@
 - `lipas` CLI: `init` creates an ordinary Python prototype; `chat` runs an
   Ollama-backed Agent or an explicit Python factory; `trace` and `effects`
   inspect the same durable claim session used by library code.
-- `docs/cli.md`, documenting the CLI as an onboarding and operations surface,
-  not a second DSL.
+- The thin CLI onboarding and inspection surface, documented alongside the
+  ordinary-Python entry point in the README rather than as a second DSL.
+- `Agent.ollama(...)`, a short local-Agent constructor, and explicit string
+  side-effect values such as `@tool(side_effect="read_only")`.
+- `Agent.ask(...)` and context-manager support, so the first ordinary Python
+  script can use `with Agent.ollama(...) as agent: agent.ask("...")` without
+  introducing an event loop or manual session cleanup.
+- `Team.ask_sync(...)` and context-manager support for the same ordinary
+  script style at a durable handoff boundary; async services continue to use
+  `await team.ask(...)`.
+- Claim-idempotent in-memory and SQLite stores: re-delivery of the same
+  logical claim is a no-op; reusing its id for different content raises a
+  typed `ClaimIdConflict` instead of diverging between store backends.
+- `examples/00_playground.py`, the recommended first runnable example using
+  only `Agent.ollama(...)`, one tool, and a durable trace.
+
+### Changed
+
+- `lipas chat` now uses persistent line editing/history through the optional
+  `cli` extra (with `readline` fallback) and shows a terminal spinner while an
+  Agent is working.
+- `lipas chat` now makes local Ollama timeouts explicit, supports `--host` and
+  `--timeout`, and avoids implying that a localhost transport error is an
+  internet request.
+- Interactive chat now performs no implicit local timeout/network retry;
+  `--retries` opts into extra attempts without changing library defaults.
 
 - Claim-linked coordination: `Team` now owns a durable audit session, and an
   Agent invoked by a Team handoff records its stable `message_id` as
@@ -20,20 +44,18 @@
   folds, effects, replay, coordination, and the external-effect boundary.
 - `lipas.adapter` is now the canonical root-level provider-neutral interchange
   surface (`Request`, `Reply`, content, usage, and stream events).
+- The adapter interchange contract is now one `lipas.adapter.types` module
+  rather than seven tiny cross-importing modules. Provider adapters, tests,
+  and the public `lipas.adapter` facade use the same canonical shapes.
 - `Team`: a small facade that makes ordinary async Python functions and
   Agents durable named team members without introducing a workflow DSL.
 - `project_supervisor(store)`: a tag-indexed read model for retry,
   termination, and escalation recommendations.
-- `STABILITY.md`, defining the 1.0 candidate core and experimental boundary.
 - Default `Agent(supervisor_policy=...)` wiring, so advisory supervisor
   termination/escalation is evaluated in the ReAct lifecycle.
 - `Team.add(name, handler)`, the direct registration API for named members.
-- Agent-and-Team mental-model guide and a progressive documentation path.
-- `assist/README.md`, which classifies the design notes as conceptual,
-  historical, or unimplemented so they cannot be mistaken for the 0.9.6
-  runtime contract.
-
-### Changed
+- A progressive documentation path centered on the README, Getting started,
+  and the execution model.
 
 - Project-facing prose and headings now use the LIPAS brand; Python imports,
   distribution name, module paths, and the `lipas` CLI intentionally remain
@@ -44,10 +66,37 @@
   examples retain `LIPAS_OLLAMA_MODEL` as an explicit local override.
 - Earlier reliable-core additions are consolidated in this release: `Team`,
   default Agent supervisor wiring, and `project_supervisor(...)`.
+- `project_supervisor(...)` now lives with `Supervisor`, its policy types, and
+  its claim schema rather than in a separate projection module.
+
+- The high-level authoring path is now one short vocabulary: `Agent`,
+  `@tool`, and `Team`. Lower-level harnesses remain available for custom
+  runtime work but are no longer required reading or the first examples.
+
+### Removed
+
+- The obsolete, overlapping pre-beta APIs (`DeclarativeAgent`, `LLM`,
+  `Runtime`, `lipas.types`, deferred supervisor modules, and the unused
+  `IdentityRow`) and their stale tests. The canonical API now owns one
+  request/reply shape in `lipas.adapter`, one `Agent` entry point, and three
+  runtime rows: history, capability, and effect.
+- Compatibility aliases for pre-effect terminology (`CallNode`, `call_id`,
+  and `TAG_CALL_*` / `F_CALL_ID`). Persisted string values remain readable as
+  storage details; new Python code uses effect names exclusively.
+- Duplicate serialization types and archived implementation notes that no
+  longer matched the runtime.
+- Separate beta/stability checklists, a standalone CLI guide, a standalone
+  mental-model guide, and the `assist/` essays. Their useful material is now
+  consolidated into the README, Getting started, and Execution model; the
+  rest was removed rather than preserved as competing documentation.
+- The `lipas.testing` package. `FakeAdapter` and fold-purity enforcement are
+  repository test helpers now; shipped LIPAS code contains only runtime
+  behaviour. The supervision example uses the documented Ollama path instead
+  of importing a package-private test fake.
 
 ### Verified
 
-- 379 tests pass across the audit, replay, budget, supervision, mailbox, and
+- 319 tests pass across audit, replay, budget, supervision, mailbox, CLI, and
   provider-adapter contracts.
 
 ## [0.8.0b1] — 2026-07-11
@@ -88,10 +137,9 @@ correctly. No breaking changes since 0.1.0a1.
 ### Added
 - **Initial SQLite-backed `ClaimStore`** — serializable persistence
   for claim logs. In-memory store remains the default.
-- **`lipas.testing.deterministic_fold`** — context manager that traps
-  `time.time` and `os.environ` access inside fold strategies and
-  raises `StrategyContractViolation`. Drop it into a test to prove a
-  strategy is pure; no boilerplate, no framework buy-in.
+- **Deterministic fold test helper** — traps nondeterministic inputs inside
+  fold strategies and raises `StrategyContractViolation`. It now lives with
+  the repository tests rather than the shipped package.
 
 ### Changed
 - Store contract realigned with database-style guarantees: callers

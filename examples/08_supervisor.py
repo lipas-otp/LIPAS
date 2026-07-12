@@ -2,9 +2,7 @@
 
 Three tactics fire across a run:
 
-  - retry         : recorded as advisory claim only (ReAct does not
-                    act on retry recommendations in v0.1; see
-                    docs/B3-NOTES.md).
+  - retry         : recorded as an advisory claim only.
   - terminate     : ReActAgent honors → early FinalResult.
   - escalate_human: ReActAgent honors → early FinalResult with
                     payload in metadata.

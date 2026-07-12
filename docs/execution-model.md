@@ -1,82 +1,111 @@
-# Execution model
+# LIPAS execution model
 
-LIPAS is a Python reference implementation of a claim-based execution model
-for reliable AI agents. It does not require a graph DSL: an `Agent` is an
-ordinary assistant, a `Tool` is an explicitly classified capability, and a
-`Team` is a durable handoff boundary between assistants or async functions.
+This is the one conceptual document for LIPAS. You do not need it to write a
+first agent; read [Getting started](getting-started.md) first. Read this when
+you need to know what a durable trace, replay, or Team actually guarantees.
 
-## Claims and folds
+## Start from the application's need
 
-A **claim** is an immutable, append-only record: a tag, fields, source, and
-identity. A **fold** validates a claim against its owning row and updates that
-row's projection with its declared merge strategy. The tape is the audit
-record; projections are derived views for decisions and queries.
+LIPAS has three public ideas:
 
-Rows own namespaces and invariants. `EffectRow` owns call lifecycle,
-`CapabilityRow` owns budgets, and `HistoryRow` owns observations and
-coordination transitions. A producer must fold through a `RowSet`, never write
-an effect tag directly to an unrelated store.
+| Idea | Meaning | Add it when |
+|---|---|---|
+| `Agent` | One assistant: model, tools, and a reason/act loop | The normal starting point |
+| `@tool` | An explicit Python capability with a declared side-effect class | The assistant needs to read or change something |
+| `Team` | A durable handoff boundary between named assistants or functions | Work needs a separate owner, restart boundary, or audit trail |
 
-## Effects
+An Agent can use many tools and make many model calls. That alone does **not**
+call for a Team. Add a Team only when the next piece of work should survive as
+a separately owned handoff—for example, a research task handed from a planner
+to an independently restartable researcher, or a payment requiring a distinct
+approval boundary.
 
-An LLM or tool invocation is an effect with a generated or supplied
-`effect_id`:
+Tools are not agents. They are the explicit hands of an Agent. A Team member
+is usually one Agent, but can be a plain async function when no model is
+needed.
+
+## One record, three views
+
+Every reliability-relevant event becomes a **Claim**: an immutable record with
+a tag, fields, source, and stable `claim_id`. A store admits one logical claim
+id once. Re-delivering the same payload is a no-op; reusing an id for different
+content is rejected.
+
+A **fold** appends that claim and updates derived views. This is the central
+rule of the runtime: decisions and effects are recorded before they become
+easy to forget. A merge strategy must be deterministic; a field that uses a
+semilattice strategy is also order-independent. History deliberately remains
+ordered.
+
+The standard session has only three rows:
+
+| Row | Question | Responsibility |
+|---|---|---|
+| History | What happened or was decided? | observations, replay choices, supervision, mailbox and operation transitions |
+| Capability | May this spend happen? | budgets, resource spend, quota and rate events |
+| Effect | What call was intended, and what became of it? | model/tool intent, result, rejection, and causal links |
+
+Rows are projections over the same tape, not separate databases or a hidden
+workflow state. A new row should exist only when a concern owns its own tags
+and genuinely needs a separate invariant or view. Domain memory, search
+indexes, and user profiles remain ordinary application data—not a LIPAS row.
+
+## Effects: make the live boundary visible
+
+Every model or tool invocation has a lifecycle:
 
 ```text
-effect_intent → effect_result | effect_rejected
+effect_intent  →  effect_result | effect_rejected
 ```
 
-Intent is written before an invocation. A terminal result or rejection makes
-the recorded outcome explicit; an intent without a terminal record is an
-orphan and represents interruption or a bug worth investigating. `compensates`
-links one effect to an earlier effect. `caused_by` links an effect to an
-external causal root such as a Team `message_id`.
+Intent is recorded before the live invocation. A result or rejection makes the
+outcome explicit. An intent without either is an **orphan**: an interrupted or
+unknown operation that must be investigated, not silently treated as success.
 
-Guards and capability budgets run before the live effect. Their denial is
-still an effect intent plus a typed rejection, not an invisible exception.
-Supervisor recommendations are claims too; the default ReAct agent may honor
-recorded termination or escalation recommendations.
+Guards and budgets run before the live effect. A denial is still recorded as an
+intent plus a typed rejection. `caused_by` can link an Agent effect to its Team
+message; `compensates` can link a compensating effect to an earlier one.
 
-## Replay
+## Replay: reproduce decisions without accidentally repeating effects
 
-Replay is part of execution semantics, not a debugging afterthought. LLM tape
-replay substitutes a recorded reply. `ToolReplayer` is strict by default:
-recorded output is substituted and no live tool is invoked. `BEST_EFFORT` may
-run a missing tool; `LIVE_REROUTE` refuses external writes unless explicitly
-allowed.
+LLM replay substitutes a recorded reply. Tool replay is strict by default: a
+recorded tool result is substituted and no live tool executes. `BEST_EFFORT`
+can execute a missing call; `LIVE_REROUTE` refuses an external write unless the
+caller explicitly opts in.
 
-This proves what the runtime replayed and which decision it made. It does not
-prove that an original external operation happened exactly once.
-
-## Teams
-
-`Team` writes handoff, lease, acknowledgement, release, and recovery claims to
-its durable audit session. Mailbox delivery is at least once: after an expired
-lease, the same stable message can be delivered again. An Agent receiving a
-Team message places its stable `message_id` in `caused_by` on its LLM and tool
-effect intents. This associates independent Team and Agent tapes without
-pretending they are one distributed transaction.
+Replay proves which recorded decision was used. It does **not** prove that the
+original external operation was delivered exactly once.
 
 ## The external boundary
 
-`OperationJournal` is where a caller-supplied idempotency key crosses into an
-external provider. It records `prepared`, `uncertain`, `succeeded`, and
-`failed` transitions durably and can optionally fold the same transitions into
-a claim session. Supply the originating `effect_id` to link that boundary to
-the effect tape.
+`OperationJournal` is the boundary for an external write that supports an
+idempotency key. It persists the caller's key before submission and records
+`prepared`, `uncertain`, `succeeded`, and `failed`. Its transitions can link to
+the originating effect.
 
-After a crash or ambiguous provider error, LIPAS marks the operation
-`uncertain`; it refuses blind resubmission and requires reconciliation. An
-exactly-once statement is valid only when the provider itself honors the
-idempotency key and reconciliation contract.
+After a crash or an ambiguous provider error, the state is `uncertain`.
+LIPAS refuses blind resubmission; application code must reconcile with the
+provider. Exactly-once is possible only when that provider honors the same key
+and offers a way to determine the outcome.
 
-## Canonical interchange shape and non-goals
+## Teams: reliable handoff, not a graph DSL
 
-`lipas.adapter` defines the canonical public `Request`, `Reply`, content,
-usage, and stream-event shapes. Provider adapters normalize to these shapes;
-new applications should not use the legacy `lipas.types` module.
+`Team` records handoff, lease, acknowledgement, release, and recovery in its
+own durable session. Delivery is at least once: a crashed member's lease can
+expire and the same stable message can be delivered again. The receiver uses
+the message id as its idempotency/replay key.
 
-LIPAS deliberately does not provide a graph/workflow DSL, global distributed
-transactions, or provider-independent exactly-once delivery. Its boundary is
-smaller and stricter: make decisions, effects, failures, and recovery states
-explicit in a record that can be inspected and replayed safely.
+This is intentionally smaller than distributed ownership or a workflow graph.
+Each Agent keeps its own authority and budget today; cross-Team budget sharing,
+capability delegation, and mailbox replay are explicit application work.
+
+## Deliberate boundaries
+
+LIPAS does not provide a graph DSL, a hosted control plane, magical long-term
+memory, global distributed transactions, or provider-independent exactly-once
+delivery. Its job is narrower: make an Agent's decisions, costs, effects,
+failures, and recovery state explicit enough to inspect and replay safely.
+
+The provider-neutral `Request`, `Reply`, content, usage, and stream-event
+shapes live in `lipas.adapter`. Ollama, injected-client Anthropic, and the
+optional-SDK OpenAI Responses adapter implement those shapes.

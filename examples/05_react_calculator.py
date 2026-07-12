@@ -1,7 +1,7 @@
 """
 Minimal ReAct + ToolHarness demo with PURE tools.
 
-Verifies the P3.1 wire-up end-to-end:
+Shows the lower-level ReAct wiring end-to-end:
   - effect_intent / effect_result claims for tool_calls
   - resource_spent claims under tool_calls + wall_seconds buckets
   - HistoryRow iteration claims

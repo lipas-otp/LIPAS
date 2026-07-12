@@ -37,6 +37,7 @@ classifiers = [
 ollama = [
     "httpx>=0.27",
 ]
+cli = ["prompt-toolkit>=3.0"]
 openai = [ "httpx>=0.27" ]
 # anthropic = [ "anthropic>=0.28", ]
 dev = [
@@ -44,7 +45,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "httpx>=0.27",        # needed by OllamaAdapter in tests
 ]
-all = ["httpx>=0.27"]
+all = ["httpx>=0.27", "prompt-toolkit>=3.0"]
 
 [project.urls]
 Homepage   = "https://github.com/lipas-otp/lipas"

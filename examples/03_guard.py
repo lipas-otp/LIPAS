@@ -1,4 +1,4 @@
-"""Demonstrate the guard pre-flight gate (P2.8).
+"""Demonstrate the guard pre-flight gate.
 
 Registers a guard that denies any LLM call whose prompt mentions a
 forbidden word. The harness folds effect_intent + effect_rejected

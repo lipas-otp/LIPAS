@@ -1,4 +1,4 @@
-"""Demonstrate ToolHarness replay (P3.2 / RFC-001).
+"""Demonstrate strict ToolHarness replay.
 
 Three phases:
 

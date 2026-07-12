@@ -11,17 +11,19 @@ Three runs back-to-back:
                      is wired to a ReplayCursor seeded from run 1's
                      store AND to a DeadAdapter that raises if invoked.
                      LLM calls are short-circuited from the recorded
-                     log; PURE tools re-execute (observably equivalent).
+                     log. This low-level example intentionally leaves its
+                     ToolHarness live, so its PURE tools re-execute.
 
   Run 3 (mismatch) — replay with a tampered system prompt; ReplayCursor's
                      strict_match rejects on the first call, proving
                      the cursor genuinely validates request signatures.
 
-What this demo asserts about lipas v0.1:
+What this demo asserts:
   - LLM replay is byte-equivalent (the final text matches).
   - Replay does not touch the network (DeadAdapter raises if reached).
   - Replay does not fold new effect claims for LLM calls.
-  - Tool calls DO re-execute in v0.1 (see README §Replay for why).
+  - Its intentionally live ToolHarness re-executes PURE tools. For strict
+    tool tape substitution, see `07_tool_replay.py` or `replay(...)`.
   - strict_match=True is enforced, not advisory.
 """
 from __future__ import annotations

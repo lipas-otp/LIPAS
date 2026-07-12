@@ -1,62 +1,55 @@
 # Getting started with LIPAS
 
-This tutorial builds a small support agent as ordinary Python: one read-only
-tool, a durable audit session, a replay, and a mailbox handoff. LIPAS supplies
-the reliability boundary; your application remains normal Python code.
+This tutorial builds a small support agent as ordinary Python, gives it a
+durable audit session, and then shows the one reason to add a Team. LIPAS
+supplies the reliability boundary; your application remains normal Python code.
 
 ## 1. Install and start a local model
 
 ```bash
-pip install 'lipas[ollama]'
+pip install 'lipas[ollama,cli]'
 ollama serve
 ollama pull gemma4:12b
 ```
 
 Use `pip install 'lipas[openai]'` when constructing an OpenAI Responses
-adapter instead. The core package has no mandatory provider SDK.
+adapter instead. The core package has no mandatory provider SDK; the `cli`
+extra supplies the optional interactive line editor used by `lipas chat`.
 
 ## 2. Write a tool and agent
 
 Create `support.py`:
 
 ```python
-import asyncio
-
-from lipas import Agent
-from lipas.adapter import OllamaAdapter
-from lipas.tools import SideEffectClass, tool
+from lipas import Agent, tool
 
 
-@tool(side_effect=SideEffectClass.READ_ONLY)
+@tool(side_effect="read_only")
 def lookup_customer(customer_id: str) -> str:
     """Look up a customer record."""
     return {"C-42": "Ada Lovelace"}.get(customer_id, "not found")
 
 
-async def main() -> None:
-    agent = Agent(
-        adapter=OllamaAdapter(),
-        model="gemma4:12b",
+def main() -> None:
+    with Agent.ollama(
+        "gemma4:12b",
         instructions="Use lookup_customer when a customer id is given.",
         tools=[lookup_customer],
-        session_path="runs/support.db",
+        session="runs/support.db",
         budgets={"tool_calls": 10, "tokens_out": 2_000},
-    )
-    try:
-        result = await agent("Who is customer C-42?")
+    ) as agent:
+        result = agent.ask("Who is customer C-42?")
         print(result.text)
-    finally:
-        agent.close()
 
 
-asyncio.run(main())
+main()
 ```
 
 Run it with `python support.py`. The decorator is intentionally explicit:
 `PURE`, `READ_ONLY`, `IDEMPOTENT_WRITE`, and `EXTERNAL_WRITE` have different
 replay and safety rules.
 
-## 3. Inspect and replay the run
+## 3. Inspect the run
 
 The SQLite file contains the claim tape. You can inspect it directly from
 Python:
@@ -71,21 +64,12 @@ finally:
     rowset.store.close()
 ```
 
-For replay, LIPAS defaults to strict tape substitution: recorded LLM replies
-and tool results are used without contacting the live model or tool provider.
-
-```python
-from lipas import replay
-
-with replay("runs/support.db") as run:
-    # Build LLMHarness and ToolHarness instances using run.rowset,
-    # run.replay_cursor, and run.tool_replayer. See
-    # examples/06_react_replay.py for complete wiring.
-    pass
-```
-
-Use live reroute only deliberately. An `EXTERNAL_WRITE` is refused unless you
-explicitly opt in; replay safety is not a claim of exactly-once delivery.
+Replay is deliberately not hidden behind a convenient “run it again” button.
+The default policy substitutes recorded model replies and tool results without
+contacting live systems; live rerouting is explicit. See the [Execution
+model](execution-model.md#replay-reproduce-decisions-without-accidentally-repeating-effects)
+and `examples/06_react_replay.py` / `examples/07_tool_replay.py` when you need
+that boundary.
 
 ## 4. Add a team member without a workflow DSL
 
@@ -102,38 +86,27 @@ async def researcher(prompt):
     return {"finding": f"research complete: {prompt}"}
 
 
-team = Team.open("runs/team.db")
-team.add("researcher", researcher)
-
-result = await team.ask(
-    "researcher",
-    "check release risks",
-    sender="planner",
-    message_id="release-risk-001",
-)
-print(result)
-team.close()
+with Team.open("runs/team.db") as team:
+    team.add("researcher", researcher)
+    result = team.ask_sync(
+        "researcher",
+        "check release risks",
+        sender="planner",
+        message_id="release-risk-001",
+    )
+    print(result)
 ```
 
 Treat `message_id` as the idempotency/replay key when the member initiates an
-external operation. Delivery is at-least-once by design.
+external operation. Delivery is at-least-once by design. In an async service,
+use `await team.ask(...)` instead.
 
-## 5. Add supervision when policy matters
+## Next only when the need appears
 
-The default agent can take a `supervisor_policy`. Policies observe its audited
-effects and can emit retry, terminate, or human-escalation recommendations.
-
-```python
-from lipas.supervisor import Policy, PolicyRule, TerminateAction
-
-policy = Policy.of(
-    PolicyRule("demo_stop", lambda view, ctx: TerminateAction("review")),
-)
-
-agent = Agent(..., supervisor_policy=policy)
-```
-
-Use policies for concrete operational rules: spend ceilings, repeated tool
-failures, required approval, or a known uncertain external operation. Keep
-the business logic in Python; LIPAS records why it was permitted, denied,
-halted, or escalated.
+- Add `budgets={...}` or `tool_guards=[...]` to the Agent when a call must be
+  limited or denied before it reaches a provider.
+- Add `supervisor_policy=...` for a concrete termination or escalation rule;
+  see `examples/09_loop_with_supervisor.py` and
+  `examples/12_supervised_agent.py`.
+- Use `OperationJournal` only around an external write with a provider
+  idempotency key; see `examples/11_operation_journal.py`.

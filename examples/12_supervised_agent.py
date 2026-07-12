@@ -1,9 +1,8 @@
 """Use a Supervisor policy from the ordinary high-level Agent API.
 
-Run from the repository root: ``python -m examples.12_supervised_agent``
-
-FakeAdapter keeps the example offline. Substitute OllamaAdapter or an OpenAI
-adapter in a real application; supervision still observes the same claim tape.
+Run from the repository root: ``python -m examples.12_supervised_agent``.
+It uses the documented local Ollama default; use ``Agent(adapter=...)`` for a
+different provider.
 """
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import asyncio
 
 from lipas import Agent, project_supervisor
 from lipas.supervisor import Policy, PolicyRule, TerminateAction
-from lipas.testing.fake_adapter import FakeAdapter
 
 
 def require_review(_view, _ctx):
@@ -20,9 +18,8 @@ def require_review(_view, _ctx):
 
 async def main() -> None:
     policy = Policy.of(PolicyRule("require_review", require_review))
-    agent = Agent(
-        adapter=FakeAdapter.echoing(),
-        model="demo-model",
+    agent = Agent.ollama(
+        instructions="Draft a concise support reply.",
         supervisor_policy=policy,
     )
     try:

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lipas import OperationJournal, PendingOperation
+from lipas import OperationJournal
+from lipas.operations import PendingOperation
 
 
 def flaky_provider(*, idempotency_key: str) -> dict[str, str]:
