@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable, AsyncIterator
@@ -206,7 +207,10 @@ class LLMHarness:
             return self.replay_cursor.advance(request)
 
         effect_id = _replay_call_id or f"call_{uuid.uuid4().hex[:12]}"
-        target = LLMTarget(request=request)
+        # Guards are observers. Give them an isolated copy so an accidental
+        # mutation in policy code cannot rewrite the request that is admitted
+        # or sent to a provider.
+        target = LLMTarget(request=deepcopy(request))
 
         # Compute estimate at most once per call, lazily.
         _estimate_cache: list[ResourceEstimate] = []
@@ -263,7 +267,7 @@ class LLMHarness:
             yield Done(self.replay_cursor.advance(request))
             return
         effect_id = f"call_{uuid.uuid4().hex[:12]}"
-        target = LLMTarget(request=request)
+        target = LLMTarget(request=deepcopy(request))
         cache: list[ResourceEstimate] = []
         async def estimate() -> ResourceEstimate:
             if not cache: cache.append(await self.adapter.estimate_cost(request))
@@ -364,7 +368,10 @@ class LLMHarness:
             F_EFFECT_ID: effect_id,
             F_KIND:      EffectKind.LLM_CALL.value,
             F_MODEL:     getattr(request, "model", None),
-            F_REQUEST:   request,
+            # Request is frozen only at the top level; provider-shaped message
+            # mappings can still be mutable. The tape records submission-time
+            # data, not later caller mutation.
+            F_REQUEST:   deepcopy(request),
         }
         if compensates is not None:
             intent_fields[F_COMPENSATES] = compensates
@@ -377,7 +384,9 @@ class LLMHarness:
         ))
 
     def _fold_result(self, effect_id: str, outcome: RetryOutcome) -> None:
-        reply = outcome.reply
+        # Provider content commonly contains mutable dict blocks. Snapshot it
+        # so an in-memory tape is as stable as a SQLite-serialized one.
+        reply = deepcopy(outcome.reply)
         result_fields: dict = {
             F_EFFECT_ID: effect_id,
             F_KIND:      EffectKind.LLM_CALL.value,

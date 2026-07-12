@@ -22,6 +22,7 @@ One call produces, depending on path:
                         reason ∈ {"unknown_tool",
                                   "schema_violation",
                                   "guard:<slug>",
+                                  "estimate_invalid",
                                   "budget_exhausted"})
 
   Normal path:
@@ -38,8 +39,8 @@ One call produces, depending on path:
                                were spent regardless of outcome).
 
 Pre-flight order (top of call):
-    resolve tool → [replay decision] → schema → guards → budget
-                 → record_intent → execute
+    resolve tool → [replay decision] → schema → guards → valid estimate
+                 → budget → record_intent → execute
 
 Why no retry?
   Tools may carry side effects.  EXTERNAL_WRITE retried blindly
@@ -57,9 +58,10 @@ Spend computation:
   and tool_calls=1.0 still records (one logical call was charged to
   the conversation).
 
-Tools that don't declare estimate_fn pay only the two system
-buckets.  Tools whose estimate_fn raises pay the system buckets
-plus a logged warning — degraded but not fatal.
+Tools that don't declare estimate_fn pay only the two system buckets. A tool
+that declares an estimate_fn but cannot produce a finite non-negative estimate
+is rejected before execution: a broken estimate must not silently turn a hard
+budget into a post-hoc warning.
 
 The return value is an Anthropic-shaped tool_result dict:
 
@@ -74,8 +76,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import uuid
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -110,6 +114,7 @@ __all__ = [
     "SchemaRejection",
     "ToolGuardRejection",
     "ToolBudgetRejection",
+    "ToolEstimateRejection",
 ]
 
 logger = logging.getLogger(__name__)
@@ -190,9 +195,23 @@ class ToolBudgetRejection:
         }
 
 
+@dataclass(frozen=True)
+class ToolEstimateRejection:
+    """A tool declared an unusable pre-flight resource estimate."""
+    tool_name: str
+    detail: str
+
+    @property
+    def reason(self) -> str:
+        return "estimate_invalid"
+
+    def as_detail(self) -> dict:
+        return {"tool_name": self.tool_name, "detail": self.detail}
+
+
 _AnyRejection = (
     UnknownToolRejection | SchemaRejection
-    | ToolGuardRejection | ToolBudgetRejection
+    | ToolGuardRejection | ToolBudgetRejection | ToolEstimateRejection
 )
 
 
@@ -286,7 +305,9 @@ class ToolHarness:
         replay layer terminates the session.
         """
         eid  = effect_id or f"tool_{uuid.uuid4().hex[:12]}"
-        args = dict(arguments)
+        # A tool receives its own nested copy. This prevents a mutating client
+        # from changing either the caller's mapping or the recorded intent.
+        args = deepcopy(dict(arguments))
 
         # ── 0. Resolve tool ─────────────────────────────────
         try:
@@ -349,7 +370,12 @@ class ToolHarness:
         # _signature is set by Tool.__post_init__.  Bind() raises
         # TypeError on missing required / unexpected kwarg / etc.
         try:
-            tool._signature.bind(**args).apply_defaults()
+            bound = tool._signature.bind(**args)
+            bound.apply_defaults()
+            # The same fully bound arguments drive estimate, guards, audit,
+            # and execution. In particular, an estimate_fn sees defaults just
+            # as the tool body does.
+            args = deepcopy(dict(bound.arguments))
         except TypeError as e:
             rej = SchemaRejection(tool_name=tool.name, detail=str(e))
             self._fold_intent(eid, tool, args, compensates, caused_by)
@@ -358,7 +384,9 @@ class ToolHarness:
                 eid, f"Schema violation: {e}", is_error=True,
             )
 
-        target = ToolTarget(tool=tool, arguments=args)
+        # Guards are policy observers, not argument transformers. Keep their
+        # input separate from the mapping eventually sent to the tool body.
+        target = ToolTarget(tool=tool, arguments=deepcopy(args))
 
         # ── 2. Guard gate ───────────────────────────────────
         guard_rej = await self._preflight_guards(target)
@@ -373,7 +401,16 @@ class ToolHarness:
             )
 
         # ── 3. Budget gate ──────────────────────────────────
-        estimate = self._estimate_dict(tool, args)
+        estimate, estimate_rej = self._estimate_dict(tool, args)
+        if estimate_rej is not None:
+            self._fold_intent(eid, tool, args, compensates, caused_by)
+            self._fold_rejection(eid, estimate_rej)
+            return self._tool_result(
+                eid,
+                f"Tool estimate for {tool.name!r} is invalid: {estimate_rej.detail}",
+                is_error=True,
+            )
+        assert estimate is not None
         bud_rej  = self._preflight_budget(estimate)
         if bud_rej is not None:
             self._fold_intent(eid, tool, args, compensates, caused_by)
@@ -408,7 +445,7 @@ class ToolHarness:
             }
             wall_seconds = time.monotonic() - t0
             self._fold_result(eid, tool, output, status, error_detail)
-            self._fold_spend(eid, self._compute_spend(tool, args, wall_seconds))
+            self._fold_spend(eid, self._compute_spend(estimate, wall_seconds))
             if not isinstance(e, Exception):
                 # KeyboardInterrupt etc. — fold-and-propagate.
                 raise
@@ -428,7 +465,7 @@ class ToolHarness:
         self._fold_result(eid, tool, output, status, error_detail)
 
         # ── 7. Record spend ─────────────────────────────────
-        self._fold_spend(eid, self._compute_spend(tool, args, wall_seconds))
+        self._fold_spend(eid, self._compute_spend(estimate, wall_seconds))
 
         # ── 8. Synthesize tool_result ───────────────────────
         return self._tool_result(eid, _stringify(output), is_error=False)
@@ -469,7 +506,7 @@ class ToolHarness:
 
         self._fold_intent(eid, tool, args, compensates, caused_by)
 
-        new_fields = dict(recorded_node.result.fields)
+        new_fields = deepcopy(dict(recorded_node.result.fields))
         new_fields[F_EFFECT_ID] = eid
         # F_KIND, F_STATUS, F_OUTPUT, F_SIDE_EFFECT, F_ATTEMPTS,
         # F_ERROR (if present) copied verbatim.
@@ -556,7 +593,7 @@ class ToolHarness:
 
     def _estimate_dict(
         self, tool: Tool, args: Mapping[str, Any],
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float] | None, ToolEstimateRejection | None]:
         """Upper-bound spend estimate for pre-flight budget checking.
 
         Always includes ``tool_calls=1.0``.  Other buckets come from
@@ -565,23 +602,38 @@ class ToolHarness:
         tool's claim of the maximum wall time it will consume — must
         be enforced by the tool itself per D2).
 
-        Lenient: a raising estimate_fn logs a warning and yields no
-        extra estimate, so the call still goes through; it just
-        bypasses gating for those buckets and may overrun later.
+        A malformed estimate is a pre-flight rejection. The estimate is also
+        reused for post-call accounting, so the recorded spend matches the
+        exact value admitted by the budget gate.
         """
         upper: dict[str, float] = {"tool_calls": 1.0}
-        if tool.estimate_fn is not None:
-            try:
-                est = tool.estimate_fn(args)
-                for k, v in est.items():
-                    upper[k] = float(v)
-            except Exception as e:
-                logger.warning(
-                    "estimate_fn for tool %r raised %s: %s "
-                    "— pre-flight degraded to {tool_calls: 1.0}",
-                    tool.name, type(e).__name__, e,
-                )
-        return upper
+        if tool.estimate_fn is None:
+            return upper, None
+        try:
+            # Estimation is also observational: it cannot be allowed to
+            # rewrite the arguments admitted by schema/guard checks.
+            estimate = tool.estimate_fn(deepcopy(dict(args)))
+            if not isinstance(estimate, Mapping):
+                raise TypeError("estimate must return a mapping of bucket names to amounts")
+            for bucket, amount in estimate.items():
+                if not isinstance(bucket, str) or not bucket:
+                    raise ValueError(f"invalid bucket name {bucket!r}")
+                if (
+                    isinstance(amount, bool)
+                    or not isinstance(amount, (int, float))
+                    or not math.isfinite(float(amount))
+                    or amount < 0
+                ):
+                    raise ValueError(
+                        f"estimate for {bucket!r} must be a finite non-negative number, got {amount!r}"
+                    )
+                upper[bucket] = float(amount)
+        except Exception as exc:
+            return None, ToolEstimateRejection(
+                tool_name=tool.name,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+        return upper, None
 
     def _preflight_budget(
         self, estimate: Mapping[str, float],
@@ -607,34 +659,18 @@ class ToolHarness:
     # ── spend ──────────────────────────────────────────────────
 
     def _compute_spend(
-        self, tool: Tool,
-        args: Mapping[str, Any],
-        wall_seconds: float,
+        self, estimate: Mapping[str, float], wall_seconds: float,
     ) -> dict[str, float]:
         """Build the {bucket: amount} dict to fold as resource_spent.
 
-        ``tool_calls`` and ``wall_seconds`` are system-managed and
-        always recorded (overriding any estimate_fn return value of
-        the same key).  Other buckets come from estimate_fn — under
-        the D2 contract that ``actual ≤ estimate``, the harness
-        records the estimate value as the conservative spend.
-
-        Errors (estimate_fn raising) degrade silently: the call
-        already executed, partial system-bucket spend is recorded.
+        ``tool_calls`` and ``wall_seconds`` are system-managed and always
+        recorded (overriding any estimate value of the same key). Other
+        buckets reuse the validated pre-flight estimate, so a non-deterministic
+        estimate_fn cannot admit one amount and record another.
         """
-        spend: dict[str, float] = {
-            "tool_calls":   1.0,
-            "wall_seconds": float(wall_seconds),
-        }
-        if tool.estimate_fn is not None:
-            try:
-                est = tool.estimate_fn(args)
-                for k, v in est.items():
-                    if k in ("tool_calls", "wall_seconds"):
-                        continue  # system-managed, do not let tool override
-                    spend[k] = float(v)
-            except Exception:
-                pass  # already warned in _estimate_dict; don't double-log
+        spend = dict(estimate)
+        spend["tool_calls"] = 1.0
+        spend["wall_seconds"] = float(wall_seconds)
         return spend
 
     # ── fold helpers ───────────────────────────────────────────
@@ -651,7 +687,7 @@ class ToolHarness:
             F_EFFECT_ID:             eid,
             F_KIND:                  EffectKind.TOOL_CALL.value,
             F_TOOL_NAME:             tool.name,
-            F_ARGUMENTS:             dict(args),
+            F_ARGUMENTS:             deepcopy(dict(args)),
             F_DECLARED_SIDE_EFFECT:  tool.side_effect.value,
         }
         if compensates is not None:
@@ -685,7 +721,7 @@ class ToolHarness:
             F_EFFECT_ID:             eid,
             F_KIND:                  EffectKind.TOOL_CALL.value,
             F_TOOL_NAME:             tool_name,
-            F_ARGUMENTS:             dict(args),
+            F_ARGUMENTS:             deepcopy(dict(args)),
             F_DECLARED_SIDE_EFFECT:  "external_write",
         }
         if compensates is not None:
@@ -711,7 +747,7 @@ class ToolHarness:
             F_KIND:         EffectKind.TOOL_CALL.value,
             F_ATTEMPTS:     1,            # no retry layer (D6)
             F_STATUS:       status,
-            F_OUTPUT:       output,
+            F_OUTPUT:       deepcopy(output),
             F_SIDE_EFFECT:  tool.side_effect.value,
             # ^ actual side-effect class.  v0.1: equals declared.  Future
             #   work: a tool may downgrade (declared EXTERNAL_WRITE,
@@ -719,7 +755,7 @@ class ToolHarness:
             #   record a tighter actual class here.
         }
         if status == "error" and error_detail is not None:
-            fields[F_ERROR] = error_detail
+            fields[F_ERROR] = deepcopy(error_detail)
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_RESULT,
             fields=fields,

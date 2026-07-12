@@ -6,10 +6,12 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from .calculus import Claim
 from .rows import RowSet
+from .serialization.store_sqlite import ensure_sqlite_parent
 
 TAG_AGENT_HANDOFF = "agent_handoff"
 TAG_AGENT_MAIL_CLAIM = "agent_mail_claim"
@@ -45,16 +47,24 @@ class Mailbox:
     again, which gives at-least-once delivery without pretending duplicates are
     impossible.  Handlers must use ``message.id`` as their operation key.
     """
-    def __init__(self, path: str = ":memory:", *, rowset: RowSet | None = None) -> None:
+    def __init__(self, path: str | Path = ":memory:", *, rowset: RowSet | None = None) -> None:
+        ensure_sqlite_parent(path)
         self._conn = sqlite3.connect(path)
         self._conn.execute("""CREATE TABLE IF NOT EXISTS mailbox (
             id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
             payload TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','leased','acknowledged')),
             attempts INTEGER NOT NULL DEFAULT 0, lease_token TEXT, lease_expires REAL,
             created_at REAL NOT NULL, acknowledged_at REAL)""")
-        self._conn.commit(); self.rowset = rowset
+        self._conn.commit()
+        self.rowset = rowset
+        self._closed = False
 
-    def close(self) -> None: self._conn.close()
+    def close(self) -> None:
+        """Close the mailbox connection. Safe to call more than once."""
+        if self._closed:
+            return
+        self._conn.close()
+        self._closed = True
     def get(self, message_id: str) -> MailboxMessage | None:
         row = self._conn.execute("SELECT id,sender,recipient,payload,status,attempts,lease_token FROM mailbox WHERE id=?", (message_id,)).fetchone()
         return None if row is None else MailboxMessage(row[0], row[1], row[2], json.loads(row[3]), row[4], row[5], row[6])
@@ -98,9 +108,16 @@ class Mailbox:
         return tuple(claimed)
 
     def acknowledge(self, message_id: str, *, lease_token: str) -> None:
+        now = time.time()
         with self._conn:
-            cur = self._conn.execute("UPDATE mailbox SET status='acknowledged',acknowledged_at=?,lease_token=NULL,lease_expires=NULL WHERE id=? AND status='leased' AND lease_token=?", (time.time(), message_id, lease_token))
-        if not cur.rowcount: raise MailboxLeaseError("message is not owned by this lease")
+            cur = self._conn.execute(
+                "UPDATE mailbox SET status='acknowledged',acknowledged_at=?,"
+                "lease_token=NULL,lease_expires=NULL WHERE id=? AND status='leased' "
+                "AND lease_token=? AND lease_expires>?",
+                (now, message_id, lease_token, now),
+            )
+        if not cur.rowcount:
+            raise MailboxLeaseError("message is not owned by an active lease")
         self._audit(TAG_AGENT_MAIL_ACK, {"message_id": message_id})
 
     def release(self, message_id: str, *, lease_token: str) -> None:
@@ -134,7 +151,12 @@ class AgentOrchestrator:
         try:
             result = await self._agents[recipient](message)
         except BaseException:
-            self.mailbox.release(message.id, lease_token=message.lease_token or "")
+            # Preserve the handler failure. A concurrently recovered lease is
+            # already safe to redeliver and must not mask that real exception.
+            try:
+                self.mailbox.release(message.id, lease_token=message.lease_token or "")
+            except MailboxLeaseError:
+                pass
             raise
         self.mailbox.acknowledge(message.id, lease_token=message.lease_token or "")
         return result

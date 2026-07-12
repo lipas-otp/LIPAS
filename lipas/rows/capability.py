@@ -27,6 +27,7 @@ gated bucket.  Net effect:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import math
 
 from ..calculus import (
     Claim, StrategyRegistry,
@@ -58,6 +59,24 @@ class CapabilityRow:
     # bucket_name -> hard limit
     budgets: dict[str, float] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Reject budget shapes that would turn a hard gate into a no-op."""
+        normalized: dict[str, float] = {}
+        for bucket, limit in self.budgets.items():
+            if not isinstance(bucket, str) or not bucket:
+                raise ValueError(f"budget name must be a non-empty string, got {bucket!r}")
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, (int, float))
+                or not math.isfinite(float(limit))
+                or limit < 0
+            ):
+                raise ValueError(
+                    f"budget {bucket!r} must be a finite non-negative number, got {limit!r}"
+                )
+            normalized[bucket] = float(limit)
+        self.budgets = normalized
+
     def register_strategies(self, registry: StrategyRegistry) -> None:
         registry.register("_quota_totals", strategy_counter_max)
         registry.register("_rate_events",  strategy_append)
@@ -75,7 +94,7 @@ class CapabilityRow:
         msgs: list[str] = []
         bucket = claim.fields.get(F_BUCKET)
         amount = claim.fields.get(F_AMOUNT, 0)
-        if bucket is None or not isinstance(amount, (int, float)):
+        if not self._valid_amount(bucket, amount):
             msgs.append(f"{TAG_RESOURCE_SPENT}: missing/invalid bucket or amount")
             return msgs
 
@@ -103,14 +122,21 @@ class CapabilityRow:
         msgs: list[str] = []
         bucket = claim.fields.get(F_BUCKET)
         amount = claim.fields.get(F_AMOUNT, 0)
-        if bucket is None or not isinstance(amount, (int, float)):
+        if not self._valid_amount(bucket, amount):
             msgs.append(f"{TAG_BUDGET_OVERRUN}: missing/invalid bucket or amount")
             return msgs
-        if amount < 0:
-            msgs.append(
-                f"{TAG_BUDGET_OVERRUN}: amount must be non-negative, got {amount}"
-            )
         return msgs
+
+    @staticmethod
+    def _valid_amount(bucket: object, amount: object) -> bool:
+        return (
+            isinstance(bucket, str)
+            and bool(bucket)
+            and isinstance(amount, (int, float))
+            and not isinstance(amount, bool)
+            and math.isfinite(float(amount))
+            and amount >= 0
+        )
 
     # ── projection helpers ────────────────────────────────────
 

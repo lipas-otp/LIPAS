@@ -1,27 +1,14 @@
-"""
-LIPAS · P3.3 — Anthropic adapter.
+"""Anthropic Messages adapter.
 
-Implements LLMAdapter (streaming Protocol) against Anthropic's
-Messages API. First cut is non-streaming under the hood: messages.create()
-runs to completion, then the adapter yields exactly one Done event.
-This satisfies the Protocol contract; a true SSE variant can replace
-stream()'s body without touching estimate_cost or the translators.
+It implements the normalized LLMAdapter protocol with an injected Anthropic
+client. The current transport is single-shot: ``messages.create()`` completes
+before the adapter yields its one terminal ``Done`` event. Request and reply
+content use the provider-neutral, dictionary-shaped blocks defined by
+``lipas.adapter.types``.
 
-Runtime content shape
----------------------
-Both inbound (Request.messages[*].content) and outbound
-(Reply.content) blocks are Anthropic-shaped dicts at runtime, NOT
-the dataclasses declared in content.py. This matches what
-ReActAgent actually passes and parses this shape. See module
-backlog: B-?? "reconcile content type signatures with runtime shape".
-
-Error contract (LOCKED — see protocol.py)
------------------------------------------
-All provider/transport/runtime failures emerge as a terminal Done
-carrying Reply(stop_reason='error', error_detail=...). error_detail
-conforms to one of the TypedDicts in lipas.adapter.errors so
-classify() returns a real ErrorKind (not UNKNOWN) and retry.py
-can act on it. Only CancelledError propagates.
+Provider, transport, and runtime failures become a terminal
+``Reply(stop_reason='error', error_detail=...)``; only cancellation
+propagates. This keeps the effect lifecycle auditable regardless of provider.
 """
 from __future__ import annotations
 

@@ -34,7 +34,7 @@ class LLMAdapter(Protocol):
         error_detail  = provider-raw diagnostic info; required when
                         stop_reason='error' (enforced by Reply itself)
 
-    This invariant lets the harness record a `call_result` claim
+    This invariant lets the harness record an effect-result claim
     unconditionally — no try/except boundary at the call site, no
     branching between "Reply path" and "exception path". ErrorKind
     classification happens one layer up, consuming `reply.error_detail`.

@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.9.8] — 2026-07-12
+
+### Added
+
+- A numbered, progressive ten-lesson example course: four practical
+  single-Agent scenarios, then budget, strict replay, supervision, Team, and
+  external-operation patterns. The older low-level, overlapping examples were
+  removed so newcomers have one unambiguous learning path.
+- Four portable, ready-to-copy `SKILL.md` templates: `research-brief`,
+  `support-triage`, `daily-brief`, and `safe-external-actions`.
+- Regression coverage that builds the practical examples without a provider,
+  validates the supplied Skills, and checks path-based supervised sessions.
+
+### Changed
+
+- A Skill directory can now be passed directly as
+  `Agent(..., skills="skills/name")`; advanced callers may still use a
+  `SkillRegistry` explicitly.
+- SQLite-backed sessions, mailboxes, and operation journals create missing
+  parent directories and accept normal `pathlib.Path` values.
+- A durable Agent now carries its declared budgets into its standard SQLite
+  session. Previously, only in-memory Agents enforced those budgets.
+- OperationJournal terminal outcomes are now immutable, so a stale
+  reconciliation cannot rewrite a known success or failure. Mailbox
+  acknowledgements now require an active, unexpired lease.
+- A provider return that cannot be journaled (for example, an
+  unserializable result) now becomes `uncertain` rather than looking like an
+  unsubmitted operation.
+- Provider-neutral request, reply, resource-estimate, and pricing values now
+  reject malformed model names, stop reasons, token counts, and non-finite
+  costs at the adapter boundary rather than letting them weaken budget checks.
+- Capability budgets and recorded spend amounts now reject negative, boolean,
+  infinite, and NaN values, preserving the meaning of a hard budget gate.
+- LLM and tool runtime records now snapshot mutable request, reply, argument,
+  and output values at their effect boundary, preventing later user/tool
+  mutation from changing an in-memory audit tape or replay input.
+- Tools with an invalid or failing `estimate=` function now fail closed before
+  execution; the validated estimate is reused for spend recording so a
+  non-deterministic estimator cannot bypass a hard budget.
+- Tool estimates, guards, intent records, and execution now share one fully
+  bound argument mapping, including Python default values.
+- Guard and estimate callbacks now receive isolated input snapshots; policy or
+  accounting code cannot mutate the request/arguments ultimately admitted to
+  a provider or tool.
+- The Team, OperationJournal, and Supervisor examples are self-contained
+  where possible. The operation-recovery example now uses a fresh stable key
+  per run, so it demonstrates uncertainty and reconciliation repeatedly.
+- The practical Ollama examples now show an immediate progress line, bound
+  their request size to their displayed budget, and print provider failures or
+  non-natural termination instead of appearing to finish silently.
+- README, Getting started, Execution model, and the examples index now form a
+  progressive path from a first Agent to Skills, supervision, handoffs, and
+  external-operation recovery.
+- Documentation now distinguishes lower-level `LLMHarness.stream(...)` from
+  the final-result-oriented `Agent` API, and states that visible stream output
+  is not retried. Tool-estimate documentation now matches the fail-closed
+  `estimate_invalid` behavior.
+
+### Verified
+
+- 363 tests pass across audit, replay, budget, supervision, mailbox, CLI,
+  examples, Skills, and provider-adapter contracts.
+- `lipas-0.9.8-py3-none-any.whl` builds successfully.
+
 ## [0.9.7] — 2026-07-12
 
 ### Changed
@@ -12,8 +76,6 @@
   public `lipas.adapter` facade remains the supported import surface.
 - Moved repository-only fake adapters and fold-purity checks into `tests/`.
   The published `lipas` package contains no testing namespace.
-- Merged the supervisor projection into `lipas.supervisor` and updated the
-  supervised-Agent example to use the documented Ollama path.
 - Consolidated the public documentation into README, Getting started, and the
   Execution model; removed competing beta/stability, CLI, mental-model, and
   conceptual-note documents.

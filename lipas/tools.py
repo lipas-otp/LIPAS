@@ -428,7 +428,10 @@ def tool(
     and returning a {bucket: float} upper-bound for THIS call.  Per
     the D2 contract, actual ≤ estimate for every returned bucket.
     The harness uses this for pre-flight budget gating; if the contract
-    is broken the actual is recorded as TAG_BUDGET_OVERRUN.
+    is broken the actual is recorded as TAG_BUDGET_OVERRUN.  The estimate
+    itself must return finite, non-negative numeric values.  If it raises
+    or returns an invalid value, the harness records an `estimate_invalid`
+    pre-flight rejection and does not execute the tool.
 
     `observability_only=` (P3.2 / RFC-001 §3.4) marks tools whose
     side effects are infrastructure (logging sinks, metric emitters,

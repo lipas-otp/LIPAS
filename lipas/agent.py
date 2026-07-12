@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .adapter import Request
@@ -45,8 +46,8 @@ class Agent:
     instructions: str | None = None
     max_tokens: int = 4096
     max_iterations: int = 10
-    skills: SkillRegistry | Sequence[Skill] = field(default_factory=SkillRegistry)
-    session_path: str | None = None
+    skills: SkillRegistry | Sequence[Skill] | str | Path = field(default_factory=SkillRegistry)
+    session_path: str | Path | None = None
     budgets: Mapping[str, float] | None = None
     harness_kwargs: Mapping[str, Any] = field(default_factory=dict)
     tool_guards: Sequence[Any] = ()
@@ -67,7 +68,7 @@ class Agent:
         cls,
         model: str = "gemma4:12b",
         *,
-        session: str | None = None,
+        session: str | Path | None = None,
         host: str | None = None,
         timeout_s: float = 500.0,
         **kwargs: Any,
@@ -96,21 +97,35 @@ class Agent:
         system = self.instructions if self.instructions is not None else self.system
         tool_registry = self.tools if isinstance(self.tools, ToolRegistry) else ToolRegistry(self.tools)
         if self.session_path is not None:
-            self.rowset = open_session(self.session_path, registry=self.registry)
+            self.rowset = open_session(
+                self.session_path,
+                registry=self.registry,
+                budgets=self.budgets,
+            )
         else:
             self.rowset = RowSet(ClaimStore(registry=self.registry), [
                 HistoryRow(), CapabilityRow(budgets=dict(self.budgets or {})), EffectRow(),
             ])
         supervisor = None
         if self.supervisor_policy is not None:
+            supervisor_session_id = self.supervisor_session_id or (
+                str(self.session_path)
+                if self.session_path is not None else "in-memory-agent"
+            )
             supervisor = Supervisor(
                 self.supervisor_policy, self.rowset,
-                self.supervisor_session_id or self.session_path or "in-memory-agent",
+                supervisor_session_id,
             )
-        skill_registry = (
-            self.skills if isinstance(self.skills, SkillRegistry)
-            else SkillRegistry(self.skills)
-        )
+        # A Skill directory is a pleasant default for ordinary projects:
+        # ``skills="skills/support-triage"``.  Advanced callers can still
+        # provide an explicit registry or already-loaded Skill objects.
+        if isinstance(self.skills, SkillRegistry):
+            skill_registry = self.skills
+        elif isinstance(self.skills, (str, Path)):
+            from .skills import discover_skills
+            skill_registry = SkillRegistry(discover_skills(self.skills))
+        else:
+            skill_registry = SkillRegistry(self.skills)
         self.harness = LLMHarness(
             adapter=self.adapter,
             rowset=self.rowset,

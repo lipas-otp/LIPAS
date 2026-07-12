@@ -15,7 +15,7 @@ Streaming incompatibility:
 
 P2.4 amendment:
     Return type changed from `Reply` to `RetryOutcome(reply, attempts)`.
-    The harness layer (P2.4) records `attempts` into call_result claims
+    The harness layer records `attempts` on effect-result claims
     to make retry behavior an observable, auditable signal of the
     capability layer rather than a hidden implementation detail.
     Future fields (total_delay_s, attempt_kinds, ...) can be added to

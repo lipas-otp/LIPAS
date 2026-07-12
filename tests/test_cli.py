@@ -44,7 +44,7 @@ def test_chat_once_uses_same_agent_runtime(monkeypatch, capsys):
     assert "agent> echo: hello" in capsys.readouterr().out
 
 
-def test_chat_creates_parent_for_new_session(monkeypatch, tmp_path):
+def test_chat_passes_a_new_session_to_the_agent(monkeypatch, tmp_path):
     captured = {}
 
     class StubAgent:
@@ -58,7 +58,6 @@ def test_chat_creates_parent_for_new_session(monkeypatch, tmp_path):
     monkeypatch.setattr("lipas.cli._chat", lambda *_args, **_kwargs: __import__("asyncio").sleep(0))
     session = tmp_path / "new" / "chat.db"
     assert main(["chat", "--session", str(session), "--once", "hello"]) == 0
-    assert session.parent.is_dir()
     assert captured["session"] == str(session)
 
 

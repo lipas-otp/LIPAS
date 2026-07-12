@@ -40,6 +40,7 @@ On mismatch the cursor raises ``ReplayMismatch``.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import AsyncIterator, ClassVar, Sequence
@@ -188,7 +189,9 @@ class ReplayCursor:
         if self.strict_match:
             self._validate_match(entry, request)
         self._pos += 1
-        return entry.reply
+        # Callers receive a value, never a mutable reference into the recorded
+        # tape. This keeps later replay calls independent.
+        return deepcopy(entry.reply)
 
     def _validate_match(self, entry: _RecordedCall, request: Request) -> None:
         rec = entry.recorded_request
@@ -270,4 +273,4 @@ class ReplayingAdapter:
             )
         entry = self._entries[self._pos]
         self._pos += 1
-        yield Done(reply=entry.reply)
+        yield Done(reply=deepcopy(entry.reply))

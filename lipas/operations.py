@@ -10,10 +10,12 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TypeVar
 
 from .calculus import Claim
 from .rows import RowSet
+from .serialization.store_sqlite import ensure_sqlite_parent
 
 TAG_OPERATION_PREPARED = "operation_prepared"
 TAG_OPERATION_UNCERTAIN = "operation_uncertain"
@@ -22,6 +24,7 @@ TAG_OPERATION_FAILED = "operation_failed"
 
 __all__ = [
     "Operation", "OperationJournal", "IdempotentProvider", "PendingOperation",
+    "OperationStateError",
     "TAG_OPERATION_PREPARED", "TAG_OPERATION_UNCERTAIN",
     "TAG_OPERATION_SUCCEEDED", "TAG_OPERATION_FAILED",
 ]
@@ -34,6 +37,10 @@ class IdempotentProvider(Protocol):
 
 class PendingOperation(RuntimeError):
     """A provider may have accepted an earlier attempt; reconcile it first."""
+
+
+class OperationStateError(RuntimeError):
+    """A terminal operation cannot be rewritten to a different outcome."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +62,8 @@ class OperationJournal:
     refuses to retry a pre-existing pending or uncertain row, because that is
     precisely the crash window in which an external effect is unknowable.
     """
-    def __init__(self, path: str = ":memory:", *, rowset: RowSet | None = None) -> None:
+    def __init__(self, path: str | Path = ":memory:", *, rowset: RowSet | None = None) -> None:
+        ensure_sqlite_parent(path)
         self._conn = sqlite3.connect(path)
         self._conn.execute("""CREATE TABLE IF NOT EXISTS operations (
             key TEXT PRIMARY KEY, kind TEXT NOT NULL, request_json TEXT NOT NULL,
@@ -68,9 +76,16 @@ class OperationJournal:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(operations)")}
         if "effect_id" not in columns:
             self._conn.execute("ALTER TABLE operations ADD COLUMN effect_id TEXT")
-        self._conn.commit(); self.rowset = rowset
+        self._conn.commit()
+        self.rowset = rowset
+        self._closed = False
 
-    def close(self) -> None: self._conn.close()
+    def close(self) -> None:
+        """Close the journal connection. Safe to call more than once."""
+        if self._closed:
+            return
+        self._conn.close()
+        self._closed = True
     def __enter__(self) -> "OperationJournal": return self
     def __exit__(self, *_: Any) -> None: self.close()
 
@@ -98,9 +113,65 @@ class OperationJournal:
         return operation
 
     def _transition(self, key: str, state: str, *, result: Any = None, provider_reference: str | None = None, error: Mapping[str, Any] | None = None) -> Operation:
-        if self.get(key) is None: raise KeyError(key)
+        """Move a non-terminal operation once, without rewriting history.
+
+        A journal entry is a recovery record, not a mutable status row.  In
+        particular, a later or stale reconciliation must never turn a known
+        success into a failure.  The conditional SQL update also prevents two
+        processes from both treating the same pending row as theirs to settle.
+        """
+        current = self.get(key)
+        if current is None:
+            raise KeyError(key)
+
+        new_error = dict(error) if error else None
+        same_outcome = (
+            current.state == state
+            and current.result == result
+            and current.provider_reference == provider_reference
+            and (dict(current.error) if current.error else None) == new_error
+        )
+        if same_outcome:
+            return current
+        if current.state in {"succeeded", "failed"}:
+            raise OperationStateError(
+                f"operation {key!r} is terminal ({current.state}) and cannot be rewritten"
+            )
+
+        allowed_from = ("pending",) if state == "uncertain" else ("pending", "uncertain")
+        if current.state not in allowed_from:
+            raise OperationStateError(
+                f"operation {key!r} cannot transition from {current.state!r} to {state!r}"
+            )
+        placeholders = ",".join("?" for _ in allowed_from)
         with self._conn:
-            self._conn.execute("UPDATE operations SET state=?,result_json=?,provider_reference=?,error_json=?,updated_at=? WHERE key=?", (state, json.dumps(result, sort_keys=True) if result is not None else None, provider_reference, json.dumps(dict(error), sort_keys=True) if error else None, time.time(), key))
+            cursor = self._conn.execute(
+                "UPDATE operations SET state=?,result_json=?,provider_reference=?,"
+                f"error_json=?,updated_at=? WHERE key=? AND state IN ({placeholders})",
+                (
+                    state,
+                    json.dumps(result, sort_keys=True) if result is not None else None,
+                    provider_reference,
+                    json.dumps(new_error, sort_keys=True) if new_error else None,
+                    time.time(),
+                    key,
+                    *allowed_from,
+                ),
+            )
+        if cursor.rowcount != 1:
+            latest = self.get(key)
+            assert latest is not None
+            latest_matches = (
+                latest.state == state
+                and latest.result == result
+                and latest.provider_reference == provider_reference
+                and (dict(latest.error) if latest.error else None) == new_error
+            )
+            if latest_matches:
+                return latest
+            raise OperationStateError(
+                f"operation {key!r} changed concurrently; its current state is {latest.state!r}"
+            )
         operation = self.get(key)
         assert operation is not None
         self._audit({"succeeded": TAG_OPERATION_SUCCEEDED, "failed": TAG_OPERATION_FAILED,
@@ -127,10 +198,29 @@ class OperationJournal:
             raise PendingOperation(f"operation {key!r} is {op.state}; reconcile provider state before retrying")
         try:
             result = provider(idempotency_key=key)
+            reference = provider_reference(result) if provider_reference else None
+            return self.settle(key, result=result, provider_reference=reference)
         except BaseException as exc:
-            self.mark_uncertain(key, error={"type": type(exc).__name__, "message": str(exc)})
+            # The provider may already have accepted the operation even when
+            # result parsing, provider-reference extraction, or journal
+            # serialization fails. Preserve the original error, but turn an
+            # still-pending row into uncertainty so no caller can resend it.
+            self._mark_uncertain_after_submission(key, exc)
             raise
-        return self.settle(key, result=result, provider_reference=provider_reference(result) if provider_reference else None)
+
+    def _mark_uncertain_after_submission(self, key: str, exc: BaseException) -> None:
+        current = self.get(key)
+        if current is None or current.state != "pending":
+            return
+        try:
+            self.mark_uncertain(
+                key,
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+        except OperationStateError:
+            # A concurrent reconciler/settler won the race. Its durable state
+            # is more authoritative than this process's local exception.
+            pass
 
     def pending(self) -> tuple[Operation, ...]:
         return tuple(op for (key,) in self._conn.execute("SELECT key FROM operations WHERE state IN ('pending','uncertain') ORDER BY created_at") if (op := self.get(key)) is not None)
@@ -142,7 +232,12 @@ class OperationJournal:
         only application code may choose a new idempotency key and resubmit.
         """
         op = self.get(key)
-        if op is None: raise KeyError(key)
+        if op is None:
+            raise KeyError(key)
+        # Reconciliation is idempotent after a known outcome.  Do not invoke a
+        # possibly stale provider lookup or rewrite a terminal journal row.
+        if op.state in {"succeeded", "failed"}:
+            return op
         found, result, reference = lookup(key)
         if found: return self.settle(key, result=result, provider_reference=reference)
         return self.fail(key, error={"type": "provider_not_found", "message": "reconciliation found no provider operation"})

@@ -221,8 +221,6 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     if args.factory:
         agent = _factory(args.factory)
     else:
-        if args.session:
-            Path(args.session).parent.mkdir(parents=True, exist_ok=True)
         retry_policy = dict(DEFAULT_POLICY)
         for kind in (ErrorKind.TIMEOUT, ErrorKind.NETWORK):
             retry_policy[kind] = RetryPolicy(

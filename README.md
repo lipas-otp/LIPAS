@@ -13,7 +13,7 @@ Agent  = one assistant that thinks and uses tools
 Team   = a durable handoff between named assistants or functions
 ```
 
-> **0.9.7 public beta.** Ollama, injected-client Anthropic, and OpenAI
+> **0.9.8 public beta.** Ollama, injected-client Anthropic, and OpenAI
 > Responses adapters are available, along with durable SQLite sessions, safe
 > replay, supervision, and at-least-once Team handoffs.
 
@@ -76,7 +76,9 @@ with Agent.ollama(
 
 `agent.ask(...)` is the normal-script API. In an async application, use
 `await agent.run(...)`. The first runnable example is
-[`examples/00_playground.py`](examples/00_playground.py).
+[`examples/01_first_agent.py`](examples/01_first_agent.py). The numbered
+[example course](examples/README.md) then builds from ordinary assistants to
+replay, supervision, durable handoffs, and external-operation recovery.
 
 ## When to add more
 
@@ -115,6 +117,31 @@ with Team.open("runs/team.db") as team:
 The record is not a magic memory system and LIPAS is not a graph/workflow DSL.
 Your application still owns its domain data, business rules, and user-facing
 workflow.
+
+The high-level `Agent` API returns a final result. Lower-level
+`LLMHarness.stream(...)` supports normalized stream events for integrations
+that need them, but LIPAS does not yet offer token streaming from `Agent`.
+
+## Reusable Skills
+
+A Skill is a portable `SKILL.md` instruction file: it captures how an Agent
+should approach recurring work without granting it any new authority. Tools
+remain the only executable capability. Start by copying one of the ready-made
+[example skills](examples/skills), then point an Agent at its directory:
+
+```python
+from lipas import Agent
+from my_app.tools import search_papers
+
+agent = Agent.ollama(
+    tools=[search_papers],
+    skills="skills/research-brief",
+)
+```
+
+The research, support-triage, daily-brief, and safe-external-actions Skills are
+deliberately small templates: edit them for your own standards rather than
+treating prompt text as a permission system.
 
 ## Try and inspect
 

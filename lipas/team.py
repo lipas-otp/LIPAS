@@ -7,7 +7,9 @@ wire those two objects separately.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .orchestration import AgentOrchestrator, Mailbox
@@ -43,7 +45,7 @@ class Team:
         self._orchestrator = AgentOrchestrator(self.mailbox, lease_seconds=self.lease_seconds)
 
     @classmethod
-    def open(cls, path: str = ":memory:", *, audit_path: str | None = None,
+    def open(cls, path: str | Path = ":memory:", *, audit_path: str | Path | None = None,
              lease_seconds: float = 60.0) -> "Team":
         """Open a Team and its durable audit session.
 
@@ -63,7 +65,13 @@ class Team:
         prompt. It is adapted internally to the mailbox protocol; callers do
         not need a second public abstraction.
         """
-        if not name or not callable(handler):
+        from .agent import Agent
+
+        is_async_callable = (
+            inspect.iscoroutinefunction(handler)
+            or inspect.iscoroutinefunction(getattr(handler, "__call__", None))
+        )
+        if not name or not callable(handler) or not (isinstance(handler, Agent) or is_async_callable):
             raise TypeError("team.add(name, handler) requires a non-empty name and async callable")
 
         async def receive(message):
@@ -71,7 +79,6 @@ class Team:
             # An Agent retains its normal public call surface. At a mailbox
             # boundary we additionally seed its state with the stable message
             # id, making every LLM/tool intent traceable to this handoff.
-            from .agent import Agent
             if isinstance(handler, Agent):
                 from .behaviour import AgentState
                 return await handler.run(

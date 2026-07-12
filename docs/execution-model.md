@@ -6,7 +6,7 @@ you need to know what a durable trace, replay, or Team actually guarantees.
 
 ## Start from the application's need
 
-LIPAS has three public ideas:
+LIPAS has three execution ideas:
 
 | Idea | Meaning | Add it when |
 |---|---|---|
@@ -23,6 +23,10 @@ approval boundary.
 Tools are not agents. They are the explicit hands of an Agent. A Team member
 is usually one Agent, but can be a plain async function when no model is
 needed.
+
+A `Skill` is optional reusable guidance in a portable `SKILL.md` file. It is
+loaded into an Agent's instructions, but creates no capability and no new
+execution semantics: the Agent can still act only through its declared tools.
 
 ## One record, three views
 
@@ -63,8 +67,12 @@ outcome explicit. An intent without either is an **orphan**: an interrupted or
 unknown operation that must be investigated, not silently treated as success.
 
 Guards and budgets run before the live effect. A denial is still recorded as an
-intent plus a typed rejection. `caused_by` can link an Agent effect to its Team
-message; `compensates` can link a compensating effect to an earlier one.
+intent plus a typed rejection. A tool with an `estimate=` must produce finite,
+non-negative estimates before it can run; an invalid or failing estimate is an
+`estimate_invalid` rejection, never a reason to bypass a hard budget. The
+accepted intent snapshots the submitted input. `caused_by` can link an Agent
+effect to its Team message; `compensates` can link a compensating effect to an
+earlier one.
 
 ## Replay: reproduce decisions without accidentally repeating effects
 
@@ -81,23 +89,38 @@ original external operation was delivered exactly once.
 `OperationJournal` is the boundary for an external write that supports an
 idempotency key. It persists the caller's key before submission and records
 `prepared`, `uncertain`, `succeeded`, and `failed`. Its transitions can link to
-the originating effect.
+the originating effect. A known terminal outcome is immutable: repeated
+reconciliation returns it rather than allowing stale information to rewrite it.
 
 After a crash or an ambiguous provider error, the state is `uncertain`.
 LIPAS refuses blind resubmission; application code must reconcile with the
 provider. Exactly-once is possible only when that provider honors the same key
 and offers a way to determine the outcome.
 
+If LIPAS cannot durably record a provider return—for example, because a result
+cannot be serialized—it also marks a still-pending submission `uncertain`.
+Recording trouble is never treated as evidence that the external write did not
+happen.
+
 ## Teams: reliable handoff, not a graph DSL
 
 `Team` records handoff, lease, acknowledgement, release, and recovery in its
 own durable session. Delivery is at least once: a crashed member's lease can
 expire and the same stable message can be delivered again. The receiver uses
-the message id as its idempotency/replay key.
+the message id as its idempotency/replay key. An acknowledgement is valid only
+while its lease is active; an expired worker cannot acknowledge late work.
 
 This is intentionally smaller than distributed ownership or a workflow graph.
 Each Agent keeps its own authority and budget today; cross-Team budget sharing,
 capability delegation, and mailbox replay are explicit application work.
+
+## Streaming: a lower-level boundary today
+
+`LLMHarness.stream(...)` can yield normalized `Delta`, `ToolUseDelta`, and
+terminal `Done` events while preserving the same effect record. Once an event
+is visible, that attempt is not retried: emitted output cannot be taken back.
+The high-level `Agent` API deliberately returns a final `FinalResult` only; it
+does not yet expose caller-facing token streaming.
 
 ## Deliberate boundaries
 

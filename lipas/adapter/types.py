@@ -125,8 +125,10 @@ class Request:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.model:
-            raise ValueError("model must be non-empty")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("model must be a non-empty string")
+        if not isinstance(self.system, str):
+            raise TypeError("system must be a string")
         if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
             raise ValueError(f"max_tokens must be int, got {type(self.max_tokens).__name__}")
         if self.max_tokens <= 0:
@@ -168,6 +170,14 @@ class Reply:
     error_detail: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("Reply.model must be a non-empty string")
+        if not isinstance(self.usage, Usage):
+            raise TypeError("Reply.usage must be Usage")
+        if self.stop_reason not in {
+            "end_turn", "max_tokens", "stop_sequence", "tool_use", "error",
+        }:
+            raise ValueError(f"Reply.stop_reason is not recognized: {self.stop_reason!r}")
         if self.stop_reason == "error" and self.error_detail is None:
             raise ValueError("Reply with stop_reason='error' must populate error_detail")
         if self.stop_reason != "error" and self.error_detail is not None:
@@ -216,12 +226,18 @@ class ResourceEstimate:
     max_cost_usd: Decimal
 
     def __post_init__(self) -> None:
-        if self.input_tokens < 0:
-            raise ValueError(f"input_tokens must be >= 0, got {self.input_tokens}")
-        if self.max_output_tokens < 0:
-            raise ValueError(f"max_output_tokens must be >= 0, got {self.max_output_tokens}")
-        if self.max_cost_usd < 0:
-            raise ValueError(f"max_cost_usd must be >= 0, got {self.max_cost_usd}")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("ResourceEstimate.model must be a non-empty string")
+        for name in ("input_tokens", "max_output_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative int, got {value!r}")
+        if not isinstance(self.max_cost_usd, Decimal):
+            raise TypeError("max_cost_usd must be Decimal")
+        if not self.max_cost_usd.is_finite() or self.max_cost_usd < 0:
+            raise ValueError(
+                f"max_cost_usd must be a finite non-negative Decimal, got {self.max_cost_usd!r}"
+            )
 
 
 class UnknownModelError(KeyError):
@@ -243,6 +259,19 @@ class ModelPrice:
     output_per_mtok: Decimal
     cache_read_per_mtok: Decimal = Decimal("0")
     cache_write_per_mtok: Decimal = Decimal("0")
+
+    def __post_init__(self) -> None:
+        for name in (
+            "input_per_mtok", "output_per_mtok",
+            "cache_read_per_mtok", "cache_write_per_mtok",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal):
+                raise TypeError(f"{name} must be Decimal")
+            if not value.is_finite() or value < 0:
+                raise ValueError(
+                    f"{name} must be a finite non-negative Decimal, got {value!r}"
+                )
 
     def cost(self, usage: Usage) -> Decimal:
         return (

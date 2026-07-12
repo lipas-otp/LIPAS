@@ -9,6 +9,7 @@ import pytest
 from lipas.calculus import Claim
 from lipas.exceptions import ClaimIdConflict
 from lipas.rows.capability import CapabilityRow
+from lipas.rows.base import InvariantViolation
 from lipas.rows.effect import EffectRow
 from lipas.rows.history import HistoryRow
 from lipas.serialization.store_sqlite import SqliteClaimStore
@@ -73,6 +74,42 @@ def test_open_session_in_memory():
         assert len(rowset.store) == 1
     finally:
         rowset.store.close()
+
+
+def test_open_session_creates_missing_parent_directories(tmp_path):
+    path = tmp_path / "new-project" / "runs" / "agent.db"
+    rowset = open_session(path)
+    try:
+        assert path.is_file()
+    finally:
+        rowset.store.close()
+
+
+@pytest.mark.parametrize("budgets", [
+    {"tokens_out": -1},
+    {"tokens_out": float("nan")},
+    {"tokens_out": float("inf")},
+    {"tokens_out": True},
+    {"": 1},
+])
+def test_capability_row_rejects_invalid_budget_limits(budgets):
+    with pytest.raises(ValueError):
+        CapabilityRow(budgets=budgets)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("amount", [True, float("nan"), float("inf"), -1])
+def test_capability_row_rejects_invalid_spend_amounts(amount):
+    from lipas.store import ClaimStore
+    from lipas.rows import RowSet
+
+    rowset = RowSet(ClaimStore(), [CapabilityRow(budgets={"tokens_out": 100})])
+    claim = Claim(
+        tag="resource_spent",
+        fields={"bucket": "tokens_out", "amount": amount},
+        source="test",
+    )
+    with pytest.raises(InvariantViolation, match="invalid bucket or amount"):
+        rowset.fold(claim)
 
 
 def test_claim_store_deduplicates_same_claim_id():

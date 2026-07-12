@@ -1,7 +1,7 @@
 """Standardized error classification for adapter calls.
 
 Provider-specific exceptions are mapped to one of these kinds before
-being recorded in call_result.error_kind. This lets policy and replay
+being recorded on an effect result. This lets policy and replay
 reason about errors uniformly across providers.
 
 The transient/permanent distinction is advisory — it informs default

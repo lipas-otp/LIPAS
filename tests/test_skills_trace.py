@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -48,6 +49,31 @@ def test_skill_requires_portable_metadata(tmp_path):
     path.write_text("# instructions", encoding="utf-8")
     with pytest.raises(SkillError, match="front matter"):
         load_skill(path)
+
+
+def test_ready_made_example_skills_are_portable_and_distinct():
+    root = Path(__file__).resolve().parent.parent / "examples" / "skills"
+    skills = discover_skills(root)
+    assert [skill.name for skill in skills] == [
+        "daily-brief", "research-brief", "safe-external-actions",
+        "support-triage",
+    ]
+    assert all(skill.description and skill.instructions for skill in skills)
+
+
+def test_agent_accepts_a_skill_directory_directly(tmp_path):
+    skill_file = tmp_path / "triage" / "SKILL.md"
+    skill_file.parent.mkdir()
+    skill_file.write_text(
+        "---\nname: triage\ndescription: Route work safely.\n---\n"
+        "Look up facts before making a recommendation.\n",
+        encoding="utf-8",
+    )
+    agent = Agent(adapter=FakeAdapter.echoing(), model="fake", skills=skill_file.parent)
+    try:
+        assert '<skill name="triage">' in agent.behaviour.request_template.system
+    finally:
+        agent.close()
 
 
 def test_trace_is_markdown_and_jsonl_safe():
@@ -103,6 +129,24 @@ def test_agent_ollama_has_a_playable_documented_default():
     agent = Agent.ollama()
     try:
         assert agent.model == "gemma4:12b"
+    finally:
+        agent.close()
+
+
+def test_durable_agent_keeps_its_declared_budget(tmp_path):
+    adapter = FakeAdapter.echoing()
+    agent = Agent(
+        adapter=adapter,
+        model="fake",
+        session_path=tmp_path / "runs" / "agent.db",
+        max_tokens=100,
+        budgets={"tokens_out": 50},
+    )
+    try:
+        result = agent.ask("write a long answer")
+        assert result.is_error
+        assert result.error and result.error["type"] == "preflight_rejection"
+        assert adapter.calls_made == 0
     finally:
         agent.close()
 

@@ -46,6 +46,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Iterator
 
 from ..calculus import (
@@ -59,6 +60,21 @@ from .codec import (CodecRegistry, decode, encode, make_default_codec_registry)
 
 # Bumped only on incompatible schema change.
 SCHEMA_VERSION = 1
+
+
+def ensure_sqlite_parent(path: str | Path) -> None:
+    """Create a normal SQLite path's parent directory when it is missing.
+
+    SQLite creates a database file but not its containing directory. High-level
+    LIPAS paths such as ``runs/agent.db`` should work in a new project, while
+    ``:memory:`` and SQLite URI paths remain entirely caller-controlled.
+    """
+    # SQLite accepts ``Path`` instances as well as strings.  Treat URI paths
+    # specially: their location and creation semantics belong to SQLite, not
+    # to this small convenience helper.
+    if isinstance(path, str) and (path == ":memory:" or path.startswith("file:")):
+        return
+    Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
 
 _SCHEMA_SQL = """
@@ -102,7 +118,7 @@ class SqliteClaimStore:
 
     def __init__(
         self,
-        path: str,
+        path: str | Path,
         *,
         registry:       StrategyRegistry | None = None,
         ctx:            BeliefContext     | None = None,
@@ -136,6 +152,7 @@ class SqliteClaimStore:
         self._by_tag: dict[str, list[int]] = {}
         self._by_id:  dict[str, Claim] = {}
 
+        ensure_sqlite_parent(path)
         # check_same_thread=True (the default) is intentional — single-process
         # writer ownership is part of the contract; sharing across threads
         # without serialization would silently corrupt the journal.

@@ -30,8 +30,9 @@ Override at the call site if you know what you're doing.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, ClassVar
 
 from lipas.adapter import Request, ResourceEstimate, StreamEvent
@@ -55,10 +56,10 @@ __all__ = [
 ]
 
 
-def _default_rows() -> list[Row]:
+def _default_rows(*, budgets: Mapping[str, float] | None = None) -> list[Row]:
     """Standard row triple. Fresh instances per call (Row objects are
     cheap and stateless w.r.t. the store)."""
-    return [EffectRow(), HistoryRow(), CapabilityRow()]
+    return [EffectRow(), HistoryRow(), CapabilityRow(budgets=dict(budgets or {}))]
 
 
 # =====================================================================
@@ -66,10 +67,11 @@ def _default_rows() -> list[Row]:
 # =====================================================================
 
 def open_session(
-    path: str,
+    path: str | Path,
     *,
     rows: Sequence[Row] | None = None,
     registry: StrategyRegistry | None = None,
+    budgets: Mapping[str, float] | None = None,
 ) -> RowSet:
     """Open or create a SQLite-backed RowSet.
 
@@ -107,9 +109,12 @@ def open_session(
     registry:
         Override the default StrategyRegistry. Most callers should
         leave this as None.
+    budgets:
+        Limits for the default ``CapabilityRow``. Ignored when ``rows=`` is
+        supplied, because the caller then owns the complete projection set.
     """
     store = SqliteClaimStore(path, registry=registry)
-    chosen = list(rows) if rows is not None else _default_rows()
+    chosen = list(rows) if rows is not None else _default_rows(budgets=budgets)
     return RowSet(store, chosen)
 
 

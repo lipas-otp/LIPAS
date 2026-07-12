@@ -109,6 +109,15 @@ class TestRequest:
         with pytest.raises(ValueError):
             make_request(model="")
 
+    @pytest.mark.parametrize("model", [None, 42, "   "])
+    def test_model_must_be_a_non_blank_string(self, model):
+        with pytest.raises(ValueError):
+            make_request(model=model)  # type: ignore[arg-type]
+
+    def test_system_must_be_a_string(self):
+        with pytest.raises(TypeError):
+            make_request(system={"not": "text"})  # type: ignore[arg-type]
+
     # --- Structural temperature validation only.
     # Provider-specific range checks belong in adapters (see protocol.py).
 
@@ -177,6 +186,23 @@ class TestReplyErrorDetail:
         )
         assert r.error_detail == {"type": "rate_limit", "status_code": 429}
 
+    @pytest.mark.parametrize("kwargs", [
+        {"model": ""},
+        {"model": 42},
+        {"stop_reason": "unknown_stop"},
+        {"usage": {"input": 1}},
+    ])
+    def test_reply_rejects_invalid_core_fields(self, kwargs):
+        values = {
+            "content": [],
+            "usage": Usage(),
+            "stop_reason": "end_turn",
+            "model": "m",
+        }
+        values.update(kwargs)
+        with pytest.raises((TypeError, ValueError)):
+            Reply(**values)  # type: ignore[arg-type]
+
 
 # -------------------------------------------------------- ModelPrice / Table
 
@@ -212,6 +238,15 @@ class TestModelPrice:
         p = ModelPrice(input_per_mtok=Decimal("0.01"), output_per_mtok=Decimal("0.02"))
         assert isinstance(p.cost(Usage(input=100)), Decimal)
 
+    @pytest.mark.parametrize("kwargs", [
+        {"input_per_mtok": Decimal("-1"), "output_per_mtok": Decimal("1")},
+        {"input_per_mtok": Decimal("NaN"), "output_per_mtok": Decimal("1")},
+        {"input_per_mtok": 1, "output_per_mtok": Decimal("1")},
+    ])
+    def test_prices_must_be_finite_non_negative_decimals(self, kwargs):
+        with pytest.raises((TypeError, ValueError)):
+            ModelPrice(**kwargs)  # type: ignore[arg-type]
+
 
 class TestPriceTable:
     def test_lookup_hit(self):
@@ -246,6 +281,16 @@ class TestResourceEstimate:
     def test_negatives_rejected(self, kwargs):
         with pytest.raises(ValueError):
             ResourceEstimate(model="m", **kwargs)
+
+    @pytest.mark.parametrize("kwargs", [
+        dict(input_tokens=True, max_output_tokens=0, max_cost_usd=Decimal("0")),
+        dict(input_tokens=0, max_output_tokens=1.5, max_cost_usd=Decimal("0")),
+        dict(input_tokens=0, max_output_tokens=0, max_cost_usd=Decimal("NaN")),
+        dict(input_tokens=0, max_output_tokens=0, max_cost_usd=0.0),
+    ])
+    def test_invalid_numeric_shapes_rejected(self, kwargs):
+        with pytest.raises((TypeError, ValueError)):
+            ResourceEstimate(model="m", **kwargs)  # type: ignore[arg-type]
 
 
 # -------------------------------------------------------------- ToolSpec
