@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.9.7] — 2026-07-12
+
+### Changed
+
+- Simplified the shipped runtime around the public `Agent` / `@tool` / `Team`
+  model. The remaining modules correspond to real execution boundaries rather
+  than compatibility layers, test utilities, or fragmented data shapes.
+- Consolidated all provider-neutral adapter values—request, reply, content,
+  usage, stream events, estimates, and pricing—in `lipas.adapter.types`; the
+  public `lipas.adapter` facade remains the supported import surface.
+- Moved repository-only fake adapters and fold-purity checks into `tests/`.
+  The published `lipas` package contains no testing namespace.
+- Merged the supervisor projection into `lipas.supervisor` and updated the
+  supervised-Agent example to use the documented Ollama path.
+- Consolidated the public documentation into README, Getting started, and the
+  Execution model; removed competing beta/stability, CLI, mental-model, and
+  conceptual-note documents.
+
+### Removed
+
+- Legacy adapter submodules (`content`, `request`, `reply`, `usage`,
+  `streaming`, `estimate`, and `pricing`), the standalone supervisor projection
+  module, and `lipas.testing`. These were intentional pre-1.0 simplifications,
+  not compatibility shims.
+
+### Verified
+
+- 319 tests pass across audit, replay, budget, supervision, mailbox, CLI, and
+  provider-adapter contracts.
+
 ## [0.9.6] — 2026-07-11
 
 ### Added
@@ -44,9 +74,6 @@
   folds, effects, replay, coordination, and the external-effect boundary.
 - `lipas.adapter` is now the canonical root-level provider-neutral interchange
   surface (`Request`, `Reply`, content, usage, and stream events).
-- The adapter interchange contract is now one `lipas.adapter.types` module
-  rather than seven tiny cross-importing modules. Provider adapters, tests,
-  and the public `lipas.adapter` facade use the same canonical shapes.
 - `Team`: a small facade that makes ordinary async Python functions and
   Agents durable named team members without introducing a workflow DSL.
 - `project_supervisor(store)`: a tag-indexed read model for retry,
@@ -66,8 +93,6 @@
   examples retain `LIPAS_OLLAMA_MODEL` as an explicit local override.
 - Earlier reliable-core additions are consolidated in this release: `Team`,
   default Agent supervisor wiring, and `project_supervisor(...)`.
-- `project_supervisor(...)` now lives with `Supervisor`, its policy types, and
-  its claim schema rather than in a separate projection module.
 
 - The high-level authoring path is now one short vocabulary: `Agent`,
   `@tool`, and `Team`. Lower-level harnesses remain available for custom
@@ -85,14 +110,6 @@
   storage details; new Python code uses effect names exclusively.
 - Duplicate serialization types and archived implementation notes that no
   longer matched the runtime.
-- Separate beta/stability checklists, a standalone CLI guide, a standalone
-  mental-model guide, and the `assist/` essays. Their useful material is now
-  consolidated into the README, Getting started, and Execution model; the
-  rest was removed rather than preserved as competing documentation.
-- The `lipas.testing` package. `FakeAdapter` and fold-purity enforcement are
-  repository test helpers now; shipped LIPAS code contains only runtime
-  behaviour. The supervision example uses the documented Ollama path instead
-  of importing a package-private test fake.
 
 ### Verified
 

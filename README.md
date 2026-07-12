@@ -13,9 +13,40 @@ Agent  = one assistant that thinks and uses tools
 Team   = a durable handoff between named assistants or functions
 ```
 
-> **0.9.6 public beta.** Ollama, injected-client Anthropic, and OpenAI
+> **0.9.7 public beta.** Ollama, injected-client Anthropic, and OpenAI
 > Responses adapters are available, along with durable SQLite sessions, safe
 > replay, supervision, and at-least-once Team handoffs.
+
+## The one idea underneath
+
+LIPAS does not ask you to write a graph or a special workflow language. You
+write ordinary Python; an `Agent` calls a model and ordinary `@tool` functions.
+The runtime records the reliability-relevant parts of that work as immutable
+**Claims**.
+
+A **fold** accepts each stable claim once, validates it, and updates small
+derived views of the same record: history answers what happened, capability
+enforces spend limits, and effects record `intent → result | rejection`.
+
+```text
+ordinary Python Agent / Tool / Team
+                 │
+                 ▼
+           append-only Claims
+                 ├── history:    decisions and handoffs
+                 ├── capability: budgets and spend
+                 └── effect:     intent, result, lineage
+```
+
+That one record is why the pieces fit together rather than becoming unrelated
+features: guards and budgets decide before a call; replay substitutes a
+recorded result; supervision records its recommendation; a Team handoff has a
+stable causal id; an external write can be reconciled against its recorded
+intent. Your code remains natural Python because the runtime records the
+boundary around it instead of replacing its control flow.
+
+For the precise guarantees and limits, read the short [Execution
+model](docs/execution-model.md).
 
 ## Start here
 

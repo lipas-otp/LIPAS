@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lipas"
-version = "0.9.6"
+version = "0.9.7"
 description = "LIPAS — write ordinary Python agents with replay, auditing, supervision, and durable handoffs."
 readme = "README.md"
 license = {file = "LICENSE"}

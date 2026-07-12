@@ -31,7 +31,7 @@ async def main() -> None:
     try:
         result = await team.ask(
             "researcher",
-            "release risks for LIPAS 0.9.6",
+            "release risks for LIPAS 0.9.7",
             sender="planner",
             message_id=message_id,
         )
