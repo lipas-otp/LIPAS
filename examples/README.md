@@ -1,5 +1,7 @@
 # LIPAS examples: a small course in reliable agents
 
+> Language: [English](README.md) | [中文](README.zh-CN.md)
+
 Run every lesson from the repository root:
 
 ```bash
@@ -91,3 +93,21 @@ python -m lipas.cli effects runs/02-research-brief.db
 An `orphan` effect means the process ended after intent was recorded but
 before LIPAS observed a terminal result. Treat it as an interrupted operation,
 not a successful answer.
+
+## Guided capstone paths
+
+After the first-agent lesson, these are the longer examples worth reading as
+small projects rather than isolated API demonstrations:
+
+| Project | Run | What it combines |
+| --- | --- | --- |
+| Research brief | `python -m examples.02_research_brief` | Read-only retrieval, a reusable Skill, budgets, a durable session, and synthesis. |
+| Support triage | `python -m examples.03_support_triage` | Narrow customer-support capabilities, safe guidance, a Skill, budgets, and a trace. |
+| Daily brief | `python -m examples.04_daily_brief` | Several read-only sources turned into an operational recommendation. |
+| Safe external operation | `python -m examples.09_external_operation` | Idempotency keys, an uncertain submission, reconciliation, and an audit record. |
+| Research review Team | `python -m examples.10_research_review_team` | Two independently owned handoffs with stable message identities. |
+
+The first three need a local Ollama model. The last two run with the core
+package alone. Read the matching chapters in
+[LIPAS, step by step](../docs/tutorial.md) before changing the local demo data
+into a real client.

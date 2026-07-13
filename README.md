@@ -1,5 +1,7 @@
 # LIPAS
 
+> Language: [English](README.md) | [中文](README.zh-CN.md)
+
 **LIPAS lets you write ordinary Python agents with an explicit record of what
 they decided, spent, and did.** It is a small Python reference implementation
 of a claim-based execution model for reliable AI agents.
@@ -76,9 +78,15 @@ with Agent.ollama(
 
 `agent.ask(...)` is the normal-script API. In an async application, use
 `await agent.run(...)`. The first runnable example is
-[`examples/01_first_agent.py`](examples/01_first_agent.py). The numbered
-[example course](examples/README.md) then builds from ordinary assistants to
-replay, supervision, durable handoffs, and external-operation recovery.
+[`examples/01_first_agent.py`](examples/01_first_agent.py).
+
+New to LIPAS? Read [LIPAS, step by step](docs/tutorial.md) as a small,
+linear introduction: first Agent, tools, side effects, results, sessions,
+budgets, replay, writes, Skills, Teams, and then complete runnable projects.
+For a copy-and-run first screen, use the shorter
+[Quick start](docs/getting-started.md). The numbered
+[example course](examples/README.md) remains the reference collection for
+focused scenarios.
 
 ## When to add more
 
@@ -164,8 +172,10 @@ in time, not that LIPAS contacted the internet.
 
 ## Read only what you need
 
-- [Getting started](docs/getting-started.md) — build a small Agent, then add
-  replay, a Team handoff, and supervision.
+- [LIPAS, step by step](docs/tutorial.md) — the recommended linear tutorial,
+  from one Agent through complete projects.
+- [Quick start](docs/getting-started.md) — copy one small local Agent and run
+  it in minutes.
 - [Execution model](docs/execution-model.md) — the exact semantics and limits
   of claims, effects, replay, external operations, and Teams.
 - [Examples](examples/README.md) — focused, runnable scenarios from the high

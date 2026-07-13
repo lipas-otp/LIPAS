@@ -1,7 +1,10 @@
 # LIPAS execution model
 
+> Language: [English](execution-model.md) | [中文](execution-model.zh-CN.md)
+
 This is the one conceptual document for LIPAS. You do not need it to write a
-first agent; read [Getting started](getting-started.md) first. Read this when
+first agent; read the [Quick start](getting-started.md) or the
+[step-by-step tutorial](tutorial.md) first. Read this when
 you need to know what a durable trace, replay, or Team actually guarantees.
 
 ## Start from the application's need
