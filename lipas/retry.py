@@ -30,7 +30,7 @@ import random
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
-from lipas.adapter import Reply, Request
+from lipas.adapter import Reply, Request, Usage
 from lipas.adapter.errors import (
     DEFAULT_POLICY,
     ErrorKind,
@@ -64,6 +64,28 @@ class RetryOutcome:
     """
     reply: Reply
     attempts: int
+    total_usage: Usage | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reply, Reply):
+            raise TypeError("RetryOutcome.reply must be Reply")
+        if (
+            isinstance(self.attempts, bool)
+            or not isinstance(self.attempts, int)
+            or self.attempts < 1
+        ):
+            raise ValueError("RetryOutcome.attempts must be a positive int")
+        if self.total_usage is not None:
+            if not isinstance(self.total_usage, Usage):
+                raise TypeError("RetryOutcome.total_usage must be Usage or None")
+            for field_name in ("input", "output", "cache_read", "cache_write"):
+                if getattr(self.total_usage, field_name) < getattr(
+                    self.reply.usage, field_name,
+                ):
+                    raise ValueError(
+                        "RetryOutcome.total_usage cannot be smaller than "
+                        f"reply.usage for {field_name}"
+                    )
 
     # Read-only convenience projections preserve the useful part of the old
     # ``Reply``-only call site without hiding the new audit-critical attempt
@@ -74,6 +96,10 @@ class RetryOutcome:
     def error_detail(self): return self.reply.error_detail
     @property
     def usage(self): return self.reply.usage
+    @property
+    def billed_usage(self) -> Usage:
+        """Usage across every provider attempt, including failed retries."""
+        return self.total_usage if self.total_usage is not None else self.reply.usage
 
 
 async def call_with_retry(
@@ -125,12 +151,18 @@ async def call_with_retry(
         rng = random.Random()
 
     attempt = 0  # 0-indexed: index of the attempt about to run.
+    total_usage = Usage()
 
     while True:
         reply = await complete(adapter, request)
+        total_usage = total_usage + reply.usage
 
         if reply.stop_reason != "error":
-            return RetryOutcome(reply=reply, attempts=attempt + 1)
+            return RetryOutcome(
+                reply=reply,
+                attempts=attempt + 1,
+                total_usage=total_usage,
+            )
 
         kind = classify(reply)
         policy = policy_table[kind]
@@ -142,7 +174,11 @@ async def call_with_retry(
                 kind.name, attempts_made, policy.max_attempts,
                 policy.should_retry,
             )
-            return RetryOutcome(reply=reply, attempts=attempts_made)
+            return RetryOutcome(
+                reply=reply,
+                attempts=attempts_made,
+                total_usage=total_usage,
+            )
 
         # Full jitter (AWS Architecture Blog variant):
         #   delay ~ U(0, base * 2**attempt)

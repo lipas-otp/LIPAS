@@ -11,6 +11,23 @@ from lipas.exceptions import ClaimIdConflict
 from lipas.rows.capability import CapabilityRow
 from lipas.rows.base import InvariantViolation
 from lipas.rows.effect import EffectRow
+from lipas.adapter import Reply, Request, Usage
+from lipas.effect import (
+    EffectKind,
+    F_ATTEMPTS,
+    F_DECLARED_SIDE_EFFECT,
+    F_EFFECT_ID,
+    F_KIND,
+    F_MODEL,
+    F_OUTPUT,
+    F_REPLY,
+    F_SIDE_EFFECT,
+    F_SPEND,
+    F_TOOL_NAME,
+    F_TOTAL_USAGE,
+    TAG_EFFECT_INTENT,
+    TAG_EFFECT_RESULT,
+)
 from lipas.rows.history import HistoryRow
 from lipas.serialization.store_sqlite import SqliteClaimStore
 from lipas.session import open_session
@@ -134,6 +151,61 @@ def test_claim_store_rejects_conflicting_claim_id():
         store.fold(Claim(tag="observation", fields={"x": 2}, claim_id="once"))
 
 
+def test_claim_copy_helpers_preserve_source_provenance():
+    claim = Claim(
+        tag="observation",
+        fields={"x": 1},
+        source="agent.react",
+        claim_id="source-1",
+    )
+
+    assert claim.with_field("y", 2).source == "agent.react"
+    assert claim.with_fields({"z": 3}).source == "agent.react"
+
+
+def test_claim_store_snapshots_admitted_claims_and_read_results():
+    from lipas.store import ClaimStore
+
+    store = ClaimStore()
+    claim = Claim(
+        tag="observation",
+        fields={"nested": {"values": [1]}},
+        claim_id="immutable",
+        seq=999,
+    )
+    store.fold(claim)
+    claim.fields["nested"]["values"].append(2)
+    exposed = store.log[0]
+    exposed.fields["nested"]["values"].append(3)
+
+    assert store.log[0].fields == {"nested": {"values": [1]}}
+    assert store.log[0].seq == 999
+    claim.tag = "rewritten"
+    assert store.log[0].tag == "observation"
+
+
+def test_sqlite_store_memory_mirror_cannot_be_mutated_by_caller(db_path):
+    store = SqliteClaimStore(db_path)
+    claim = Claim(
+        tag="observation",
+        fields={"nested": {"values": [1]}},
+        claim_id="immutable",
+    )
+    try:
+        store.fold(claim)
+        claim.fields["nested"]["values"].append(2)
+        store.filter(tag="observation")[0].fields["nested"]["values"].append(3)
+        assert store.log[0].fields == {"nested": {"values": [1]}}
+    finally:
+        store.close()
+
+    reopened = SqliteClaimStore(db_path)
+    try:
+        assert reopened.log[0].fields == {"nested": {"values": [1]}}
+    finally:
+        reopened.close()
+
+
 def test_sqlite_session_deduplicates_same_claim_id(db_path):
     rowset = open_session(db_path)
     claim = Claim(tag="observation", fields={"_history": [{"step": 1}]}, claim_id="once")
@@ -161,3 +233,65 @@ def test_sqlite_session_deduplicates_claim_id_after_reopen(db_path):
         assert reopened.store.seq == 1
     finally:
         reopened.store.close()
+
+
+def test_effect_row_rejects_invalid_retry_usage_before_recovery_reads_it():
+    from lipas.rows import RowSet
+    from lipas.store import ClaimStore
+
+    rowset = RowSet(ClaimStore(), [EffectRow()])
+    request = Request("fake", [{"role": "user", "content": "hi"}], 10)
+    reply = Reply((), Usage(), "end_turn", "fake")
+    rowset.fold(Claim(
+        tag=TAG_EFFECT_INTENT,
+        fields={
+            F_EFFECT_ID: "call_abcdef012345",
+            F_KIND: EffectKind.LLM_CALL.value,
+            F_MODEL: "fake",
+            "request": request,
+        },
+    ))
+
+    with pytest.raises(InvariantViolation, match="total_usage.*Usage"):
+        rowset.fold(Claim(
+            tag=TAG_EFFECT_RESULT,
+            fields={
+                F_EFFECT_ID: "call_abcdef012345",
+                F_KIND: EffectKind.LLM_CALL.value,
+                "status": "ok",
+                F_ATTEMPTS: 1,
+                F_REPLY: reply,
+                F_TOTAL_USAGE: {"input": 1},
+            },
+        ))
+
+
+def test_effect_row_rejects_invalid_tool_spend_before_recovery_reads_it():
+    from lipas.rows import RowSet
+    from lipas.store import ClaimStore
+
+    rowset = RowSet(ClaimStore(), [EffectRow()])
+    rowset.fold(Claim(
+        tag=TAG_EFFECT_INTENT,
+        fields={
+            F_EFFECT_ID: "tool_abcdef012345",
+            F_KIND: EffectKind.TOOL_CALL.value,
+            F_TOOL_NAME: "write_note",
+            "arguments": {},
+            F_DECLARED_SIDE_EFFECT: "idempotent_write",
+        },
+    ))
+
+    with pytest.raises(InvariantViolation, match="invalid spend entry"):
+        rowset.fold(Claim(
+            tag=TAG_EFFECT_RESULT,
+            fields={
+                F_EFFECT_ID: "tool_abcdef012345",
+                F_KIND: EffectKind.TOOL_CALL.value,
+                "status": "ok",
+                F_ATTEMPTS: 1,
+                F_OUTPUT: "saved",
+                F_SIDE_EFFECT: "idempotent_write",
+                F_SPEND: {"tool_calls": float("nan")},
+            },
+        ))

@@ -17,6 +17,20 @@ from lipas.adapter.errors import (
 )
 
 
+@pytest.mark.parametrize("kwargs", [
+    {"should_retry": 1, "base_delay_s": 0, "max_attempts": 1},
+    {"should_retry": True, "base_delay_s": True, "max_attempts": 2},
+    {"should_retry": True, "base_delay_s": -1, "max_attempts": 2},
+    {"should_retry": True, "base_delay_s": float("nan"), "max_attempts": 2},
+    {"should_retry": True, "base_delay_s": float("inf"), "max_attempts": 2},
+    {"should_retry": True, "base_delay_s": 0, "max_attempts": 0},
+    {"should_retry": False, "base_delay_s": 0, "max_attempts": 2},
+])
+def test_retry_policy_rejects_unusable_shapes(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        RetryPolicy(**kwargs)
+
+
 
 # -- helpers ----------------------------------------------------------
 

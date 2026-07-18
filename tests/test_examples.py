@@ -2,6 +2,23 @@
 from __future__ import annotations
 
 from importlib import import_module
+from pathlib import Path
+import re
+from urllib.parse import unquote
+
+
+def _markdown_anchors(text: str) -> set[str]:
+    """Return the GitHub-style anchors used by the documentation headings."""
+    anchors: set[str] = set()
+    occurrences: dict[str, int] = {}
+    for heading in re.findall(r"^#{1,6} +(.+?) *#* *$", text, re.MULTILINE):
+        heading = re.sub(r"`([^`]*)`", r"\1", heading)
+        slug = re.sub(r"[^\w -]", "", heading.lower()).strip()
+        slug = re.sub(r" +", "-", slug)
+        duplicate = occurrences.get(slug, 0)
+        occurrences[slug] = duplicate + 1
+        anchors.add(slug if duplicate == 0 else f"{slug}-{duplicate}")
+    return anchors
 
 
 def test_single_agent_lessons_build_durable_agents(tmp_path):
@@ -25,7 +42,7 @@ def test_single_agent_lessons_build_durable_agents(tmp_path):
 
 
 def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsys):
-    """Lessons 05–10 must work without Ollama, a network, or pre-made runs/."""
+    """Lessons 05–11 must work without Ollama, a network, or pre-made runs/."""
     monkeypatch.chdir(tmp_path)
     budget = import_module("examples.05_budget_limit").build_agent(
         session=tmp_path / "runs" / "budget.db",
@@ -43,6 +60,7 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
         "examples.08_team_handoff",
         "examples.09_external_operation",
         "examples.10_research_review_team",
+        "examples.11_durable_execution",
     ):
         module = import_module(module_name)
         module.main()
@@ -53,3 +71,49 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
     assert "mailbox status: acknowledged" in output
     assert "blind retry refused:" in output
     assert "decision:" in output
+    assert "run state before approval: waiting" in output
+    assert "saved notes: ['approved note']" in output
+    assert "final run state: completed" in output
+
+
+def test_documentation_local_links_resolve():
+    files = [
+        Path("README.md"),
+        Path("README.zh-CN.md"),
+        Path("CHANGELOG.md"),
+        *Path("docs").glob("*.md"),
+        *Path("examples").glob("README*.md"),
+    ]
+    missing: list[str] = []
+    for source in files:
+        text = source.read_text(encoding="utf-8")
+        for target in re.findall(r"\[[^]]+\]\(([^)]+)\)", text):
+            if "://" in target or target.startswith("mailto:"):
+                continue
+            path_text, _, anchor = target.partition("#")
+            destination = (source.parent / unquote(path_text or source.name)).resolve()
+            if not destination.exists():
+                missing.append(f"{source}:{target}")
+                continue
+            if anchor and destination.suffix == ".md":
+                destination_text = destination.read_text(encoding="utf-8")
+                if unquote(anchor).lower() not in _markdown_anchors(destination_text):
+                    missing.append(f"{source}:{target}")
+    assert missing == []
+
+
+def test_lesson_catalogues_and_tutorial_cover_every_numbered_example():
+    examples = sorted(Path("examples").glob("[0-9][0-9]_*.py"))
+    english = Path("examples/README.md").read_text(encoding="utf-8")
+    chinese = Path("examples/README.zh-CN.md").read_text(encoding="utf-8")
+    tutorial = Path("docs/tutorial.md").read_text(encoding="utf-8")
+    tutorial_zh = Path("docs/tutorial.zh-CN.md").read_text(encoding="utf-8")
+
+    for example in examples:
+        module = f"examples.{example.stem}"
+        assert module in english
+        assert module in chinese
+    assert "examples/11_durable_execution.py" in tutorial
+    assert "examples/11_durable_execution.py" in tutorial_zh
+    assert not Path("docs/getting-started.md").exists()
+    assert not Path("docs/getting-started.zh-CN.md").exists()

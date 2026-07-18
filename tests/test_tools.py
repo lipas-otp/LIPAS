@@ -288,6 +288,30 @@ def test_equality_ignores_handler_identity():
     assert t1 == t2
 
 
+@pytest.mark.parametrize("overrides", [
+    {"name": ""},
+    {"description": " "},
+    {"parameters_schema": []},
+    {"side_effect": "pure"},
+    {"_handler": None},
+    {"declared_buckets": frozenset()},
+    {"declared_buckets": frozenset({1})},
+    {"estimate_fn": 1},
+    {"observability_only": 1},
+])
+def test_direct_tool_construction_rejects_invalid_core_fields(overrides):
+    fields = {
+        "name": "f",
+        "description": "d",
+        "parameters_schema": {"type": "object"},
+        "side_effect": SideEffectClass.PURE,
+        "_handler": lambda: None,
+    }
+    fields.update(overrides)
+    with pytest.raises((TypeError, ValueError)):
+        Tool(**fields)
+
+
 def test_name_override():
     @tool(side_effect=SideEffectClass.PURE, name="custom")
     def f(x: int) -> int:

@@ -25,7 +25,7 @@ import pytest
 from lipas import retry as retry_mod
 from lipas.adapter import Reply, Usage
 from lipas.adapter.errors import DEFAULT_POLICY, ErrorKind, RetryPolicy
-from lipas.retry import call_with_retry
+from lipas.retry import RetryOutcome, call_with_retry
 
 
 # -- helpers ----------------------------------------------------------
@@ -60,6 +60,26 @@ def auth_reply() -> Reply:
 
 def unknown_reply() -> Reply:
     return err_reply({"type": "novel_garbage_we_have_never_seen"})
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"reply": object(), "attempts": 1},
+    {"reply": ok_reply(), "attempts": True},
+    {"reply": ok_reply(), "attempts": 0},
+    {"reply": ok_reply(), "attempts": 1, "total_usage": {}},
+])
+def test_retry_outcome_rejects_invalid_shapes(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        RetryOutcome(**kwargs)
+
+
+def test_retry_outcome_total_usage_must_include_final_attempt():
+    reply = Reply(
+        content=(), usage=Usage(input=2, output=1),
+        stop_reason="end_turn", model="m",
+    )
+    with pytest.raises(ValueError, match="cannot be smaller"):
+        RetryOutcome(reply=reply, attempts=2, total_usage=Usage(input=1, output=1))
 
 
 class SleepRecorder:

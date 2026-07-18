@@ -15,8 +15,8 @@ validation is required.
 supervisor_retry / supervisor_terminate / supervisor_escalate follow the same
 pattern: they are observations the agent made about
 its own ongoing run (recommended retries, requested terminations,
-human escalations). No invariant; first-write-wins under the default
-strategy. The Supervisor module (lipas.supervisor) is the canonical
+human escalations). No invariant; field conflicts follow the registry's
+ordered default strategy. The Supervisor module (lipas.supervisor) is the canonical
 producer; readers consume them via store.filter(tag=...) or
 HistoryRow.project()['event_count'].
 
@@ -77,6 +77,16 @@ class HistoryRow:
             # durable idempotency state with an effect/tape when supplied.
             "operation_prepared", "operation_uncertain",
             "operation_succeeded", "operation_failed",
+            # ExecutionStore transition audit. The execution database remains
+            # authoritative for leases/checkpoints; these outbox mirrors make
+            # its control history visible in the shared evidence projection.
+            "execution_task_created", "execution_task_completed",
+            "execution_task_cancelled", "execution_run_created",
+            "execution_run_claimed", "execution_lease_renewed",
+            "execution_checkpoint_saved", "execution_interrupt_requested",
+            "execution_interrupt_resolved", "execution_cancel_requested",
+            "execution_run_completed", "execution_run_failed",
+            "execution_run_cancelled",
         })
     )
 

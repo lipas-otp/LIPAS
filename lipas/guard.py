@@ -22,10 +22,8 @@ wins; subsequent guards are not consulted.
 Common guard kinds (provided as building blocks):
 
   - CallableGuard       : wrap a sync/async function.
-  - HumanApprovalGuard  : block on an external resolver (queue, web
-                          hook, CLI) that returns Allow/Deny.
-                          Stub provided; deployments wire in their
-                          own resolver.
+  - HumanApprovalGuard  : block on an injected external resolver (queue,
+                          web hook, CLI) that returns Allow/Deny.
 
 Rejection is recorded as ``effect_rejected`` with reason starting in
 ``"guard:"`` (e.g. ``"guard:human_approval"``), distinguishing guard
@@ -38,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol, Union, runtime_checkable
 
@@ -77,6 +76,18 @@ class GuardVerdict:
     allowed: bool
     reason: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed, bool):
+            raise TypeError("GuardVerdict.allowed must be bool")
+        if not isinstance(self.reason, str):
+            raise TypeError("GuardVerdict.reason must be str")
+        if not isinstance(self.detail, dict):
+            raise TypeError("GuardVerdict.detail must be dict")
+        if self.allowed and self.reason:
+            raise ValueError("an allowed GuardVerdict must not carry a denial reason")
+        if not self.allowed and not self.reason:
+            raise ValueError("a denied GuardVerdict requires a non-empty reason")
 
     @classmethod
     def allow(cls) -> "GuardVerdict":
@@ -181,7 +192,7 @@ class CallableGuard:
 
 
 # =====================================================================
-# HumanApprovalGuard — pluggable resolver stub
+# HumanApprovalGuard — pluggable resolver
 # =====================================================================
 
 ApprovalResolver = Callable[
@@ -218,6 +229,21 @@ class HumanApprovalGuard:
     resolver: ApprovalResolver | None = None
     timeout_s: float | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("HumanApprovalGuard.name must be a non-empty string")
+        if self.resolver is not None and not callable(self.resolver):
+            raise TypeError("HumanApprovalGuard.resolver must be callable or None")
+        if self.timeout_s is not None and (
+            isinstance(self.timeout_s, bool)
+            or not isinstance(self.timeout_s, (int, float))
+            or not math.isfinite(float(self.timeout_s))
+            or self.timeout_s <= 0
+        ):
+            raise ValueError("HumanApprovalGuard.timeout_s must be a finite positive number")
+        if self.timeout_s is not None:
+            self.timeout_s = float(self.timeout_s)
+
     async def check(
         self,
         target: EffectTarget,
@@ -231,10 +257,17 @@ class HumanApprovalGuard:
         coro = self.resolver(target, estimate)
         try:
             if self.timeout_s is None:
-                return await coro
-            return await asyncio.wait_for(coro, timeout=self.timeout_s)
+                verdict = await coro
+            else:
+                verdict = await asyncio.wait_for(coro, timeout=self.timeout_s)
         except asyncio.TimeoutError:
             return GuardVerdict.deny(
                 "approval_timeout",
                 timeout_s=self.timeout_s,
             )
+        if not isinstance(verdict, GuardVerdict):
+            raise TypeError(
+                "HumanApprovalGuard resolver returned "
+                f"{type(verdict).__name__}, expected GuardVerdict",
+            )
+        return verdict

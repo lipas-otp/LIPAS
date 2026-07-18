@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from lipas.calculus import Claim, make_default_registry
+from lipas.calculus import Claim, StrategyRegistry, make_default_registry
 from lipas.store import ClaimStore
 
 
@@ -71,6 +71,13 @@ def test_clean_fold_passes():
     with deterministic_fold():
         _fold_two(store, 1, 2)
     assert store.merged.fields.get("x") == 2
+
+
+def test_unregistered_fields_are_last_write_in_fold_order():
+    registry = StrategyRegistry()
+    store = ClaimStore(registry=registry)
+    _fold_two(store, "first", "second")
+    assert store.merged.fields["x"] == "second"
 
 
 def test_deterministic_fold_is_a_noop_outside_violations():

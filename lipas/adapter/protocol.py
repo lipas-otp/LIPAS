@@ -5,8 +5,7 @@ Adapters translate Request <-> provider native format and emit a
 provider-neutral StreamEvent sequence terminating in exactly one Done.
 """
 from __future__ import annotations
-from typing import AsyncIterator, ClassVar, Protocol, runtime_checkable
-from contextlib import aclosing
+from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .types import Done, Reply, Request, ResourceEstimate, StreamEvent
 
@@ -49,11 +48,12 @@ class LLMAdapter(Protocol):
     sites will continue to work without modification.
     """
 
-    name: ClassVar[str]
+    @property
+    def name(self) -> str: ...
 
     async def estimate_cost(self, request: Request) -> ResourceEstimate: ...
 
-    async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+    def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
         """Drive one model call.
 
         Error contract
@@ -82,10 +82,15 @@ async def complete(adapter: LLMAdapter, request: Request) -> Reply:
     StreamProtocolError, which signals an adapter bug (stream ended
     without Done).
     """
-    async with aclosing(adapter.stream(request)) as stream:
+    stream = adapter.stream(request)
+    try:
         async for event in stream:
             if isinstance(event, Done):
                 return event.reply
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
     raise StreamProtocolError(
         f"adapter {getattr(adapter, 'name', '?')!r} "
         f"stream ended without Done event"

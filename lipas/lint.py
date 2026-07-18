@@ -60,9 +60,10 @@ Returns a list sorted by ``(rule, seq)`` for stable output across runs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from dataclasses import dataclass
+from typing import Callable
 
+from lipas.calculus import Claim
 from lipas.store import ClaimStore
 from lipas.supervisor import (
     F_GB_SOURCE_CLAIM_SEQ,
@@ -148,7 +149,7 @@ def lint_goal_blocked_pairing(store: ClaimStore) -> list[LintViolation]:
     # Build seq -> claim map for O(1) successor lookup. Seqs are
     # assigned by fold and dense in the in-memory store; the dict is
     # the robust path in case a future store flavour leaves gaps.
-    by_seq: dict[int, object] = {c.seq: c for c in log}
+    by_seq: dict[int, Claim] = {c.seq: c for c in log}
 
     for c in log:
         if c.tag not in _TRIGGER_TAGS:

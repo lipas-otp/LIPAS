@@ -19,7 +19,8 @@ your application needs one.
 4. Handle results in a normal Python program.
 5. Keep a durable record when the work matters.
 6. Add limits, replay, and write safety only when the problem calls for them.
-7. Finish with reusable guidance, handoffs, and complete projects.
+7. Checkpoint a run only when it must survive waiting or interruption.
+8. Finish with reusable guidance, handoffs, and complete projects.
 
 ## Before chapter 1
 
@@ -61,8 +62,8 @@ agent = Agent.ollama("qwen2.5:7b", instructions="Be concise.")
 ```
 
 For most scripts, `ask()` is the only method you need. It runs the async agent
-loop and returns one `FinalResult`. There is no Agent-level token streaming in
-this release.
+loop and returns one `FinalResult`. The current API has no Agent-level token
+streaming.
 
 ## 2. Give the assistant one capability
 
@@ -269,7 +270,75 @@ with Team.open("runs/team.db") as team:
 will initiate idempotent or external work. The two-owner project below shows
 the complete shape.
 
-## 10. Guided projects
+## 10. Resume one Agent run after approval or interruption
+
+A durable session records what an Agent did. A durable execution additionally
+records where the ReAct loop can resume. Add this boundary when one logical run
+must wait for approval, survive process interruption, or accept cooperative
+cancellation without appending its prompt or repeating completed effects.
+
+Durable execution uses two SQLite records on purpose:
+
+- the Agent `session` owns Claims, Effects, spend, and stable effect identity;
+- `ExecutionStore` owns Task, Run, lease, checkpoint, and Interrupt state.
+
+Passing the Agent's `rowset` to `ExecutionStore` does not change that authority:
+it mirrors control transitions into the Claim evidence tape through a local,
+crash-repairable outbox.
+
+Create the Task and Run before calling `run_durable()`. A write approval policy
+raises `RunSuspended` only after the checkpoint and Interrupt are durable:
+
+```python
+from pathlib import Path
+
+from lipas import (
+    Agent,
+    ExecutionStore,
+    RunSuspended,
+    writes_require_approval,
+)
+
+
+async def execute(agent: Agent) -> None:
+    with ExecutionStore("runs/execution.db", rowset=agent.rowset) as executions:
+        task = executions.create_task("prepare one approved change", Path.cwd())
+        run = executions.create_run(task.id)
+        try:
+            result = await agent.run_durable(
+                "Prepare and apply the change.",
+                execution_store=executions,
+                run_id=run.id,
+                approval_policy=writes_require_approval,
+            )
+        except RunSuspended as suspended:
+            # A real application shows suspended.interrupt.request to a user.
+            executions.resolve_interrupt(
+                suspended.interrupt.id,
+                allow=True,
+                response={"approved_by": "operator"},
+            )
+            result = await agent.resume_durable(
+                execution_store=executions,
+                run_id=run.id,
+                approval_policy=writes_require_approval,
+            )
+        print(result.stop_reason, result.text)
+```
+
+The Agent must use `session=` or `session_path=`; an in-memory Claim tape is
+rejected because a checkpoint alone cannot prove whether an effect already
+finished. Resume through `resume_durable()`—the original input is already
+checkpointed. Completed terminal runs restore their result without reclaiming
+a lease or calling the provider again. Execution schema mismatches fail at open
+time instead of interpreting an incompatible checkpoint.
+
+Run [`examples/11_durable_execution.py`](../examples/11_durable_execution.py)
+for a provider-free approval/resume flow. Automatic lease heartbeat, timeout
+recovery, and Agent-level token streaming are not yet provided; the exact
+failure semantics are in the [execution model](execution-model.md#durable-react-runs).
+
+## 11. Guided projects
 
 These are the longer, runnable examples to read after the chapters above.
 They deliberately use local data or offline functions so that you can inspect
@@ -282,6 +351,7 @@ the LIPAS boundary before replacing a tool body with a real client.
 | [Daily brief](../examples/04_daily_brief.py) | Chapters 1–6 | Several read-only sources become one operational recommendation. |
 | [Safe external operation](../examples/09_external_operation.py) | Chapters 7–8 | Idempotency keys, uncertainty after failure, reconciliation, and an audit record. |
 | [Research review Team](../examples/10_research_review_team.py) | Chapter 9 | Two independently owned handoffs with stable message identities. |
+| [Durable execution](../examples/11_durable_execution.py) | Chapter 10 | Separate execution/effect stores, a durable approval Interrupt, and resume of the same run. |
 
 Run the first three with a local Ollama model, for example:
 
@@ -291,7 +361,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-The latter two are provider-free. The complete example catalogue, including
+The latter three are provider-free. The complete example catalogue, including
 replay and supervision, is in [examples/README.md](../examples/README.md).
 
 ## API card
@@ -305,6 +375,11 @@ Keep this reference nearby while working through the book:
 | `agent.ask(prompt)` | Run synchronously and receive `FinalResult`. |
 | `await agent.run(prompt, state=None)` | Run asynchronously; pass a prior state only to continue deliberately. |
 | `await agent(prompt)` | Async alias for `run`. |
+| `await agent.run_durable(..., execution_store=..., run_id=...)` | Start or continue a checkpointed ReAct run. |
+| `await agent.resume_durable(...)` | Resume checkpointed input without appending the prompt again. |
+| `ExecutionStore` | Persist Task, Run, lease, Checkpoint, cancellation, and Interrupt state. |
+| `ExecutionStore.cancel_task(...)` | Cancel a Task and cooperatively stop its active Run. |
+| `ApprovalPolicy` / `writes_require_approval` | Type or use a policy that suspends selected tool calls before execution. |
 | `agent.close()` / `with agent:` | Close a durable session. |
 | `@tool(side_effect=...)` | Turn a typed, documented Python function into a capability. |
 

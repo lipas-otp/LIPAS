@@ -1,5 +1,96 @@
 # Changelog
 
+## [0.10.0] — 2026-07-18
+
+### Added
+
+- A durable ReAct phase runner over `ExecutionStore`, including run leases,
+  versioned checkpoints, approval interruption/resume, cooperative
+  cancellation, terminal-result restoration, and orphan-safe Effect recovery.
+- A provider-free durable-execution lesson covering approval suspension and
+  resume; the linear tutorial now includes the same recovery boundary.
+- A versioned execution database and Claim-shaped transaction outbox for
+  Task, Run, lease, checkpoint, Interrupt, cancellation, and settlement
+  transitions. `repair_audit()` mirrors committed events with stable Claim ids.
+- A public `ExecutionStore.cancel_task()` transition, making
+  `TaskState.CANCELLED` reachable while cooperatively stopping an active Run.
+
+### Changed
+
+- Documentation now has one onboarding path: README for the copy-and-run
+  start, the tutorial for progressive learning, the execution model for exact
+  semantics, and the roadmap for unshipped product work. The duplicate Quick
+  start pages and capstone tables were consolidated into those owners.
+- The stable durable surface is `Agent.run_durable()`, `resume_durable()`,
+  `ExecutionStore`, `ApprovalPolicy`, and the execution value/error types.
+  The lower-level `DurableReActRunner` remains available from `lipas.durable`
+  but is no longer presented as a top-level application API.
+- Claim documentation now distinguishes the mutable event-preparation object
+  from the immutable snapshot owned by a Claim store, and defines which SQLite
+  store is authoritative for each kind of mutable control state.
+
+### Fixed
+
+- Provider tool-call correlation ids are now separate from internal Effect
+  ids, so real Anthropic/OpenAI ids and repeated ids across runs cannot corrupt
+  the Effect tape.
+- OpenAI Responses, Anthropic, and Ollama now translate multi-turn typed tool
+  calls/results into their provider wire shapes without silently flattening or
+  misreporting terminal provider states.
+- Tool replay consumes repeated identical recordings in source order and
+  preserves recorded error observations.
+- Retry usage and priced `cost_usd` are accumulated across every billed
+  attempt. Deterministic spend claims let recovery finish partially recorded
+  accounting without double charging the tape.
+- Claim stores now snapshot admitted values and returned read models, so caller
+  mutation cannot rewrite an append-only in-memory tape or diverge it from its
+  SQLite source.
+- Team handoff claims the message it just sent instead of accidentally leasing
+  an older pending message, and durable runs can reclaim expired cancellation
+  requests and restore already-settled results.
+- OperationJournal and Team now commit Claim-shaped audit events to a local
+  outbox with their authoritative SQLite transitions and repair the separate
+  audit tape idempotently after a crash window.
+- Durable checkpoints bind the stable Claim-store identity, preventing a
+  resume against the wrong Effect tape from silently reissuing live work.
+- Durable supervision now uses stable run/iteration-scoped claim identities;
+  recovery repairs a crash between recommendation emission and checkpointing
+  without duplicating supervisor or `goal_blocked` claims.
+- Execution and mailbox leases reject boolean, infinite, and NaN durations or
+  timestamps instead of creating permanently unrecoverable work.
+- Effect rows validate aggregate retry usage and persisted tool spend before
+  malformed recovery data can enter the tape. Terminal cancellation restores
+  consistently, including Claim-store identity checks.
+- OpenAI cached input is normalized into disjoint pricing buckets, and
+  non-token incomplete responses are surfaced as typed provider failures.
+- Malformed provider tool arguments now fail closed as terminal adapter errors
+  across OpenAI, Anthropic, and Ollama instead of reaching defaulted tools.
+- Model `max_tokens` truncation and malformed tool-use stops are no longer
+  reported as natural Agent completion.
+- The wheel now includes its declared PEP 561 `py.typed` marker.
+- Execution databases fail closed on an incompatible schema version instead of
+  interpreting unknown durable state.
+- OperationJournal and Team mailbox databases now carry the same fail-closed
+  schema compatibility gate, including safe adoption of legacy version-1
+  databases. Mailbox also supports the same context-managed cleanup pattern as
+  the other durable stores.
+- Adapter request-translation failures now become recorded terminal error
+  replies instead of escaping after an Effect intent; OpenAI Responses rejects
+  unsupported `stop_sequences` explicitly rather than silently dropping them.
+- Tool estimates cannot charge undeclared resource buckets, and public guard,
+  retry-policy, retry-outcome, Agent-state, and final-result values reject
+  structurally invalid states before they reach durable records.
+
+### Verified
+
+- 503 tests pass across execution, durable recovery, replay, adapters, budgets,
+  Team, CLI, examples, and packaging-facing contracts.
+- A real subprocess `SIGKILL` between a completed write Effect and its next
+  checkpoint restores the recorded result after restart without repeating the
+  write.
+- The wheel builds successfully and imports its public execution and adapter
+  surfaces from an isolated target installation.
+
 ## [0.9.8] — 2026-07-12
 
 ### Added

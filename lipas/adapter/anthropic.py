@@ -13,7 +13,10 @@ propagates. This keeps the effect lifecycle auditable regardless of provider.
 from __future__ import annotations
 
 import asyncio
+import inspect
+from copy import deepcopy
 import logging
+from collections.abc import Mapping
 from typing import Any, AsyncIterator, ClassVar
 
 from .types import (
@@ -50,7 +53,7 @@ _NETWORK_EXC_NAMES = frozenset({
 class AnthropicAdapter:
     """Anthropic Messages API adapter — implements LLMAdapter."""
 
-    name: ClassVar[str] = "anthropic"
+    name: str = "anthropic"
 
     def __init__(
         self,
@@ -81,17 +84,17 @@ class AnthropicAdapter:
         surface as Done(reply=Reply(stop_reason='error', ...)).
         Only CancelledError propagates.
         """
-        params = self._build_params(request)
-
         try:
+            params = self._build_params(request)
             response = await self.client.messages.create(**params)
+            reply = self._reply_from_response(request, response)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             yield Done(reply=self._error_reply(request, exc))
             return
 
-        yield Done(reply=self._reply_from_response(request, response))
+        yield Done(reply=reply)
 
     # ── LLMAdapter.estimate_cost ───────────────────────────────
 
@@ -119,7 +122,7 @@ class AnthropicAdapter:
 
     def _build_params(self, request: Request) -> dict[str, Any]:
         # Request.messages is already provider-neutral, dict-shaped data.
-        messages = list(request.messages)
+        messages = self._anthropic_messages(request.messages)
 
         params: dict[str, Any] = {
             "model":      request.model,
@@ -134,7 +137,7 @@ class AnthropicAdapter:
             # currently passes dicts via _get_tool_descriptors, so
             # accept both.
             params["tools"] = [
-                t if isinstance(t, dict) else {
+                dict(t) if isinstance(t, Mapping) else {
                     "name":         t.name,
                     "description":  t.description,
                     "input_schema": dict(t.input_schema),
@@ -152,6 +155,29 @@ class AnthropicAdapter:
 
         return params
 
+    @staticmethod
+    def _anthropic_messages(messages: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if isinstance(content, str):
+                out.append({"role": role, "content": content})
+                continue
+            blocks: list[Any] = []
+            for raw in content:
+                if not isinstance(raw, Mapping):
+                    blocks.append(raw)
+                    continue
+                block = deepcopy(dict(raw))
+                if block.get("type") == "tool_result":
+                    tool_id = block.pop("tool_call_id", None)
+                    if "tool_use_id" not in block and tool_id is not None:
+                        block["tool_use_id"] = tool_id
+                blocks.append(block)
+            out.append({"role": role, "content": blocks})
+        return out
+
     # ── reply translation ─────────────────────────────────────
 
     def _reply_from_response(
@@ -168,11 +194,22 @@ class AnthropicAdapter:
                     "text": getattr(block, "text", "") or "",
                 })
             elif btype == "tool_use":
+                tool_id = getattr(block, "id", None)
+                tool_name = getattr(block, "name", None)
+                tool_input = getattr(block, "input", None)
+                if (
+                    not isinstance(tool_id, str)
+                    or not tool_id
+                    or not isinstance(tool_name, str)
+                    or not tool_name
+                    or not isinstance(tool_input, Mapping)
+                ):
+                    raise ValueError("Anthropic returned a malformed tool_use block")
                 content.append({
                     "type":  "tool_use",
-                    "id":    getattr(block, "id", "") or "",
-                    "name":  getattr(block, "name", "") or "",
-                    "input": dict(getattr(block, "input", {}) or {}),
+                    "id":    tool_id,
+                    "name":  tool_name,
+                    "input": dict(tool_input),
                 })
             else:
                 logger.warning(
@@ -185,18 +222,33 @@ class AnthropicAdapter:
                                 "raw":  repr(block)})
 
         sr_raw = getattr(response, "stop_reason", None) or ""
-        stop_reason: StopReason = _STOP_REASON_MAP.get(sr_raw, "end_turn")
-        if sr_raw and sr_raw not in _STOP_REASON_MAP:
+        usage = self._usage_from_response(response)
+        model = getattr(response, "model", request.model) or request.model
+        if sr_raw not in _STOP_REASON_MAP:
             logger.warning(
                 "anthropic adapter: unknown stop_reason=%r, "
-                "coerced to 'end_turn'.", sr_raw,
+                "surfaced as a terminal provider error.", sr_raw,
             )
+            return Reply(
+                content=tuple(content),
+                usage=usage,
+                stop_reason="error",
+                model=model,
+                error_detail={
+                    "type": "provider_error",
+                    "provider_error": {
+                        "type": "unknown_stop_reason",
+                        "stop_reason": sr_raw,
+                    },
+                },
+            )
+        stop_reason: StopReason = _STOP_REASON_MAP.get(sr_raw, "end_turn")
 
         return Reply(
             content=tuple(content),
-            usage=self._usage_from_response(response),
+            usage=usage,
             stop_reason=stop_reason,
-            model=getattr(response, "model", request.model) or request.model,
+            model=model,
             error_detail=None,
         )
 
@@ -236,7 +288,10 @@ class AnthropicAdapter:
                 json_meth = getattr(resp, "json", None)
                 if callable(json_meth):
                     try:
-                        body_dict = json_meth() or {}
+                        raw_body = json_meth()
+                        body_dict = (
+                            dict(raw_body) if isinstance(raw_body, Mapping) else {}
+                        )
                     except Exception:  # pragma: no cover
                         body_dict = {}
             # Some SDKs attach the parsed body directly.
@@ -300,7 +355,8 @@ class AnthropicAdapter:
             try:
                 params = self._build_params(request)
                 params.pop("max_tokens", None)
-                resp = await ct(**params)
+                counted = ct(**params)
+                resp = await counted if inspect.isawaitable(counted) else counted
                 tokens = getattr(resp, "input_tokens", None)
                 if isinstance(tokens, int) and tokens >= 0:
                     return tokens
@@ -345,7 +401,7 @@ class AnthropicAdapter:
                                     chars += len(sub.get("text", "") or "")
 
         for t in request.tools or ():
-            if isinstance(t, dict):
+            if isinstance(t, Mapping):
                 chars += (
                     len(t.get("name", "")) + len(t.get("description", ""))
                     + len(str(t.get("input_schema", {})))

@@ -232,8 +232,54 @@ class TestSubstitutePath:
         h, rs = target_harness_factory(r)
         out = await h.call(tool_name="spy_fail", arguments={"x": 7})
         assert out.get("is_error") is True
+        assert out["content"] == "RuntimeError: boom:7"
         result = claims_with_eid(rs.store, TAG_EFFECT_RESULT, out["tool_use_id"])[0]
         assert result.fields[F_STATUS] == "error"
+
+    async def test_repeated_identical_calls_consume_recordings_in_order(
+        self, fresh_rowset,
+    ):
+        counter = 0
+
+        @tool(side_effect=SideEffectClass.READ_ONLY)
+        async def changing_lookup(key: str) -> int:
+            """Return a changing observation for the same arguments."""
+            nonlocal counter
+            counter += 1
+            return counter
+
+        tools = ToolRegistry([changing_lookup])
+        source = fresh_rowset()
+        source_harness = ToolHarness(tools=tools, rowset=source)
+        await source_harness.call(
+            tool_name="changing_lookup", arguments={"key": "same"},
+        )
+        await source_harness.call(
+            tool_name="changing_lookup", arguments={"key": "same"},
+        )
+
+        target = fresh_rowset()
+        replay = ToolHarness(
+            tools=tools,
+            rowset=target,
+            tool_replayer=ToolReplayer(
+                view=effect_view(source),
+                mode=ReplayMode.STRICT_TAPE,
+            ),
+        )
+        first = await replay.call(
+            tool_name="changing_lookup", arguments={"key": "same"},
+        )
+        second = await replay.call(
+            tool_name="changing_lookup", arguments={"key": "same"},
+        )
+
+        assert first["content"] == "1"
+        assert second["content"] == "2"
+        with pytest.raises(ReplayMissing):
+            await replay.call(
+                tool_name="changing_lookup", arguments={"key": "same"},
+            )
 
     async def test_caller_supplied_effect_id_used(
         self, recording, target_harness_factory,

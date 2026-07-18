@@ -40,18 +40,20 @@ ATOMICITY WARNING
 """
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from ..calculus import Claim, StrategyRegistry
+from ..adapter import Usage
 from ..store    import ClaimStore
 from ..effect import (
     EffectKind,
     F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
-    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_MODEL, F_OUTPUT,
+    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_MODEL, F_OUTPUT, F_SPEND,
     F_REASON, F_REPLY, F_REQUEST, F_SIDE_EFFECT, F_STATUS,
-    F_TOOL_NAME,
+    F_TOOL_NAME, F_TOTAL_USAGE,
     TAG_EFFECT_INTENT, TAG_EFFECT_RESULT, TAG_EFFECT_REJECTED,
 )
 
@@ -61,7 +63,8 @@ __all__ = [
     # Re-exports for convenience (canonical home: lipas.effect):
     "TAG_EFFECT_INTENT", "TAG_EFFECT_RESULT", "TAG_EFFECT_REJECTED",
     "F_EFFECT_ID", "F_KIND", "F_COMPENSATES", "F_CAUSED_BY",
-    "F_STATUS", "F_ATTEMPTS", "F_ERROR", "F_REASON", "F_DETAIL",
+    "F_STATUS", "F_ATTEMPTS", "F_TOTAL_USAGE", "F_SPEND",
+    "F_ERROR", "F_REASON", "F_DETAIL",
     "F_MODEL", "F_REQUEST", "F_REPLY",
     "F_TOOL_NAME", "F_ARGUMENTS", "F_DECLARED_SIDE_EFFECT",
     "F_OUTPUT", "F_SIDE_EFFECT",
@@ -380,6 +383,16 @@ class EffectRow:
                 f"{TAG_EFFECT_RESULT}: status='error' requires {F_ERROR!r}"
             )
 
+        attempts = f.get(F_ATTEMPTS)
+        if attempts is not None and (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or attempts < 1
+        ):
+            msgs.append(
+                f"{TAG_EFFECT_RESULT}: {F_ATTEMPTS!r} must be a positive int"
+            )
+
         # Kind-specific payload checks.
         if kind == EffectKind.LLM_CALL.value:
             msgs.extend(self._check_result_llm(f))
@@ -390,9 +403,15 @@ class EffectRow:
 
     def _check_result_llm(self, f: Mapping) -> list[str]:
         # P2.7 rule preserved: F_REPLY required regardless of status.
+        msgs: list[str] = []
         if F_REPLY not in f:
-            return [f"{TAG_EFFECT_RESULT}[llm_call]: {F_REPLY!r} required"]
-        return []
+            msgs.append(f"{TAG_EFFECT_RESULT}[llm_call]: {F_REPLY!r} required")
+        total_usage = f.get(F_TOTAL_USAGE)
+        if total_usage is not None and not isinstance(total_usage, Usage):
+            msgs.append(
+                f"{TAG_EFFECT_RESULT}[llm_call]: {F_TOTAL_USAGE!r} must be Usage"
+            )
+        return msgs
 
     def _check_result_tool(self, f: Mapping) -> list[str]:
         msgs: list[str] = []
@@ -411,6 +430,27 @@ class EffectRow:
                 f"{F_SIDE_EFFECT}={actual!r} not in "
                 f"{sorted(_VALID_SIDE_EFFECTS)}"
             )
+        spend = f.get(F_SPEND)
+        if spend is not None:
+            if not isinstance(spend, Mapping):
+                msgs.append(
+                    f"{TAG_EFFECT_RESULT}[tool_call]: {F_SPEND!r} must be a mapping"
+                )
+            else:
+                for bucket, amount in spend.items():
+                    if (
+                        not isinstance(bucket, str)
+                        or not bucket
+                        or isinstance(amount, bool)
+                        or not isinstance(amount, (int, float))
+                        or not math.isfinite(float(amount))
+                        or amount < 0
+                    ):
+                        msgs.append(
+                            f"{TAG_EFFECT_RESULT}[tool_call]: invalid "
+                            f"{F_SPEND} entry {bucket!r}={amount!r}"
+                        )
+                        break
         return msgs
 
     # ── invariants: rejection ─────────────────────────────────

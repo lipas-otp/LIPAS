@@ -5,7 +5,7 @@ import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .adapter import Request
 from .adapter.protocol import LLMAdapter
@@ -23,6 +23,10 @@ from .store import ClaimStore
 from .supervisor import Policy, Supervisor
 from .tool_harness import ToolHarness
 from .tools import Tool, ToolRegistry
+
+if TYPE_CHECKING:
+    from .durable import ApprovalPolicy
+    from .execution import ExecutionStore
 
 __all__ = ["Agent"]
 
@@ -159,6 +163,90 @@ class Agent:
             if state is None else state.with_messages(*messages)
         )
         return await self.behaviour.run(initial)
+
+    async def run_durable(
+        self,
+        prompt: str | tuple[Any, ...] | list[Any] | None,
+        *,
+        execution_store: ExecutionStore,
+        run_id: str,
+        lease_seconds: float = 300.0,
+        approval_policy: ApprovalPolicy | None = None,
+    ) -> FinalResult:
+        """Run or resume this Agent through the durable ReAct phase machine.
+
+        A new run requires ``prompt``.  Resume an existing checkpoint with
+        ``prompt=None`` so the original input cannot accidentally be appended
+        twice.  The Agent's claim session must be SQLite-backed: execution
+        checkpoints and the Effect tape are separate durable records and both
+        are required for safe recovery.
+        """
+        from .durable import DurableReActRunner, settled_result_from_run
+        from .execution import ExecutionStore, RunState
+        from .serialization.store_sqlite import SqliteClaimStore
+
+        if not isinstance(execution_store, ExecutionStore):
+            raise TypeError("execution_store must be an ExecutionStore")
+        if not isinstance(self.rowset.store, SqliteClaimStore):
+            raise ValueError(
+                "durable Agent execution requires session_path= or session=",
+            )
+        run = execution_store.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        checkpoint = execution_store.get_checkpoint(run_id)
+        if run.state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+            if prompt is not None:
+                raise ValueError(
+                    "a terminal durable run can only be restored with prompt=None",
+                )
+            return settled_result_from_run(
+                run,
+                checkpoint,
+                claim_store_id=self.rowset.store.store_id,
+            )
+        if checkpoint is None:
+            if prompt is None and not run.cancel_requested:
+                raise ValueError("a new durable run requires a prompt")
+            messages = [] if prompt is None else self._messages_from_prompt(prompt)
+            initial = AgentState(
+                messages=tuple(messages),
+                metadata={"caused_by": run_id, "execution_run_id": run_id},
+            )
+        else:
+            if prompt is not None:
+                raise ValueError(
+                    "resume a durable run with prompt=None; its input is checkpointed",
+                )
+            initial = None
+        claimed = execution_store.claim_run(
+            run_id,
+            lease_seconds=lease_seconds,
+        )
+        runner = DurableReActRunner(
+            self.behaviour,
+            execution_store,
+            claimed,
+            approval_policy=approval_policy,
+        )
+        return await runner.run_to_completion(initial)
+
+    async def resume_durable(
+        self,
+        *,
+        execution_store: ExecutionStore,
+        run_id: str,
+        lease_seconds: float = 300.0,
+        approval_policy: ApprovalPolicy | None = None,
+    ) -> FinalResult:
+        """Resume a checkpointed durable run without appending new input."""
+        return await self.run_durable(
+            None,
+            execution_store=execution_store,
+            run_id=run_id,
+            lease_seconds=lease_seconds,
+            approval_policy=approval_policy,
+        )
 
     async def __call__(self, prompt: str | tuple[Any, ...] | list[Any]) -> FinalResult:
         """Allow the natural ``result = await agent('...')`` spelling."""

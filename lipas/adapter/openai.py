@@ -10,12 +10,12 @@ import json
 import os
 import uuid
 from decimal import Decimal
-from typing import Any, AsyncIterator, ClassVar, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 import httpx
 
 from .types import (
-    Delta, Done, PriceTable, Reply, Request, ResourceEstimate, StreamEvent,
+    Delta, Done, PriceTable, Reply, Request, ResourceEstimate, StopReason, StreamEvent,
     ToolSpec, ToolUseDelta, Usage,
 )
 
@@ -25,7 +25,7 @@ __all__ = ["OpenAIResponsesAdapter"]
 class OpenAIResponsesAdapter:
     """Translate normalized LIPAS requests to OpenAI's Responses API."""
 
-    name: ClassVar[str] = "openai-responses"
+    name: str = "openai-responses"
 
     def __init__(self, *, api_key: str | None = None, prices: PriceTable | None = None,
                  base_url: str = "https://api.openai.com/v1", timeout_s: float = 120.0,
@@ -49,8 +49,8 @@ class OpenAIResponsesAdapter:
         return ResourceEstimate(request.model, tokens, request.max_tokens, cost)
 
     async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
-        body = self._build_body(request, stream=True)
         try:
+            body = self._build_body(request, stream=True)
             async for event in self._post_sse(body):
                 typ = event.get("type", "")
                 if typ == "response.output_text.delta":
@@ -60,20 +60,47 @@ class OpenAIResponsesAdapter:
                 elif typ == "response.completed":
                     yield Done(self._reply_from_response(request, event.get("response", event)))
                     return
-                elif typ in {"error", "response.failed", "response.incomplete"}:
-                    yield Done(self._error_reply(request, event))
+                elif typ == "response.incomplete":
+                    response = event.get("response", event)
+                    reason = (response.get("incomplete_details") or {}).get("reason")
+                    if reason not in {None, "max_output_tokens"}:
+                        yield Done(self._provider_error_reply(request, {
+                            "type": str(reason),
+                            "reason": reason,
+                            "response": response,
+                        }))
+                    else:
+                        yield Done(self._reply_from_response(request, response))
                     return
-            yield Done(self._error_reply(request, {"type": "stream_protocol_error", "message": "stream ended without response.completed"}))
+                elif typ in {"error", "response.failed"}:
+                    yield Done(self._provider_error_reply(request, event))
+                    return
+            yield Done(self._provider_error_reply(request, {
+                "type": "stream_protocol_error",
+                "message": "stream ended without a terminal response event",
+            }))
         except asyncio.CancelledError:
             raise
         except httpx.HTTPStatusError as exc:
             yield Done(self._error_reply(request, self._http_detail(exc)))
         except (httpx.TransportError, httpx.TimeoutException) as exc:
-            yield Done(self._error_reply(request, {"type": "network_error", "message": str(exc), "provider_raw": type(exc).__name__}))
+            yield Done(self._error_reply(request, {
+                "type": "network_error",
+                "exception_type": type(exc).__name__,
+                "message": str(exc) or type(exc).__name__,
+            }))
         except Exception as exc:
-            yield Done(self._error_reply(request, {"type": "provider_error", "message": str(exc) or type(exc).__name__, "provider_raw": type(exc).__name__}))
+            yield Done(self._provider_error_reply(request, {
+                "type": type(exc).__name__,
+                "message": str(exc) or type(exc).__name__,
+            }))
 
     def _build_body(self, request: Request, *, stream: bool) -> dict[str, Any]:
+        if request.stop_sequences:
+            raise ValueError(
+                "OpenAI Responses API does not support stop_sequences; "
+                "remove them or choose an adapter that supports this field"
+            )
         body: dict[str, Any] = {"model": request.model, "input": self._input(request), "max_output_tokens": request.max_tokens, "stream": stream}
         if request.system:
             body["instructions"] = request.system
@@ -86,15 +113,62 @@ class OpenAIResponsesAdapter:
 
     @staticmethod
     def _input(request: Request) -> list[dict[str, Any]]:
-        out = []
+        out: list[dict[str, Any]] = []
         for message in request.messages:
             role, content = message.get("role", "user"), message.get("content", "")
             if isinstance(content, str):
                 out.append({"role": role, "content": content})
-            else:
-                # Responses accepts text parts and function call outputs. Keeping
-                # unknown normalized blocks intact avoids lossy provider coupling.
-                out.append({"role": role, "content": list(content)})
+                continue
+
+            text_parts: list[str] = []
+
+            def flush_text(
+                text_parts: list[str] = text_parts,
+                role: Any = role,
+            ) -> None:
+                if text_parts:
+                    out.append({"role": role, "content": "".join(text_parts)})
+                    text_parts.clear()
+
+            for block in content:
+                if not isinstance(block, Mapping):
+                    text_parts.append(str(block))
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text_parts.append(str(block.get("text", "")))
+                    continue
+                if block_type == "tool_use":
+                    flush_text()
+                    arguments = block.get("input") or {}
+                    out.append({
+                        "type": "function_call",
+                        "call_id": str(block.get("id", "")),
+                        "name": str(block.get("name", "")),
+                        "arguments": json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    })
+                    continue
+                if block_type == "tool_result":
+                    flush_text()
+                    output = block.get("content", "")
+                    if not isinstance(output, str):
+                        output = json.dumps(output, ensure_ascii=False, default=str)
+                    out.append({
+                        "type": "function_call_output",
+                        "call_id": str(
+                            block.get("tool_use_id")
+                            or block.get("tool_call_id")
+                            or ""
+                        ),
+                        "output": output,
+                    })
+                    continue
+                text_parts.append(str(block))
+            flush_text()
         return out
 
     async def _post_sse(self, body: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
@@ -122,18 +196,62 @@ class OpenAIResponsesAdapter:
                         blocks.append({"type": "text", "text": part.get("text", "")})
             elif item.get("type") == "function_call":
                 raw = item.get("arguments", "{}")
-                try: arguments = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                except (TypeError, ValueError): arguments = {}
+                try:
+                    arguments = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "OpenAI returned function_call arguments that are not valid JSON",
+                    ) from exc
+                if not isinstance(arguments, Mapping):
+                    raise ValueError(
+                        "OpenAI returned non-object function_call arguments",
+                    )
                 blocks.append({"type": "tool_use", "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}", "name": item.get("name", ""), "input": arguments})
         usage = response.get("usage") or {}
-        stop = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "max_tokens" if response.get("status") == "incomplete" else "end_turn"
-        return Reply(tuple(blocks), Usage(input=int(usage.get("input_tokens", 0) or 0), output=int(usage.get("output_tokens", 0) or 0), cache_read=int((usage.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0)), stop, str(response.get("model") or request.model))
+        input_total = int(usage.get("input_tokens", 0) or 0)
+        cache_read = int(
+            (usage.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0,
+        )
+        # OpenAI reports cached tokens as a subset of input_tokens. LIPAS Usage
+        # buckets are disjoint so ModelPrice does not charge them twice.
+        input_uncached = max(0, input_total - cache_read)
+        stop: StopReason = (
+            "tool_use"
+            if any(b["type"] == "tool_use" for b in blocks)
+            else "max_tokens"
+            if response.get("status") == "incomplete"
+            else "end_turn"
+        )
+        return Reply(
+            tuple(blocks),
+            Usage(
+                input=input_uncached,
+                output=int(usage.get("output_tokens", 0) or 0),
+                cache_read=cache_read,
+            ),
+            stop,
+            str(response.get("model") or request.model),
+        )
 
     def _error_reply(self, request: Request, detail: Mapping[str, Any]) -> Reply:
         return Reply((), Usage(), "error", request.model, error_detail=dict(detail))
+
+    def _provider_error_reply(
+        self,
+        request: Request,
+        detail: Mapping[str, Any],
+    ) -> Reply:
+        return self._error_reply(request, {
+            "type": "provider_error",
+            "provider_error": dict(detail),
+        })
 
     @staticmethod
     def _http_detail(exc: httpx.HTTPStatusError) -> dict[str, Any]:
         try: raw: Any = exc.response.json()
         except Exception: raw = exc.response.text
-        return {"type": "http_error", "status_code": exc.response.status_code, "message": str(exc), "provider_raw": raw}
+        return {
+            "type": "http_error",
+            "status_code": exc.response.status_code,
+            "body": raw if isinstance(raw, dict) else {"raw": raw},
+        }

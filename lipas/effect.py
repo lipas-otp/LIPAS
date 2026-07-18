@@ -66,6 +66,8 @@ __all__ = [
     "F_CAUSED_BY",
     "F_STATUS",
     "F_ATTEMPTS",
+    "F_TOTAL_USAGE",
+    "F_SPEND",
     "F_ERROR",
     "F_REASON",
     "F_DETAIL",
@@ -173,6 +175,8 @@ F_CAUSED_BY    = "caused_by"         # str | absent
 # Shared on result / rejected ─────────────────────────────────────────
 F_STATUS   = "status"               # "ok" | "error"
 F_ATTEMPTS = "attempts"             # int (retry layer)
+F_TOTAL_USAGE = "total_usage"       # aggregate Usage across LLM retries
+F_SPEND = "spend"                   # exact tool spend admitted/observed
 F_ERROR    = "error"                # dict, present iff status="error"
 F_REASON   = "reason"               # rejection reason slug
 F_DETAIL   = "detail"               # rejection detail dict

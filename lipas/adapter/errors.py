@@ -8,6 +8,7 @@ The transient/permanent distinction is advisory — it informs default
 retry policy but does not force it. Policy decides.
 """
 from __future__ import annotations
+import math
 from enum import Enum
 
 
@@ -126,18 +127,20 @@ def classify(reply: Reply) -> ErrorKind:
     dtype = detail.get("type")
 
     if dtype == "http_error":
-        d = cast(HTTPErrorDetail, detail)
-        return _classify_http(d["status_code"], d.get("body") or {})
+        http_detail = cast(HTTPErrorDetail, detail)
+        return _classify_http(
+            http_detail["status_code"], http_detail.get("body") or {},
+        )
 
     if dtype == "network_error":
-        d = cast(NetworkErrorDetail, detail)
-        if d["exception_type"] in _TIMEOUT_EXC_NAMES:
+        network_detail = cast(NetworkErrorDetail, detail)
+        if network_detail["exception_type"] in _TIMEOUT_EXC_NAMES:
             return ErrorKind.TIMEOUT
         return ErrorKind.NETWORK
 
     if dtype == "provider_error":
-        d = cast(ProviderErrorDetail, detail)
-        return _classify_provider(d["provider_error"])
+        provider_detail = cast(ProviderErrorDetail, detail)
+        return _classify_provider(provider_detail["provider_error"])
 
     return ErrorKind.UNKNOWN
 
@@ -186,13 +189,33 @@ def _classify_provider(provider_err: dict[str, Any]) -> ErrorKind:
 class RetryPolicy:
     """Advisory retry parameters for an ErrorKind.
 
-    P2.2 ships the table; P2.3 will ship the executor that consumes
-    it. base_delay_s is a hint, not a hard interval — the executor
-    layers jitter/backoff on top.
+    ``call_with_retry`` consumes this table. ``base_delay_s`` is a hint,
+    not a hard interval — the executor layers jitter/backoff on top.
     """
     should_retry: bool
     base_delay_s: float
     max_attempts: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.should_retry, bool):
+            raise TypeError("RetryPolicy.should_retry must be bool")
+        if (
+            isinstance(self.base_delay_s, bool)
+            or not isinstance(self.base_delay_s, (int, float))
+            or not math.isfinite(float(self.base_delay_s))
+            or self.base_delay_s < 0
+        ):
+            raise ValueError("RetryPolicy.base_delay_s must be finite and non-negative")
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts < 1
+        ):
+            raise ValueError("RetryPolicy.max_attempts must be a positive int")
+        if not self.should_retry and self.max_attempts != 1:
+            raise ValueError(
+                "a non-retrying RetryPolicy must have max_attempts=1",
+            )
 
 
 # Defaults are deliberately conservative. Real values get tuned

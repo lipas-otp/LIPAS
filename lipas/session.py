@@ -33,7 +33,7 @@ import contextlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, ClassVar
+from typing import AsyncIterator
 
 from lipas.adapter import Request, ResourceEstimate, StreamEvent
 from lipas.adapter.protocol import LLMAdapter
@@ -139,7 +139,7 @@ class ReplayStubAdapter:
     both bill real money and corrupt the replay invariant.
     """
 
-    name: ClassVar[str] = "replay-stub"
+    name: str = "replay-stub"
 
     async def estimate_cost(self, request: Request) -> ResourceEstimate:
         raise ReplayExhausted(

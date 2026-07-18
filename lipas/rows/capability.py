@@ -97,6 +97,8 @@ class CapabilityRow:
         if not self._valid_amount(bucket, amount):
             msgs.append(f"{TAG_RESOURCE_SPENT}: missing/invalid bucket or amount")
             return msgs
+        assert isinstance(bucket, str)
+        assert isinstance(amount, (int, float)) and not isinstance(amount, bool)
 
         limit = self.budgets.get(bucket)
         if limit is None:

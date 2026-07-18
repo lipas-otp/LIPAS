@@ -372,7 +372,13 @@ class Supervisor:
 
     # ----- public API -----
 
-    def tick(self, view: EffectView, ctx: BeliefContext) -> list[Claim]:
+    def tick(
+        self,
+        view: EffectView,
+        ctx: BeliefContext,
+        *,
+        claim_id_prefix: str | None = None,
+    ) -> list[Claim]:
         """One supervisor pass.
 
         Returns the claims that were folded, in fold order, including
@@ -386,7 +392,9 @@ class Supervisor:
         # Captured once at tick start (C2). Predicates emitted earlier
         # in this tick are accounted for via ``in_tick_retries`` below,
         # not by re-reading the store.
-        prior_retries: dict[str, int] = self._tally_prior_retries()
+        prior_retries: dict[str, int] = self._tally_prior_retries(
+            exclude_claim_id_prefix=claim_id_prefix,
+        )
 
         # Phase 1 — evaluate all predicates against the same snapshot.
         # No fold yet; predicates do not see each other.
@@ -421,20 +429,37 @@ class Supervisor:
 
         # Phase 2 — convert to claims and fold (with goal_blocked pairing).
         claims = [
-            self._action_to_claim(a, name, idx)
-            for (a, name, idx) in pending
+            self._action_to_claim(
+                action,
+                name,
+                attempt_index,
+                claim_id=(
+                    f"{claim_id_prefix}:action:{action_index}"
+                    if claim_id_prefix is not None else None
+                ),
+            )
+            for action_index, (action, name, attempt_index) in enumerate(pending)
         ]
         return self._emit_batch(claims)
 
     # ----- private -----
 
-    def _tally_prior_retries(self) -> dict[str, int]:
+    def _tally_prior_retries(
+        self,
+        *,
+        exclude_claim_id_prefix: str | None = None,
+    ) -> dict[str, int]:
         """Count of supervisor_retry claims per target_effect_id, taken
         from the rowset's store. Stateless across ticks: two Supervisors
         fed the same log produce the same recommendations.
         """
         out: dict[str, int] = {}
         for c in self._rowset.store.filter(tag=TAG_SUPERVISOR_RETRY):
+            if (
+                exclude_claim_id_prefix is not None
+                and c.claim_id.startswith(f"{exclude_claim_id_prefix}:")
+            ):
+                continue
             tgt = c.fields.get(F_SUP_TARGET_EFFECT_ID)
             if isinstance(tgt, str):
                 out[tgt] = out.get(tgt, 0) + 1
@@ -470,12 +495,20 @@ class Supervisor:
         out: list[Claim] = []
         for c in claims:
             self._rowset.fold(c)
-            folded = self._rowset.store.log[-1]
+            folded = next(
+                stored
+                for stored in self._rowset.store.log
+                if stored.claim_id == c.claim_id
+            )
             out.append(folded)
             if folded.tag in (TAG_SUPERVISOR_TERMINATE, TAG_SUPERVISOR_ESCALATE):
                 gb = self._build_goal_blocked(folded, folded.seq)
                 self._rowset.fold(gb)
-                out.append(self._rowset.store.log[-1])
+                out.append(next(
+                    stored
+                    for stored in self._rowset.store.log
+                    if stored.claim_id == gb.claim_id
+                ))
         return out
 
     # def _last_folded_seq(self) -> int:
@@ -527,6 +560,7 @@ class Supervisor:
             tag=TAG_GOAL_BLOCKED,
             fields=fields,
             source=f"supervisor:{self._session_id}",
+            claim_id=f"{source.claim_id}:goal-blocked",
         )
 
     @staticmethod
@@ -539,7 +573,12 @@ class Supervisor:
             )
 
     def _action_to_claim(
-        self, action: SupervisorAction, rule_name: str, attempt_index: int
+        self,
+        action: SupervisorAction,
+        rule_name: str,
+        attempt_index: int,
+        *,
+        claim_id: str | None = None,
     ) -> Claim:
         reason = f"[{rule_name}] {action.reason}"
         src = f"supervisor:{self._session_id}"
@@ -548,7 +587,7 @@ class Supervisor:
             idem = _gen_idempotency_key(
                 self._session_id, action.target_effect_id, attempt_index
             )
-            return Claim(
+            claim = Claim(
                 tag=TAG_SUPERVISOR_RETRY,
                 fields={
                     F_SUP_SCHEMA_VERSION:   SUPERVISOR_RETRY_V,
@@ -560,9 +599,12 @@ class Supervisor:
                 },
                 source=src,
             )
+            if claim_id is not None:
+                claim.claim_id = claim_id
+            return claim
 
         if isinstance(action, TerminateAction):
-            return Claim(
+            claim = Claim(
                 tag=TAG_SUPERVISOR_TERMINATE,
                 fields={
                     F_SUP_SCHEMA_VERSION: SUPERVISOR_TERMINATE_V,
@@ -570,9 +612,12 @@ class Supervisor:
                 },
                 source=src,
             )
+            if claim_id is not None:
+                claim.claim_id = claim_id
+            return claim
 
         # EscalateAction — exhaustively typed by SupervisorAction.
-        return Claim(
+        claim = Claim(
             tag=TAG_SUPERVISOR_ESCALATE,
             fields={
                 F_SUP_SCHEMA_VERSION: SUPERVISOR_ESCALATE_V,
@@ -581,3 +626,6 @@ class Supervisor:
             },
             source=src,
         )
+        if claim_id is not None:
+            claim.claim_id = claim_id
+        return claim

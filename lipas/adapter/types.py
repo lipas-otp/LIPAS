@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from decimal import Decimal
-from typing import Any, Literal, Mapping, Sequence, Union
+from typing import Any, Literal, Mapping, Sequence, Union, cast
 
 __all__ = [
     "Usage",
@@ -75,7 +75,15 @@ class ToolResultBlock:
     type: Literal["tool_result"] = "tool_result"
 
 
-ContentBlock = Union[TextBlock, ToolUseBlock, ToolResultBlock]
+# Provider adapters and the runtime deliberately normalize wire blocks to
+# dictionary-shaped values.  The dataclasses above remain convenient typed
+# builders, while Mapping is part of the actual interchange contract.
+ContentBlock = Union[
+    TextBlock,
+    ToolUseBlock,
+    ToolResultBlock,
+    Mapping[str, Any],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,10 +100,8 @@ class Message:
         for block in self.content:
             if isinstance(block, Mapping):
                 blocks.append(block)
-            elif hasattr(block, "as_dict"):
-                blocks.append(block.as_dict())
             elif is_dataclass(block):
-                blocks.append(asdict(block))
+                blocks.append(asdict(cast(Any, block)))
             else:
                 raise TypeError(
                     "Message.content entries must be mappings or content "

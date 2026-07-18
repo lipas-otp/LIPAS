@@ -2,11 +2,8 @@
 
 > 语言：[English](README.md) | [中文](README.zh-CN.md)
 
-**LIPAS 让你用普通 Python 编写 Agent，并明确记录它们做出的决定、消耗和实际
-执行的操作。** 它是一份面向可靠 AI Agent 的、基于 claim 执行模型的小型 Python
-参考实现。
-
-从一个 assistant 开始。只有在应用确实需要时，才添加相应的可靠性边界。
+LIPAS 是可信 AI 执行系统。
+它从一个 assistant 开始。只有在应用确实需要时，才添加相应的可靠性边界。
 
 ```text
 Agent  = 一个会思考并使用工具的 assistant
@@ -14,22 +11,39 @@ Agent  = 一个会思考并使用工具的 assistant
 Team   = 在具名 assistant 或函数之间建立可持久化 handoff
 ```
 
-> **0.9.8 public beta。** 已提供 Ollama、注入 client 的 Anthropic、OpenAI
-> Responses adapter，以及持久 SQLite session、安全 replay、supervision 和
-> at-least-once Team handoff。
+> **0.10.0 public beta。** 此版本在已有 Ollama、注入 client 的 Anthropic、
+> OpenAI Responses、持久 SQLite session、安全 replay、supervision 与
+> at-least-once Team 基础上加入 checkpointed ReAct execution、持久审批、取消与
+> 崩溃恢复。
+
+## 一个系统，两层能力
+
+```text
+LIPAS 本地任务工作台（开发中）
+  Task / Workspace / Approval / Artifact / Task CLI / Local Web
+                              │
+                              ▼
+LIPAS Python runtime（当前可用）
+  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation / Team
+```
+
+工作台是 LIPAS 执行工作区任务的第一方体验，例如检查文件、进行受控修改、运行验证并
+交付报告。对于需要自有领域模型或界面的应用，Python API 仍然可以独立嵌入。两层能力
+共享同一套 Effect 与审计记录；工作台不会另建一套执行模型。
 
 ## 底层的一个核心想法
 
 LIPAS 不要求你编写 graph 或特殊 workflow 语言。你只需写普通 Python：一个
 `Agent` 调用模型和普通 `@tool` 函数。runtime 会把这项工作中与可靠性相关的部分
-记录为不可变的 **Claim（声明）**。
+接纳为不可变的 **Claim（声明）存储快照**。调用方仍可修改尚未提交的 Claim 对象，
+但 store 接纳后的记录不会被这些修改重写。
 
 一次 **fold（折叠）** 会接纳每条稳定 Claim 一次，验证它，并更新同一记录上的小型
 派生视图：history 回答发生了什么，capability 约束资源消耗，effect 记录
 `intent → result | rejection`。
 
 ```text
-普通 Python Agent / Tool / Team
+普通 Python Agent / Tool / Execution / Operation / Team
                  │
                  ▼
            append-only Claims
@@ -38,10 +52,11 @@ LIPAS 不要求你编写 graph 或特殊 workflow 语言。你只需写普通 Py
                  └── effect:     intent、result 与 lineage
 ```
 
-这同一份记录使各项功能能够协作，而不是成为互不相干的特性：guard 和 budget 在
+这同一条证据 tape 使各项功能能够协作，而不是成为互不相干的特性：guard 和 budget 在
 调用前作决定；replay 替换已记录的结果；supervision 记录其建议；Team handoff 有
-稳定 causal id；外部 write 可以相对于其记录的 intent 进行 reconciliation。代码
-保持自然的 Python，因为 runtime 记录的是工作边界，而不是取代你的控制流。
+稳定 causal id；外部 write 可以相对于其记录的 intent 进行 reconciliation；执行控制
+store 通过可修复 outbox 镜像 transition。代码保持自然的 Python，因为 LIPAS 记录的
+是工作边界，而不是取代你的控制流。
 
 如需精确的保证与限制，请阅读简短的[执行模型](docs/execution-model.zh-CN.md)。
 
@@ -76,9 +91,8 @@ with Agent.ollama(
 [`examples/01_first_agent.py`](examples/01_first_agent.py)。
 
 第一次接触 LIPAS？请按顺序阅读[循序上手 LIPAS](docs/tutorial.zh-CN.md)：从第一个
-Agent、工具、副作用、结果、session，逐步到 budget、replay、write、Skill、Team 和
-完整可运行项目。想直接复制并运行第一屏代码时，请看更短的
-[快速开始](docs/getting-started.zh-CN.md)。编号的
+Agent、工具、副作用、结果、session，逐步到 budget、replay、持久恢复、write、
+Skill、Team 和完整可运行项目。编号的
 [示例课程](examples/README.zh-CN.md)仍是聚焦场景的参考集合。
 
 ## 何时增加更多组件
@@ -113,6 +127,7 @@ with Team.open("runs/team.db") as team:
 | `tool_guards=[...]` | 实时调用前有记录的 policy denial |
 | `OperationJournal` | external write 的 idempotency-key 持久化与 reconciliation state |
 | `Team` | 带 lease 和 acknowledgement 的持久、at-least-once handoff |
+| `ExecutionStore` + `Agent.run_durable()` | 带 lease 的 ReAct checkpoint、审批中断、取消与崩溃恢复 |
 
 这份记录不是魔法 memory system，LIPAS 也不是 graph/workflow DSL。应用仍然拥有自己
 的领域数据、业务规则和面向用户的流程。
@@ -160,10 +175,10 @@ lipas effects runs/chat.db
 
 - [循序上手 LIPAS](docs/tutorial.zh-CN.md) —— 推荐的线性教程，从一个 Agent 到
   完整项目。
-- [快速开始](docs/getting-started.zh-CN.md) —— 复制一个小型本地 Agent，在几分钟
-  内运行。
-- [执行模型](docs/execution-model.zh-CN.md) —— Claim、effect、replay、external
-  operation 与 Team 的精确语义和限制。
+- [执行模型](docs/execution-model.zh-CN.md) —— Claim、effect、持久 run、replay、
+  external operation 与 Team 的精确语义和限制。
+- [路线图](docs/roadmap.zh-CN.md) —— runtime 与本地任务工作台如何作为同一个
+  LIPAS 项目推进。
 - [示例](examples/README.zh-CN.md) —— 从高层 API 到更底层 harness 的聚焦、可运行
   场景。
 - [更新日志](CHANGELOG.md) —— release 历史。

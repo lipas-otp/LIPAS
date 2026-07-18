@@ -28,7 +28,7 @@ def main() -> None:
         message_id = f"release-risks-{uuid4().hex}"
         result = team.ask_sync(
             "researcher",
-            "release risks for LIPAS 0.9.8",
+            "release risks for the current LIPAS source",
             sender="planner",
             message_id=message_id,
         )

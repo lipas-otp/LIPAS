@@ -460,6 +460,42 @@ class TestGoalBlockedPairing:
         # No payload on terminate-paired goal_blocked.
         assert F_GB_PAYLOAD not in gb.fields
 
+    def test_stable_tick_repairs_crash_between_terminate_and_pair(
+        self, fresh_rowset,
+    ):
+        class SimulatedCrash(BaseException):
+            pass
+
+        rs = fresh_rowset()
+        sup = _make_supervisor(
+            rs, PolicyRule("t", lambda v, c: TerminateAction(reason="why")),
+        )
+        view, ctx = _view_and_ctx(rs)
+        original_fold = rs.fold
+
+        def crash_on_goal_blocked(claim):
+            if claim.tag == TAG_GOAL_BLOCKED:
+                raise SimulatedCrash()
+            return original_fold(claim)
+
+        rs.fold = crash_on_goal_blocked
+        with pytest.raises(SimulatedCrash):
+            sup.tick(view, ctx, claim_id_prefix="durable:tick:0")
+        rs.fold = original_fold
+
+        repaired = sup.tick(
+            *_view_and_ctx(rs), claim_id_prefix="durable:tick:0",
+        )
+        terminations = _claims_with_tag(rs, TAG_SUPERVISOR_TERMINATE)
+        blocked = _claims_with_tag(rs, TAG_GOAL_BLOCKED)
+
+        assert len(terminations) == len(blocked) == 1
+        assert [claim.tag for claim in repaired] == [
+            TAG_SUPERVISOR_TERMINATE, TAG_GOAL_BLOCKED,
+        ]
+        assert blocked[0].seq == terminations[0].seq + 1
+        assert blocked[0].fields[F_GB_SOURCE_CLAIM_SEQ] == terminations[0].seq
+
     def test_escalate_pairs_with_goal_blocked_carrying_payload(
         self, fresh_rowset,
     ):

@@ -13,3 +13,12 @@ class ClaimIdConflict(LipasError):
     fact is a producer bug and is rejected rather than silently overwriting or
     duplicating audit history.
     """
+
+
+class OrphanedEffectError(LipasError):
+    """A stable effect id has an intent but no known terminal outcome.
+
+    Durable execution must not silently submit the same operation again.  The
+    caller may reconcile it or make an explicit retry decision under a new
+    effect identity.
+    """

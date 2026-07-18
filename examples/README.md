@@ -45,7 +45,7 @@ tool's side-effect declaration truthful.
 
 These lessons are self-contained. Lesson 05 needs the `ollama` extra because
 it constructs an Ollama-backed Agent, but it rejects the request before it
-contacts an Ollama daemon or model. Lessons 06–10 use only the core package
+contacts an Ollama daemon or model. Lessons 06–11 use only the core package
 and run fully offline.
 
 | Lesson | Run | Boundary it teaches | Add it when… |
@@ -56,6 +56,7 @@ and run fully offline.
 | 08 | `python -m examples.08_team_handoff` | Durable, at-least-once handoff to one owner | A task needs its own restart or ownership boundary. |
 | 09 | `python -m examples.09_external_operation` | Idempotency, uncertainty, and reconciliation | A provider write might have happened before a crash. |
 | 10 | `python -m examples.10_research_review_team` | Two-owner evidence and review workflow | One assistant is no longer the right ownership boundary. |
+| 11 | `python -m examples.11_durable_execution` | Checkpointed approval suspension and resume | One Agent run must safely continue after waiting or interruption. |
 
 ## Reusable Skills
 
@@ -64,12 +65,12 @@ is reusable guidance, not an access-control mechanism: it changes how an
 Agent approaches a task, but only an `@tool` gives it an executable
 capability.
 
-| Skill | Used by | What it teaches |
+| Skill | Related lesson | What it teaches |
 | --- | --- | --- |
 | `research-brief` | Lesson 02 | Separate source facts, synthesis, and uncertainty. |
 | `support-triage` | Lesson 03 | Protect customer information and state clear next steps. |
 | `daily-brief` | Lesson 04 | Prioritize operational risks and recommendations. |
-| `safe-external-actions` | Lesson 09 | Require confirmation, idempotency, and reconciliation. |
+| `safe-external-actions` | Companion to Lesson 09 | Require confirmation, idempotency, and reconciliation when an Agent requests the operation. |
 
 Copy a directory into your project and pass its path directly:
 
@@ -82,8 +83,8 @@ agent = Agent.ollama(
 
 ## Inspect a run
 
-Every Agent/Team/OperationJournal lesson names its session path in the file.
-After a run, inspect the exact claims and effects rather than guessing:
+Lessons that persist state name their database paths in the file. After a run,
+inspect the exact claims and effects rather than guessing:
 
 ```bash
 python -m lipas.cli trace runs/02-research-brief.db
@@ -92,22 +93,5 @@ python -m lipas.cli effects runs/02-research-brief.db
 
 An `orphan` effect means the process ended after intent was recorded but
 before LIPAS observed a terminal result. Treat it as an interrupted operation,
-not a successful answer.
-
-## Guided capstone paths
-
-After the first-agent lesson, these are the longer examples worth reading as
-small projects rather than isolated API demonstrations:
-
-| Project | Run | What it combines |
-| --- | --- | --- |
-| Research brief | `python -m examples.02_research_brief` | Read-only retrieval, a reusable Skill, budgets, a durable session, and synthesis. |
-| Support triage | `python -m examples.03_support_triage` | Narrow customer-support capabilities, safe guidance, a Skill, budgets, and a trace. |
-| Daily brief | `python -m examples.04_daily_brief` | Several read-only sources turned into an operational recommendation. |
-| Safe external operation | `python -m examples.09_external_operation` | Idempotency keys, an uncertain submission, reconciliation, and an audit record. |
-| Research review Team | `python -m examples.10_research_review_team` | Two independently owned handoffs with stable message identities. |
-
-The first three need a local Ollama model. The last two run with the core
-package alone. Read the matching chapters in
-[LIPAS, step by step](../docs/tutorial.md) before changing the local demo data
-into a real client.
+not a successful answer. For guided multi-feature projects, use the single
+maintained list in [LIPAS, step by step](../docs/tutorial.md#11-guided-projects).

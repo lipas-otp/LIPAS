@@ -10,9 +10,8 @@ Scope:
   - HistoryRow ownership of TAG_REPLAY_DECISION + projection counts.
   - Live store isolation: replay never mutates the recording store.
 
-Out of scope here (see TODO at the bottom of this file):
-  - 're-execute' and 'refuse' operations, and non-STRICT modes — the
-    matrix gating these requires sight of replay_tools.py.
+The extended matrix later in this module also covers re-execute/refuse,
+class mismatch policy, and non-STRICT modes.
 """
 from __future__ import annotations
 

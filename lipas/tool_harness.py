@@ -75,6 +75,7 @@ raises (ReplayRefused / ReplayMissing) so the session terminates.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import time
@@ -86,11 +87,14 @@ from typing import Any, Optional
 
 from lipas.calculus import Claim
 from lipas.effect import EffectKind, ToolTarget
+from lipas.exceptions import OrphanedEffectError
 from lipas.guard import Guard, GuardVerdict
 from lipas.replay_tools import (
+    F_DECISION_SOURCE_EFFECT_ID,
     ReplayDecision,
     ReplayMissing,
     ReplayRefused,
+    TAG_REPLAY_DECISION,
     ToolReplayer,
 )
 from lipas.rows import RowSet
@@ -100,8 +104,9 @@ from lipas.rows.capability import (
     TAG_BUDGET_OVERRUN, TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
+    EffectRow,
     F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
-    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_OUTPUT, F_REASON,
+    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_OUTPUT, F_REASON, F_SPEND,
     F_SIDE_EFFECT, F_STATUS, F_TOOL_NAME,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
@@ -266,6 +271,9 @@ class ToolHarness:
     # Internal: tracks whether the session-init claim has been folded
     # for the configured replayer. One harness == one session.
     _replay_session_started: bool = field(default=False, init=False, repr=False)
+    _consumed_replay_effect_ids: set[str] = field(
+        default_factory=set, init=False, repr=False,
+    )
 
     # ── public API ─────────────────────────────────────────────
 
@@ -275,6 +283,7 @@ class ToolHarness:
         tool_name: str,
         arguments: Mapping[str, Any],
         effect_id: str | None = None,
+        tool_use_id: str | None = None,
         compensates: str | None = None,
         caused_by: str | None = None,
     ) -> dict:
@@ -285,13 +294,13 @@ class ToolHarness:
         tool_name, arguments:
             What to invoke.
         effect_id:
-            Stable id for this effect.  When the call originates from
-            an LLM tool_use block, pass ``tool_use.id`` here so
-            downstream tool_result blocks (which key on
-            ``tool_use_id``) round-trip correctly and replay can
-            match by id.  When omitted, a fresh ``tool_<hex>`` is
-            generated — fine for direct invocation outside an LLM
-            loop (tests, scripted runs).
+            Stable internal id for this audited effect. When omitted, a fresh
+            ``tool_<hex>`` id is generated.
+        tool_use_id:
+            Provider correlation id copied to the returned ``tool_result``.
+            This is deliberately separate from ``effect_id`` because provider
+            ids are neither globally unique nor constrained to LIPAS's Effect
+            id format. Defaults to the internal effect id for direct calls.
         compensates:
             Optional effect_id of a prior effect this call is
             intended to compensate (e.g. a refund tool compensating
@@ -304,10 +313,15 @@ class ToolHarness:
         ReplayRefused (LIVE_REROUTE refusing EXTERNAL_WRITE) when the
         replay layer terminates the session.
         """
-        eid  = effect_id or f"tool_{uuid.uuid4().hex[:12]}"
+        eid = effect_id or f"tool_{uuid.uuid4().hex[:12]}"
+        result_id = tool_use_id or eid
         # A tool receives its own nested copy. This prevents a mutating client
         # from changing either the caller's mapping or the recorded intent.
         args = deepcopy(dict(arguments))
+
+        recovered = self._recover_existing(eid, result_id, tool_name, args)
+        if recovered is not None:
+            return recovered
 
         # ── 0. Resolve tool ─────────────────────────────────
         try:
@@ -320,7 +334,7 @@ class ToolHarness:
             self._fold_intent_unknown(eid, tool_name, args, compensates, caused_by)
             self._fold_rejection(eid, rej)
             return self._tool_result(
-                eid,
+                result_id,
                 f"Unknown tool {tool_name!r}. Available: "
                 f"{', '.join(rej.available) or '<none>'}",
                 is_error=True,
@@ -332,11 +346,22 @@ class ToolHarness:
         # passed those gates; re-evaluating against new state is a
         # category error — same reasoning as LLM ReplayCursor).
         if self.tool_replayer is not None:
+            self._restore_consumed_replay_effect_ids()
             if not self._replay_session_started:
                 self.rowset.fold(self.tool_replayer.session_init_claim())
                 self._replay_session_started = True
 
-            decision = self.tool_replayer.decide(tool, args)
+            decision = self.tool_replayer.decide(
+                tool,
+                args,
+                exclude_effect_ids=frozenset(
+                    self._consumed_replay_effect_ids,
+                ),
+            )
+            if decision.recorded_node is not None:
+                self._consumed_replay_effect_ids.add(
+                    decision.recorded_node.effect_id,
+                )
 
             # Fold the per-call decision claim regardless of the
             # operation, so audit captures every replay choice
@@ -356,7 +381,7 @@ class ToolHarness:
 
             if decision.operation == "substitute":
                 return self._do_replay_substitute(
-                    eid, tool, args, compensates, caused_by, decision,
+                    eid, result_id, tool, args, compensates, caused_by, decision,
                 )
 
             if decision.operation == "refuse":
@@ -377,11 +402,11 @@ class ToolHarness:
             # as the tool body does.
             args = deepcopy(dict(bound.arguments))
         except TypeError as e:
-            rej = SchemaRejection(tool_name=tool.name, detail=str(e))
+            schema_rej = SchemaRejection(tool_name=tool.name, detail=str(e))
             self._fold_intent(eid, tool, args, compensates, caused_by)
-            self._fold_rejection(eid, rej)
+            self._fold_rejection(eid, schema_rej)
             return self._tool_result(
-                eid, f"Schema violation: {e}", is_error=True,
+                result_id, f"Schema violation: {e}", is_error=True,
             )
 
         # Guards are policy observers, not argument transformers. Keep their
@@ -394,7 +419,7 @@ class ToolHarness:
             self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, guard_rej)
             return self._tool_result(
-                eid,
+                result_id,
                 f"Guard {guard_rej.guard_name!r} denied: "
                 f"{guard_rej.verdict.reason}",
                 is_error=True,
@@ -406,7 +431,7 @@ class ToolHarness:
             self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, estimate_rej)
             return self._tool_result(
-                eid,
+                result_id,
                 f"Tool estimate for {tool.name!r} is invalid: {estimate_rej.detail}",
                 is_error=True,
             )
@@ -416,7 +441,7 @@ class ToolHarness:
             self._fold_intent(eid, tool, args, compensates, caused_by)
             self._fold_rejection(eid, bud_rej)
             return self._tool_result(
-                eid,
+                result_id,
                 f"Budget exhausted for {bud_rej.bucket!r}: "
                 f"{bud_rej.spent}+{bud_rej.estimate} > {bud_rej.limit}",
                 is_error=True,
@@ -444,8 +469,11 @@ class ToolHarness:
                 "message":   str(e),
             }
             wall_seconds = time.monotonic() - t0
-            self._fold_result(eid, tool, output, status, error_detail)
-            self._fold_spend(eid, self._compute_spend(estimate, wall_seconds))
+            spend = self._compute_spend(estimate, wall_seconds)
+            self._fold_result(
+                eid, tool, output, status, error_detail, spend=spend,
+            )
+            self._fold_spend(eid, spend)
             if not isinstance(e, Exception):
                 # KeyboardInterrupt etc. — fold-and-propagate.
                 raise
@@ -454,7 +482,7 @@ class ToolHarness:
                 tool.name, type(e).__name__, e,
             )
             return self._tool_result(
-                eid,
+                result_id,
                 f"{error_detail['exception']}: {error_detail['message']}",
                 is_error=True,
             )
@@ -462,19 +490,140 @@ class ToolHarness:
         wall_seconds = time.monotonic() - t0
 
         # ── 6. Record result ────────────────────────────────
-        self._fold_result(eid, tool, output, status, error_detail)
+        spend = self._compute_spend(estimate, wall_seconds)
+        self._fold_result(
+            eid, tool, output, status, error_detail, spend=spend,
+        )
 
         # ── 7. Record spend ─────────────────────────────────
-        self._fold_spend(eid, self._compute_spend(estimate, wall_seconds))
+        self._fold_spend(eid, spend)
 
         # ── 8. Synthesize tool_result ───────────────────────
-        return self._tool_result(eid, _stringify(output), is_error=False)
+        return self._tool_result(result_id, _stringify(output), is_error=False)
+
+    def _restore_consumed_replay_effect_ids(self) -> None:
+        """Recover source-tape consumption when a target tape is reopened."""
+        for claim in self.rowset.store.filter(tag=TAG_REPLAY_DECISION):
+            source_id = claim.fields.get(F_DECISION_SOURCE_EFFECT_ID)
+            if isinstance(source_id, str):
+                self._consumed_replay_effect_ids.add(source_id)
+
+    def _recover_existing(
+        self,
+        effect_id: str,
+        tool_use_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> dict | None:
+        """Return a recorded terminal tool result without executing again."""
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)),
+            None,
+        )
+        if effect_row is None:
+            return None
+        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
+        if node is None:
+            return None
+        if node.kind is not EffectKind.TOOL_CALL:
+            raise ValueError(f"effect id {effect_id!r} belongs to a non-tool effect")
+        fields = node.intent.fields
+        if fields.get(F_TOOL_NAME) != tool_name:
+            raise ValueError(f"effect id {effect_id!r} was reused for a different tool")
+
+        recorded_args = fields.get(F_ARGUMENTS)
+        normalized_args: Mapping[str, Any] = dict(arguments)
+        if recorded_args != normalized_args:
+            try:
+                tool = self.tools.get(tool_name)
+                bound = tool._signature.bind(**dict(arguments))
+                bound.apply_defaults()
+                normalized_args = dict(bound.arguments)
+            except (ToolNotFoundError, TypeError):
+                pass
+        if recorded_args != normalized_args:
+            raise ValueError(
+                f"effect id {effect_id!r} was reused with different arguments",
+            )
+
+        if node.result is not None:
+            result_fields = node.result.fields
+            recorded_spend = result_fields.get(F_SPEND, {})
+            if not isinstance(recorded_spend, Mapping):
+                raise TypeError(
+                    f"recorded tool effect {effect_id!r} has invalid spend",
+                )
+            self._fold_spend(effect_id, recorded_spend)
+            is_error = result_fields.get(F_STATUS) == "error"
+            return self._tool_result(
+                tool_use_id,
+                self._recorded_result_content(result_fields),
+                is_error=is_error,
+            )
+        if node.rejection is not None:
+            rejection_fields = node.rejection.fields
+            return self._tool_result(
+                tool_use_id,
+                self._recovered_rejection_content(rejection_fields),
+                is_error=True,
+            )
+        raise OrphanedEffectError(
+            f"tool effect {effect_id!r} has intent but no terminal outcome",
+        )
+
+    @staticmethod
+    def _recorded_result_content(fields: Mapping[str, Any]) -> str:
+        content = _stringify(fields.get(F_OUTPUT))
+        if fields.get(F_STATUS) != "error":
+            return content
+        error = fields.get(F_ERROR)
+        if not isinstance(error, Mapping):
+            return content
+        exception = error.get("exception")
+        message = error.get("message")
+        if exception is None or message is None:
+            return content
+        return f"{exception}: {message}"
+
+    @staticmethod
+    def _recovered_rejection_content(fields: Mapping[str, Any]) -> str:
+        """Rebuild the exact tool_result text emitted by a rejection path."""
+        reason = fields.get(F_REASON)
+        raw_detail = fields.get(F_DETAIL)
+        detail = raw_detail if isinstance(raw_detail, Mapping) else {}
+        if reason == "unknown_tool":
+            available = detail.get("available", ())
+            names = ", ".join(str(name) for name in available)
+            return (
+                f"Unknown tool {detail.get('tool_name')!r}. Available: "
+                f"{names or '<none>'}"
+            )
+        if reason == "schema_violation":
+            return f"Schema violation: {detail.get('detail')}"
+        if isinstance(reason, str) and reason.startswith("guard:"):
+            return (
+                f"Guard {detail.get('guard')!r} denied: "
+                f"{detail.get('reason')}"
+            )
+        if reason == "estimate_invalid":
+            return (
+                f"Tool estimate for {detail.get('tool_name')!r} is invalid: "
+                f"{detail.get('detail')}"
+            )
+        if reason == "budget_exhausted":
+            return (
+                f"Budget exhausted for {detail.get('bucket')!r}: "
+                f"{detail.get('spent')}+{detail.get('estimate')} > "
+                f"{detail.get('limit')}"
+            )
+        return f"Recorded rejection: {reason or 'rejected'}"
 
     # ── replay execution helpers (P3.2) ────────────────────────
 
     def _do_replay_substitute(
         self,
         eid: str,
+        tool_use_id: str,
         tool: Tool,
         args: Mapping[str, Any],
         compensates: str | None,
@@ -508,6 +657,7 @@ class ToolHarness:
 
         new_fields = deepcopy(dict(recorded_node.result.fields))
         new_fields[F_EFFECT_ID] = eid
+        new_fields[F_SPEND] = {"tool_calls": 1.0, "wall_seconds": 0.0}
         # F_KIND, F_STATUS, F_OUTPUT, F_SIDE_EFFECT, F_ATTEMPTS,
         # F_ERROR (if present) copied verbatim.
         self.rowset.fold(Claim(
@@ -520,9 +670,12 @@ class ToolHarness:
         # conversation) with no wall time (no live execution).
         self._fold_spend(eid, {"tool_calls": 1.0, "wall_seconds": 0.0})
 
-        output   = recorded_node.result.fields.get(F_OUTPUT)
-        is_error = recorded_node.result.fields.get(F_STATUS) == "error"
-        return self._tool_result(eid, _stringify(output), is_error=is_error)
+        result_fields = recorded_node.result.fields
+        return self._tool_result(
+            tool_use_id,
+            self._recorded_result_content(result_fields),
+            is_error=result_fields.get(F_STATUS) == "error",
+        )
 
     def _do_replay_refuse(
         self,
@@ -618,6 +771,11 @@ class ToolHarness:
             for bucket, amount in estimate.items():
                 if not isinstance(bucket, str) or not bucket:
                     raise ValueError(f"invalid bucket name {bucket!r}")
+                if bucket not in tool.declared_buckets:
+                    raise ValueError(
+                        f"estimate returned undeclared bucket {bucket!r}; "
+                        f"declare it with @tool(declared_buckets=...)"
+                    )
                 if (
                     isinstance(amount, bool)
                     or not isinstance(amount, (int, float))
@@ -741,6 +899,8 @@ class ToolHarness:
         output: Any,
         status: str,
         error_detail: dict | None,
+        *,
+        spend: Mapping[str, float],
     ) -> None:
         fields: dict = {
             F_EFFECT_ID:    eid,
@@ -749,6 +909,7 @@ class ToolHarness:
             F_STATUS:       status,
             F_OUTPUT:       deepcopy(output),
             F_SIDE_EFFECT:  tool.side_effect.value,
+            F_SPEND:        dict(spend),
             # ^ actual side-effect class.  v0.1: equals declared.  Future
             #   work: a tool may downgrade (declared EXTERNAL_WRITE,
             #   actual no-op IDEMPOTENT_WRITE because cache-hit) and
@@ -775,6 +936,13 @@ class ToolHarness:
         for bucket, amount in spend.items():
             if amount <= 0:
                 continue
+            claim_id = self._spend_claim_id(eid, bucket)
+            if any(
+                claim.claim_id == claim_id
+                for tag in (TAG_RESOURCE_SPENT, TAG_BUDGET_OVERRUN)
+                for claim in self.rowset.store.filter(tag=tag)
+            ):
+                continue
             is_overrun = (
                 cap is not None
                 and proj is not None
@@ -796,6 +964,7 @@ class ToolHarness:
                         F_EFFECT_ID:  eid,
                     },
                     source="tool_harness.call",
+                    claim_id=claim_id,
                 ))
             else:
                 self.rowset.fold(Claim(
@@ -806,7 +975,15 @@ class ToolHarness:
                         F_EFFECT_ID:  eid,
                     },
                     source="tool_harness.call",
+                    claim_id=claim_id,
                 ))
+
+    @staticmethod
+    def _spend_claim_id(effect_id: str, bucket: str) -> str:
+        digest = hashlib.sha256(
+            f"tool-spend:{effect_id}:{bucket}".encode("utf-8"),
+        ).hexdigest()[:24]
+        return f"spend_{digest}"
 
     def _fold_rejection(
         self,

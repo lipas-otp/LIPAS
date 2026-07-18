@@ -3,21 +3,23 @@
 > 语言：[English](execution-model.md) | [中文](execution-model.zh-CN.md)
 
 这是 LIPAS 的核心概念文档。编写第一个 Agent 时不需要先读它；请先看
-[快速开始](getting-started.zh-CN.md)或[循序上手教程](tutorial.zh-CN.md)。当你
+[README](../README.zh-CN.md)或[循序上手教程](tutorial.zh-CN.md)。当你
 需要了解持久 trace、replay 或 Team 究竟提供什么保证时，再回到这里。
 
 ## 从应用需要开始
 
-LIPAS 有三个执行概念：
+LIPAS 有四个执行概念：
 
 | 概念 | 含义 | 何时引入 |
 |---|---|---|
 | `Agent` | 一个 assistant：模型、工具和 reason/act 循环 | 通常的起点 |
 | `@tool` | 带已声明副作用类别的显式 Python capability | assistant 需要读取或改变某些内容 |
+| `ExecutionStore` | 持久 Task/Run 归属、checkpoint、取消与审批 Interrupt | 同一个 Agent run 必须跨越等待或进程中止 |
 | `Team` | 在具名 assistant 或函数之间建立可持久化的 handoff 边界 | 工作需要独立 owner、重启边界或审计记录 |
 
-一个 Agent 可以使用很多工具、进行很多次模型调用；仅此并不需要 Team。只有
-下一段工作应作为独立归属的 handoff 存活下来时才添加 Team，例如 planner 将
+一个 Agent 可以使用很多工具、进行很多次模型调用；仅此并不需要 Team。同一个
+Agent run 需要恢复时添加 `ExecutionStore`；只有下一段工作应作为独立归属的
+handoff 存活下来时才添加 Team，例如 planner 将
 研究任务交给可独立重启的 researcher，或付款需要独立的审批边界。
 
 工具不是 Agent；它们是 Agent 明确的“手”。Team 成员通常是一个 Agent，但在
@@ -27,11 +29,13 @@ Skill 是一个可选、可复用的 `SKILL.md` 指导文件。它会被载入 A
 instructions，但不会创建 capability 或新的执行语义：Agent 仍然只能通过已
 声明的工具行动。
 
-## 一份记录，三个视图
+## 一条证据 tape，显式的控制 store
 
-每个与可靠性有关的事件都会成为一个 **Claim（声明）**：它是带 tag、fields、
-source 和稳定 `claim_id` 的不可变记录。一个 store 对同一个逻辑 claim id 只
-接纳一次；再次投递相同 payload 是 no-op，用同一 id 投递不同内容则会被拒绝。
+每个与可靠性有关的模型、工具、budget、replay 与 supervision event 都会成为一个
+带 tag、fields、source 和稳定 `claim_id` 的 **Claim（声明）**。store 接纳 Claim
+后拥有的是不可变快照：再次投递相同逻辑 id 与 payload 是 no-op，用同一 id 投递
+不同内容会被拒绝，调用方之后的修改也无法重写 tape。用于准备 event 的 Python
+`Claim` 对象本身并不是 frozen value。
 
 一次 **fold（折叠）** 会追加该 Claim，并更新派生视图。这是 runtime 的中心
 规则：在决定与 effect 尚未被遗忘前记录它们。merge strategy 必须是确定的；
@@ -41,13 +45,27 @@ source 和稳定 `claim_id` 的不可变记录。一个 store 对同一个逻辑
 
 | Row | 回答的问题 | 职责 |
 |---|---|---|
-| History | 发生或决定了什么？ | observation、replay 选择、supervision、mailbox 与 operation transition |
+| History | 发生或决定了什么？ | observation、replay 选择、supervision、execution、mailbox 与 operation transition |
 | Capability | 这笔消耗可以发生吗？ | budget、资源消耗、quota 和 rate event |
 | Effect | 原本想调用什么，最后发生了什么？ | 模型/工具 intent、result、rejection 与因果链接 |
 
 这些 row 是同一条 tape 的投影，并非独立数据库或隐藏的 workflow state。只有当
 一个 concern 拥有自己的 tag、确实需要独立 invariant 或 view 时，才应添加新
 row。领域 memory、搜索索引和用户资料仍是普通应用数据，不是 LIPAS row。
+
+可变协调状态承担不同工作，并有明确的权威来源：
+
+| 状态 | 权威 store | Claim 的角色 |
+|---|---|---|
+| 模型/工具 Effect、消耗、replay、supervision | Agent Claim/Effect session | 权威证据 |
+| Task、Run、lease、checkpoint、Interrupt | `ExecutionStore` | 连接 `RowSet` 时形成可修复 transition 镜像 |
+| external write reconciliation | `OperationJournal` | 可修复 transition 镜像 |
+| Team 投递与 acknowledgement | mailbox SQLite database | 可修复 transition 镜像 |
+
+lease 与 compare-and-swap checkpoint 不会被强行塞进 Claim merge。它们的权威
+SQLite transition 会在同一 transaction 中追加 Claim-shaped 本地 outbox event。
+进程中止后镜像可能暂时落后，但 `repair_audit()` 会用稳定 Claim id 恢复每个 event。
+这样既保持控制状态精确，也维持统一的证据词汇。
 
 ## Effect：让实时边界可见
 
@@ -75,6 +93,10 @@ LLM replay 会替换为已记录的 reply。工具 replay 默认严格：已记�
 
 Replay 能证明使用了哪一个已记录决策；它**不能**证明原始外部操作恰好投递一次。
 
+当多个工具调用具有相同名称和参数时，target 会按 fold 顺序依次消费匹配的 source
+recording。因此，变化中的 read-only observation 不会在每一次 replay 时都错误地复用
+第一条匹配结果。
+
 ## 外部边界
 
 `OperationJournal` 是支持 idempotency key 的 external write 边界。它在提交前
@@ -88,6 +110,37 @@ reconciliation 只会返回该结果，不会允许过期信息改写它。
 
 如果 LIPAS 无法持久化记录 provider return（例如结果无法序列化），也会将仍在
 等待的 submission 标为 `uncertain`。记录失败绝不是外部 write 没有发生的证据。
+
+## 持久 ReAct run
+
+普通 `Agent.run()` 在内存中持有 reason/act/observe 循环，同时由 session 记录
+Effect。`Agent.run_durable()` 还会把这个循环接入 `ExecutionStore`：execution store
+负责 Task/Run 状态、带 fencing 的 run lease、带版本的阶段 checkpoint 和审批
+Interrupt；Agent 的 SQLite session 仍是模型与工具 Effect 的事实来源。
+checkpoint 会记录该 session 的稳定 `store_id`；若恢复时误用另一份 claim 数据库，
+runner 会在任何实时模型或工具调用之前 fail closed。
+所有权威 SQLite control store 都带显式 schema version：`ExecutionStore`、
+`OperationJournal` 与 Team mailbox 遇到不兼容 release 时都会 fail closed。
+使用 `rowset=...` 构造 `ExecutionStore` 时，每个 Task/Run/checkpoint/Interrupt
+transition 还会从其 transactional outbox 镜像至该 Claim tape；控制决策仍以
+execution database 为准。
+
+持久循环会在每次模型调用前后、每个工具结果之后、每次 observation 完成后，以及
+terminal settlement 之前保存 checkpoint。模型与工具 Effect 使用 run 范围内的
+确定性 identity。如果进程在 terminal Effect 已记录、对应 checkpoint 尚未写入时
+中止，下一位 lease owner 会从 Effect tape 恢复结果；如果只有 intent，则恢复会抛出
+`OrphanedEffectError`，不会猜测再次提交是否安全。
+
+审批 policy 可以在工具执行前以原子方式保存 checkpoint，并把 Run 转为 `waiting`。
+使用 `allow=True` 解决 Interrupt 后，Run 会重新变为可 claim；
+`Agent.resume_durable()` 从 checkpoint 恢复，不会把原始 prompt 追加两次。持久执行
+目前要求 Agent 使用 SQLite session。协作式 cancellation 会写入 checkpoint；带取消
+请求且已经过期的 lease 可以被重新 claim，但只能用于完成取消。durable run 中的
+supervisor tick 使用稳定 claim identity，因此 recommendation 已写入、checkpoint 尚未
+保存时发生崩溃，也能在恢复时修复而不重复 recommendation。timeout policy 与自动
+lease heartbeat 仍属于后续工作。恢复契约还通过真实 subprocess 测试验证：已完成
+write Effect、尚未写入其 checkpoint 时发送 `SIGKILL`，重启会恢复 Effect result，
+不会第二次执行 write。
 
 ## Team：可靠 handoff，不是图 DSL
 
@@ -116,3 +169,11 @@ transaction 或 provider 无关的 exactly-once delivery。它的职责更窄：
 provider-neutral 的 `Request`、`Reply`、content、usage 和 stream-event shape 位于
 `lipas.adapter`。Ollama、注入 client 的 Anthropic，以及 optional-SDK 的 OpenAI
 Responses adapter 都实现这些 shape。
+
+`OperationJournal` 与 Team mailbox 的 SQLite 状态是 authoritative durable state；
+但它们可选的 Claim audit 使用另一笔 transaction。每次 authoritative mutation 都会
+在同一个 SQLite transaction 中追加一条 Claim-shaped outbox event；构造、幂等重试及
+`repair_audit()` 会用稳定的 Claim id 重放 outbox。因此进程在两个数据库写入之间中止
+只会让 audit 暂时落后，不会永久漏掉或重复镜像事件。这仍是可恢复镜像，不是分布式
+transaction；调用方仍必须依据 journal/mailbox 数据库判断 operation 或 handoff 是否
+存在，不能只依据 Claim。

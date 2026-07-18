@@ -1,4 +1,4 @@
-"""LIPAS — claim-based execution primitives for reliable AI agents.
+"""LIPAS — trustworthy AI execution with durable, auditable agent work.
 
 The provider-neutral interchange surface is ``lipas.adapter``.
 """
@@ -12,10 +12,32 @@ from .operations import OperationJournal
 from .skills import Skill, SkillRegistry, discover_skills, load_skill
 from .team import Team
 from .supervisor import project_supervisor
+from .execution import (
+    Checkpoint,
+    CheckpointConflict,
+    ExecutionLeaseError,
+    ExecutionSchemaVersionMismatch,
+    ExecutionStateError,
+    ExecutionStore,
+    Interrupt,
+    InterruptState,
+    Run,
+    RunSuspended,
+    RunState,
+    Task,
+    TaskState,
+)
+from .durable import ApprovalPolicy, writes_require_approval
 
 __all__ = [
     "Agent", "tool", "SideEffectClass", "Team", "OperationJournal",
     "Skill", "SkillRegistry", "discover_skills", "load_skill",
     "open_session", "replay", "render_trace", "write_jsonl",
     "project_supervisor",
+    "ExecutionStore", "Task", "Run", "Checkpoint", "Interrupt",
+    "TaskState", "RunState", "InterruptState",
+    "ExecutionStateError", "ExecutionLeaseError",
+    "ExecutionSchemaVersionMismatch", "CheckpointConflict",
+    "ApprovalPolicy",
+    "RunSuspended", "writes_require_approval",
 ]

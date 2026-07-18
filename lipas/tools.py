@@ -8,14 +8,15 @@ Public surface:
 
 P3.1 additions:
     - Tool.declared_buckets : frozenset[str] — buckets the tool may
-                              touch.  Used by ToolHarness for spend
-                              accounting and (eventually) startup-
-                              time budget provisioning.
+                              touch. Used by ToolHarness to reject
+                              undeclared spend and by deployment-side
+                              startup budget checks.
     - Tool.estimate_fn      : Callable[[args_dict], {bucket: float}]
                               | None — upper-bound estimate per call.
-                              Honored by ToolHarness pre-flight under
-                              the D2 contract: actual ≤ estimate for
-                              every declared bucket.
+                              Honored by ToolHarness pre-flight. Custom
+                              buckets are conservatively charged at the
+                              admitted estimate; system wall time is
+                              replaced by the measured duration.
     - @tool(declared_buckets=..., estimate=...) wires both at the
       decorator level.
 
@@ -194,6 +195,24 @@ class Tool:
     _signature: inspect.Signature = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Tool.name must be a non-empty string")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("Tool.description must be a non-empty string")
+        if not isinstance(self.parameters_schema, dict):
+            raise TypeError("Tool.parameters_schema must be a dict")
+        if not isinstance(self.side_effect, SideEffectClass):
+            raise TypeError("Tool.side_effect must be SideEffectClass")
+        if not callable(self._handler):
+            raise TypeError("Tool._handler must be callable")
+        if not isinstance(self.declared_buckets, frozenset) or not self.declared_buckets:
+            raise ValueError("Tool.declared_buckets must be a non-empty frozenset")
+        if any(not isinstance(bucket, str) or not bucket for bucket in self.declared_buckets):
+            raise ValueError("Tool.declared_buckets must contain non-empty strings")
+        if self.estimate_fn is not None and not callable(self.estimate_fn):
+            raise TypeError("Tool.estimate_fn must be callable or None")
+        if not isinstance(self.observability_only, bool):
+            raise TypeError("Tool.observability_only must be bool")
         object.__setattr__(self, "_signature", inspect.signature(self._handler))
         _validate_buckets(self.name, self.declared_buckets)
 
@@ -425,13 +444,15 @@ def tool(
     violation, see SYSTEM_BUCKETS).
 
     `estimate=` (P3.1) is a callable taking the bound arguments dict
-    and returning a {bucket: float} upper-bound for THIS call.  Per
-    the D2 contract, actual ≤ estimate for every returned bucket.
-    The harness uses this for pre-flight budget gating; if the contract
-    is broken the actual is recorded as TAG_BUDGET_OVERRUN.  The estimate
-    itself must return finite, non-negative numeric values.  If it raises
-    or returns an invalid value, the harness records an `estimate_invalid`
-    pre-flight rejection and does not execute the tool.
+    and returning a {bucket: float} upper-bound for THIS call. Every returned
+    bucket must appear in `declared_buckets`. The harness uses this for
+    pre-flight budget gating and conservatively records custom-bucket spend at
+    the admitted estimate. Measured wall time replaces its estimate after the
+    call and is recorded as TAG_BUDGET_OVERRUN if it exceeds a configured
+    budget. The estimate itself must return finite, non-negative numeric
+    values. If it raises or returns an invalid or undeclared bucket, the
+    harness records an `estimate_invalid` pre-flight rejection and does not
+    execute the tool.
 
     `observability_only=` (P3.2 / RFC-001 §3.4) marks tools whose
     side effects are infrastructure (logging sinks, metric emitters,

@@ -44,13 +44,14 @@ budget snapshot).  Either is wrong.  Replay is a tape, not a policy.
 from __future__ import annotations
 
 import logging
+import hashlib
 import uuid
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Awaitable, AsyncIterator
 
-from lipas.adapter import Reply, Request, ResourceEstimate, Usage
+from lipas.adapter import Reply, Request, ResourceEstimate, UnknownModelError, Usage
 from lipas.adapter.errors import (
     DEFAULT_POLICY, ErrorKind, RetryPolicy, classify,
 )
@@ -59,9 +60,11 @@ from lipas.adapter.types import Done, StreamEvent
 
 from lipas.calculus import Claim
 from lipas.effect import EffectKind, LLMTarget
+from lipas.exceptions import OrphanedEffectError
 from lipas.guard import Guard, GuardVerdict
 from lipas.replay import ReplayCursor
 from lipas.retry import RetryOutcome, call_with_retry
+from lipas.serialization.codec import encode, make_default_codec_registry
 from lipas.rows import RowSet
 from lipas.rows.capability import (
     CapabilityRow,
@@ -69,8 +72,9 @@ from lipas.rows.capability import (
     TAG_BUDGET_OVERRUN, TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
+    EffectRow,
     F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DETAIL, F_EFFECT_ID, F_ERROR,
-    F_KIND, F_MODEL, F_REASON, F_REPLY, F_REQUEST, F_STATUS,
+    F_KIND, F_MODEL, F_REASON, F_REPLY, F_REQUEST, F_STATUS, F_TOTAL_USAGE,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
 
@@ -84,6 +88,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_RECOVERY_CODECS = make_default_codec_registry()
 
 
 BucketExtractor = Callable[[Reply], dict[str, float]]
@@ -92,8 +97,9 @@ BucketExtractor = Callable[[Reply], dict[str, float]]
 def default_bucket_extractor(reply: Reply) -> dict[str, float]:
     u = reply.usage
     out: dict[str, float] = {}
-    if u.input:
-        out["tokens_in"] = float(u.input)
+    total_input = u.input + u.cache_read + u.cache_write
+    if total_input:
+        out["tokens_in"] = float(total_input)
     if u.output:
         out["tokens_out"] = float(u.output)
     return out
@@ -196,6 +202,7 @@ class LLMHarness:
         *,
         compensates: str | None = None,
         caused_by: str | None = None,
+        effect_id: str | None = None,
         _replay_call_id: str | None = None,
     ) -> Reply:
         """Execute one LLM call.
@@ -206,7 +213,12 @@ class LLMHarness:
         if self.replay_cursor is not None and not self.replay_cursor.exhausted():
             return self.replay_cursor.advance(request)
 
-        effect_id = _replay_call_id or f"call_{uuid.uuid4().hex[:12]}"
+        if effect_id is not None and _replay_call_id is not None:
+            raise ValueError("pass effect_id or _replay_call_id, not both")
+        effect_id = effect_id or _replay_call_id or f"call_{uuid.uuid4().hex[:12]}"
+        recovered = self._recover_existing(effect_id, request)
+        if recovered is not None:
+            return recovered
         # Guards are observers. Give them an isolated copy so an accidental
         # mutation in policy code cannot rewrite the request that is admitted
         # or sent to a provider.
@@ -248,10 +260,68 @@ class LLMHarness:
         self._fold_result(effect_id, outcome)
 
         # 6. Resource accounting — success only.
-        if reply.stop_reason != "error" or reply.usage.input or reply.usage.output:
-            self._fold_spend(effect_id, reply)
+        if reply.stop_reason != "error" or outcome.billed_usage.total:
+            self._fold_spend(
+                effect_id,
+                replace(reply, usage=outcome.billed_usage),
+                pricing_model=request.model,
+            )
 
         return reply
+
+    def _recover_existing(self, effect_id: str, request: Request) -> Reply | None:
+        """Return an already-recorded terminal call without live submission."""
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)),
+            None,
+        )
+        if effect_row is None:
+            return None
+        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
+        if node is None:
+            return None
+        if node.kind is not EffectKind.LLM_CALL:
+            raise ValueError(f"effect id {effect_id!r} belongs to a non-LLM effect")
+        recorded_request = node.intent.fields.get(F_REQUEST)
+        if (
+            not isinstance(recorded_request, Request)
+            or encode(recorded_request, _RECOVERY_CODECS)
+            != encode(request, _RECOVERY_CODECS)
+        ):
+            raise ValueError(f"effect id {effect_id!r} was reused for a different request")
+        if node.result is not None:
+            reply = node.result.fields.get(F_REPLY)
+            if not isinstance(reply, Reply):
+                raise TypeError(f"recorded LLM effect {effect_id!r} has no Reply")
+            total_usage = node.result.fields.get(F_TOTAL_USAGE, reply.usage)
+            if not isinstance(total_usage, Usage):
+                raise TypeError(
+                    f"recorded LLM effect {effect_id!r} has invalid total usage",
+                )
+            if reply.stop_reason != "error" or total_usage.total:
+                self._fold_spend(
+                    effect_id,
+                    replace(reply, usage=total_usage),
+                    pricing_model=request.model,
+                )
+            return deepcopy(reply)
+        if node.rejection is not None:
+            fields = node.rejection.fields
+            detail = fields.get(F_DETAIL)
+            return Reply(
+                content=(),
+                usage=Usage(),
+                stop_reason="error",
+                model=request.model,
+                error_detail={
+                    "type": "preflight_rejection",
+                    "reason": fields.get(F_REASON),
+                    **(dict(detail) if isinstance(detail, Mapping) else {}),
+                },
+            )
+        raise OrphanedEffectError(
+            f"LLM effect {effect_id!r} has intent but no terminal outcome",
+        )
 
     async def stream(
         self, request: Request, *, compensates: str | None = None,
@@ -272,11 +342,13 @@ class LLMHarness:
         async def estimate() -> ResourceEstimate:
             if not cache: cache.append(await self.adapter.estimate_cost(request))
             return cache[0]
-        rejection = await self._preflight_budget(request, estimate)
-        if rejection is None:
-            rejection = await self._preflight_guards(target, estimate)
-        if rejection is not None:
-            yield Done(self._record_rejection(effect_id=effect_id, request=request, compensates=compensates, caused_by=caused_by, rejection=rejection))
+        stream_rejection: BudgetRejection | GuardRejection | None = (
+            await self._preflight_budget(request, estimate)
+        )
+        if stream_rejection is None:
+            stream_rejection = await self._preflight_guards(target, estimate)
+        if stream_rejection is not None:
+            yield Done(self._record_rejection(effect_id=effect_id, request=request, compensates=compensates, caused_by=caused_by, rejection=stream_rejection))
             return
         self._fold_intent(effect_id, request, compensates, caused_by)
         async for event in self.adapter.stream(request):
@@ -284,8 +356,12 @@ class LLMHarness:
             if isinstance(event, Done):
                 outcome = RetryOutcome(reply=event.reply, attempts=1)
                 self._fold_result(effect_id, outcome)
-                if event.reply.stop_reason != "error" or event.reply.usage.input or event.reply.usage.output:
-                    self._fold_spend(effect_id, event.reply)
+                if event.reply.stop_reason != "error" or event.reply.usage.total:
+                    self._fold_spend(
+                        effect_id,
+                        event.reply,
+                        pricing_model=request.model,
+                    )
                 return
         raise StreamProtocolError("adapter stream ended without terminal Done")
 
@@ -391,6 +467,7 @@ class LLMHarness:
             F_EFFECT_ID: effect_id,
             F_KIND:      EffectKind.LLM_CALL.value,
             F_ATTEMPTS:  outcome.attempts,
+            F_TOTAL_USAGE: outcome.billed_usage,
             F_REPLY:     reply,            # P2.7: always present.
         }
         if reply.stop_reason == "error":
@@ -409,8 +486,29 @@ class LLMHarness:
             source="harness.call",
         ))
 
-    def _fold_spend(self, effect_id: str, reply: Reply) -> None:
+    def _fold_spend(
+        self,
+        effect_id: str,
+        reply: Reply,
+        *,
+        pricing_model: str | None = None,
+    ) -> None:
         buckets = self.bucket_extractor(reply)
+        prices = getattr(self.adapter, "prices", None)
+        if prices is not None and "cost_usd" not in buckets:
+            try:
+                price = prices.for_model(pricing_model or reply.model)
+            except UnknownModelError:
+                logger.warning(
+                    "lipas: no price configured for model %r; token usage is "
+                    "recorded but cost_usd is unavailable",
+                    pricing_model or reply.model,
+                )
+            else:
+                buckets = {
+                    **buckets,
+                    "cost_usd": float(price.cost(reply.usage)),
+                }
         if not buckets:
             return
 
@@ -419,6 +517,14 @@ class LLMHarness:
 
         for bucket, amount in buckets.items():
             if amount <= 0:
+                continue
+
+            claim_id = self._spend_claim_id(effect_id, bucket)
+            if any(
+                claim.claim_id == claim_id
+                for tag in (TAG_RESOURCE_SPENT, TAG_BUDGET_OVERRUN)
+                for claim in self.rowset.store.filter(tag=tag)
+            ):
                 continue
 
             is_overrun = (
@@ -443,6 +549,7 @@ class LLMHarness:
                         F_EFFECT_ID:   effect_id,
                     },
                     source="harness.call",
+                    claim_id=claim_id,
                 ))
             else:
                 self.rowset.fold(Claim(
@@ -453,7 +560,15 @@ class LLMHarness:
                         F_EFFECT_ID:   effect_id,
                     },
                     source="harness.call",
+                    claim_id=claim_id,
                 ))
+
+    @staticmethod
+    def _spend_claim_id(effect_id: str, bucket: str) -> str:
+        digest = hashlib.sha256(
+            f"llm-spend:{effect_id}:{bucket}".encode("utf-8"),
+        ).hexdigest()[:24]
+        return f"spend_{digest}"
 
     # ── rejection path (shared P2.6 / P2.8) ────────────────────
 

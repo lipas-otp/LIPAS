@@ -70,7 +70,10 @@ __all__ = [
 class TerminationReason:
     NATURAL_STOP    = "natural_stop"     # agent's own decision (no tool calls)
     MAX_ITERATIONS  = "max_iterations"   # ran out of budget for steps
+    MAX_TOKENS      = "max_tokens"       # model output was truncated
     ERROR           = "error"            # adapter / preflight terminal error
+    CANCELLED       = "cancelled"        # durable run cancellation won before
+                                         #   terminal settlement
     TOOL_FAILURE    = "tool_failure"     # tool failure that the behaviour
                                          #   decided not to feed back to LLM
                                          #   (ReAct does NOT use this — it
@@ -124,6 +127,18 @@ class AgentState:
     iteration: int                         = 0
     metadata:  Mapping[str, Any]           = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.messages, tuple):
+            raise TypeError("AgentState.messages must be a tuple")
+        if (
+            isinstance(self.iteration, bool)
+            or not isinstance(self.iteration, int)
+            or self.iteration < 0
+        ):
+            raise ValueError("AgentState.iteration must be a non-negative int")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("AgentState.metadata must be a mapping")
+
     # ── evolution ─────────────────────────────────────────────
 
     def with_messages(self, *new: Any) -> "AgentState":
@@ -169,8 +184,9 @@ class FinalResult:
     Fields
     ------
     text:
-        The agent's final output, if any.  Empty string for error /
-        max-iterations / tool-failure terminations — there's no
+        The agent's final output, if any. A model ``max_tokens`` termination
+        may carry partial text but is not a natural success. Empty string for
+        error / max-iterations / tool-failure terminations — there's no
         meaningful "answer" to surface in those cases.  Callers
         deciding whether to show ``text`` to a user should branch on
         ``stop_reason``, not on ``text == ""``.
@@ -192,8 +208,9 @@ class FinalResult:
             {"type": "preflight_rejection" | "http_error" | ...,
              "reason": "...",
              ...kind-specific fields...}
-        Behaviours layered above the harness do not synthesize new
-        error shapes — they pass the harness's error_detail through.
+        Behaviours normally pass the harness's error detail through; they may
+        synthesize a typed protocol error when a reply is structurally
+        inconsistent (for example, tool_use without a valid tool block).
 
     metadata:
         Free-form result metadata.  Distinct from ``state.metadata``:
@@ -207,6 +224,22 @@ class FinalResult:
     stop_reason: str                  = TerminationReason.NATURAL_STOP
     error:       Mapping[str, Any] | None = None
     metadata:    Mapping[str, Any]    = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("FinalResult.text must be str")
+        if not isinstance(self.state, AgentState):
+            raise TypeError("FinalResult.state must be AgentState")
+        if not isinstance(self.stop_reason, str) or not self.stop_reason:
+            raise ValueError("FinalResult.stop_reason must be a non-empty string")
+        if self.error is not None and not isinstance(self.error, Mapping):
+            raise TypeError("FinalResult.error must be a mapping or None")
+        if self.stop_reason == TerminationReason.ERROR and self.error is None:
+            raise ValueError("an error FinalResult must populate error")
+        if self.stop_reason != TerminationReason.ERROR and self.error is not None:
+            raise ValueError("a non-error FinalResult must not populate error")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("FinalResult.metadata must be a mapping")
 
     @property
     def is_error(self) -> bool:

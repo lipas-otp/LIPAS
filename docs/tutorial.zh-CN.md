@@ -16,7 +16,8 @@
 4. 在普通 Python 程序中处理结果。
 5. 当工作变得重要时，保留一份持久记录。
 6. 只在问题需要时，再添加 limit、replay 和 write safety。
-7. 最后学习可复用指导、handoff 和完整项目。
+7. 只有 run 必须跨越等待或中断时，才增加 checkpoint。
+8. 最后学习可复用指导、handoff 和完整项目。
 
 ## 第 1 章前的准备
 
@@ -56,7 +57,7 @@ agent = Agent.ollama("qwen2.5:7b", instructions="Be concise.")
 ```
 
 对大多数脚本，`ask()` 是唯一需要的方法。它会运行 async Agent loop，返回一个
-`FinalResult`。本版本没有 Agent-level token streaming。
+`FinalResult`。当前 API 没有 Agent-level token streaming。
 
 ## 2. 给 assistant 一项 capability
 
@@ -247,7 +248,72 @@ with Team.open("runs/team.db") as team:
 `Team` 投递是 at-least-once。如果成员将发起 idempotent 或 external 工作，请提供
 稳定 `message_id=`。下方的双 owner 项目展示完整形状。
 
-## 10. 引导式项目
+## 10. 在审批或中断后恢复同一个 Agent run
+
+持久 session 记录 Agent 做了什么；持久 execution 还记录 ReAct loop 可以从哪里恢复。
+只有一个逻辑 run 必须等待审批、跨越进程中断，或接受协作式取消，同时又不能重复追加
+prompt 或重复已完成 effect 时，才需要这个边界。
+
+持久 execution 有意使用两份 SQLite 记录：
+
+- Agent `session` 保存 Claim、Effect、消耗与稳定 effect identity；
+- `ExecutionStore` 保存 Task、Run、lease、Checkpoint 与 Interrupt state。
+
+把 Agent 的 `rowset` 传给 `ExecutionStore` 不会改变上述权威关系：它只会通过本地、
+可修复 crash window 的 outbox，把控制 transition 镜像进 Claim 证据 tape。
+
+调用 `run_durable()` 前先创建 Task 和 Run。write approval policy 只会在 checkpoint
+和 Interrupt 都已持久化后抛出 `RunSuspended`：
+
+```python
+from pathlib import Path
+
+from lipas import (
+    Agent,
+    ExecutionStore,
+    RunSuspended,
+    writes_require_approval,
+)
+
+
+async def execute(agent: Agent) -> None:
+    with ExecutionStore("runs/execution.db", rowset=agent.rowset) as executions:
+        task = executions.create_task("prepare one approved change", Path.cwd())
+        run = executions.create_run(task.id)
+        try:
+            result = await agent.run_durable(
+                "Prepare and apply the change.",
+                execution_store=executions,
+                run_id=run.id,
+                approval_policy=writes_require_approval,
+            )
+        except RunSuspended as suspended:
+            # 真实应用应先把 suspended.interrupt.request 展示给用户。
+            executions.resolve_interrupt(
+                suspended.interrupt.id,
+                allow=True,
+                response={"approved_by": "operator"},
+            )
+            result = await agent.resume_durable(
+                execution_store=executions,
+                run_id=run.id,
+                approval_policy=writes_require_approval,
+            )
+        print(result.stop_reason, result.text)
+```
+
+Agent 必须使用 `session=` 或 `session_path=`；内存 Claim tape 会被拒绝，因为只有
+checkpoint 无法证明某项 effect 是否已经完成。应通过 `resume_durable()` 恢复——原始
+输入已经写入 checkpoint。已完成的 terminal run 会直接恢复结果，不重新 claim lease，
+也不再次调用 provider。execution schema 不匹配会在打开时失败，不会错误解释不兼容
+checkpoint。
+
+运行 [`examples/11_durable_execution.py`](../examples/11_durable_execution.py) 可查看
+完全不依赖 provider 的审批/恢复流程。自动 lease heartbeat、timeout recovery 和
+Agent-level token streaming 目前仍未提供；精确失败语义见
+[执行模型](execution-model.zh-CN.md#持久-react-run)。
+
+## 11. 引导式项目
 
 这些是在前面章节之后阅读的较长、可运行示例。它们有意使用本地数据或离线函数，
 使你可以在用真实 client 替换工具体前，先检查 LIPAS boundary。
@@ -259,6 +325,7 @@ with Team.open("runs/team.db") as team:
 | [Daily brief](../examples/04_daily_brief.py) | 第 1–6 章 | 将多个只读来源变成一项运营建议。 |
 | [Safe external operation](../examples/09_external_operation.py) | 第 7–8 章 | idempotency key、失败后的不确定性、reconciliation 和 audit record。 |
 | [Research review Team](../examples/10_research_review_team.py) | 第 9 章 | 两个独立 owner 的 handoff，以及稳定 message identity。 |
+| [Durable execution](../examples/11_durable_execution.py) | 第 10 章 | 分离的 execution/effect store、持久审批 Interrupt，以及恢复同一个 run。 |
 
 例如，使用本地 Ollama 模型运行前三个：
 
@@ -268,7 +335,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-后两个不依赖 provider。包括 replay 和 supervision 的完整示例目录见
+后三个不依赖 provider。包括 replay 和 supervision 的完整示例目录见
 [examples/README.zh-CN.md](../examples/README.zh-CN.md)。
 
 ## API 卡片
@@ -282,6 +349,11 @@ python -m examples.04_daily_brief
 | `agent.ask(prompt)` | 同步运行，收到 `FinalResult`。 |
 | `await agent.run(prompt, state=None)` | async 运行；只有刻意续接时才传入之前 state。 |
 | `await agent(prompt)` | `run` 的 async 别名。 |
+| `await agent.run_durable(..., execution_store=..., run_id=...)` | 启动或继续 checkpointed ReAct run。 |
+| `await agent.resume_durable(...)` | 恢复已保存输入，不再次追加 prompt。 |
+| `ExecutionStore` | 持久化 Task、Run、lease、Checkpoint、取消与 Interrupt state。 |
+| `ExecutionStore.cancel_task(...)` | 取消 Task，并协作式停止其 active Run。 |
+| `ApprovalPolicy` / `writes_require_approval` | 标注或直接使用在执行前挂起指定工具调用的 policy。 |
 | `agent.close()` / `with agent:` | 关闭持久 session。 |
 | `@tool(side_effect=...)` | 将有类型、带说明的 Python 函数变为 capability。 |
 

@@ -41,6 +41,7 @@ but not recommended for long-running services.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import sqlite3
 import time
@@ -54,7 +55,7 @@ from ..calculus import (
     make_default_registry, merge,
 )
 from ..exceptions import ClaimIdConflict, LipasError
-from ..store import _same_claim_payload
+from ..store import ClaimStore, _same_claim_payload
 from .codec import (CodecRegistry, decode, encode, make_default_codec_registry)
 
 
@@ -103,7 +104,7 @@ class SchemaVersionMismatch(LipasError):
     """SQLite store on disk uses a schema version this runtime doesn't speak."""
 
 
-class SqliteClaimStore:
+class SqliteClaimStore(ClaimStore):
     """SQLite-backed ClaimStore. Same surface as ``ClaimStore``."""
 
     # Mirrors ClaimStore's __slots__ shape, plus persistence members.
@@ -193,10 +194,10 @@ class SqliteClaimStore:
 
         try:
             existing = int(row[0])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
             raise SchemaVersionMismatch(
                 f"meta.lipas_schema_version is not an int: {row[0]!r}"
-            )
+            ) from exc
         if existing != SCHEMA_VERSION:
             raise SchemaVersionMismatch(
                 f"sqlite store at {self._path!r} is schema version "
@@ -269,11 +270,12 @@ class SqliteClaimStore:
         existing = self._by_id.get(claim.claim_id)
         if existing is not None:
             if _same_claim_payload(existing, claim):
-                return self._merged
+                return deepcopy(self._merged)
             raise ClaimIdConflict(
                 f"claim_id={claim.claim_id!r} was reused for a different claim"
             )
 
+        claim = deepcopy(claim)
         if claim.seq < 0:
             claim = replace(claim, seq=self._seq)
 
@@ -317,17 +319,17 @@ class SqliteClaimStore:
         self._by_id[claim.claim_id] = claim
         self._seq += 1
         self._merged = merge(self._merged, claim, self._ctx, self._registry)
-        return self._merged
+        return deepcopy(self._merged)
 
     # ── reads (identical surface to ClaimStore) ───────────────
 
     @property
     def merged(self) -> Claim:
-        return self._merged
+        return deepcopy(self._merged)
 
     @property
     def log(self) -> tuple[Claim, ...]:
-        return tuple(self._log)
+        return tuple(deepcopy(self._log))
 
     @property
     def registry(self) -> StrategyRegistry:
@@ -343,7 +345,16 @@ class SqliteClaimStore:
 
     @property
     def path(self) -> str:
-        return self._path
+        return str(self._path)
+
+    @property
+    def store_id(self) -> str:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='store_id'",
+        ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            raise LipasError("SqliteClaimStore has no valid store_id")
+        return row[0]
 
     @property
     def closed(self) -> bool:
@@ -353,7 +364,7 @@ class SqliteClaimStore:
         return len(self._log)
 
     def __iter__(self) -> Iterator[Claim]:
-        return iter(self._log)
+        return iter(deepcopy(self._log))
 
     def filter(
         self, *,
@@ -364,14 +375,14 @@ class SqliteClaimStore:
         # Identical algorithm to ClaimStore.filter: index-by-tag for
         # the common single-arg path, fall back to linear scan.
         if tag is not None and kind is None and source is None:
-            return [self._log[i] for i in self._by_tag.get(tag, ())]
+            return deepcopy([self._log[i] for i in self._by_tag.get(tag, ())])
         out: list[Claim] = []
         for c in self._log:
             if tag    is not None and c.tag    != tag:    continue
             if kind   is not None and c.kind   != kind:   continue
             if source is not None and c.source != source: continue
             out.append(c)
-        return out
+        return deepcopy(out)
 
     # ── lifecycle ─────────────────────────────────────────────
 

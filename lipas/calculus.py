@@ -18,16 +18,17 @@ Derived operations
 Algebraic guarantees
     Each field is resolved by a registered MergeStrategy.
 
-    *Semilattice* strategies (max, min, union, keep, counter_max,
+    *Semilattice* strategies (max, min, union, counter_max,
     expectations_merge) satisfy idempotency, commutativity, and
     associativity.
 
-    *Monoidal* strategies (append) satisfy associativity and
-    monotonicity — the output is ≥ both inputs in information
-    content — but duplicate folds are not harmless.
+    *Ordered* strategies (keep, last_write, append, belief_adaptive)
+    deliberately depend on fold order. Append is associative but duplicate
+    folds are not harmless; keep/last_write are idempotent assignments but
+    are not commutative.
 
-    Both kinds uphold Theorem 1 (belief monotonicity).
-    Semilattice fields additionally tolerate re-delivery.
+    ClaimStore prevents duplicate logical claim ids before merge. Semilattice
+    fields additionally tolerate reordering; ordered fields do not.
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -105,9 +106,9 @@ class StrategyRegistry:
     Instance-based so that different agents (or tests) can maintain
     independent strategy tables without interference.
 
-    The built-in default for unregistered fields is ``strategy_keep``
-    (first-write-wins), which is idempotent and commutative — hence
-    safe for semilattice reasoning.  Call ``set_default()`` to override.
+    The built-in default for unregistered fields is ``strategy_last_write``.
+    This makes ``merged`` a deterministic current-value projection in fold
+    order, not a commutative semilattice. Call ``set_default()`` to override.
 
     Hashability constraint. Strategy implementations MUST NOT hash
     field values (no set(), frozenset(), dict.fromkeys(), no
@@ -201,10 +202,10 @@ def strategy_append(a: Any, b: Any, ctx: "BeliefContext") -> Any:
 def strategy_keep(a: Any, b: Any, ctx: "BeliefContext") -> Any:
     """
     First-write-wins: once a field is set, it is never overwritten.
-    *Semilattice.*
+    *Ordered, idempotent assignment; not a semilattice.*
 
     Algebraic Properties:
-    - Idempotent and Associative, But Not Commutative.
+    - Idempotent and associative, but not commutative.
     - Monotonic: Information transitions from 'None' to 'Value' and then locks.
     - Order-Dependent (Not Commutative): In a logical sense, as it assumes any
       non-None value is the 'Final Truth' for this specific claim chain.
@@ -351,9 +352,10 @@ class Claim:
         priority    Numeric.  When two non-⊥ claims merge, the
                     higher-priority claim's tag wins.
 
-    All framework concepts — observations, commitments, effects,
-    outcomes, traces, fail records, expectations — are represented
-    as Claims and processed through the same ⊕ operation.
+    Runtime evidence concepts — observations, commitments, effects,
+    outcomes, traces, fail records, expectations — are represented as
+    Claims and processed through the same ⊕ operation. Mutable execution
+    control state such as leases and checkpoints has a separate authority.
     """
 
     tag: str
@@ -378,6 +380,7 @@ class Claim:
             fields={**self.fields, key: value},
             kind=self.kind,
             priority=self.priority,
+            source=self.source,
             claim_id=claim_id,
         )
 
@@ -388,6 +391,7 @@ class Claim:
             fields={**self.fields, **updates},
             kind=self.kind,
             priority=self.priority,
+            source=self.source,
             claim_id=claim_id,
         )
 
@@ -448,8 +452,8 @@ def merge(
 
     Core Logic:
     1. Identity: If either claim is BOTTOM (⊥), the other is returned as-is.
-    2. Monotonicity: Fields existing in only one claim are preserved. Information
-       never disappears; it only accumulates or transforms.
+    2. Field preservation: fields existing in only one claim are preserved.
+       Conflicting values follow their registered strategy and may be replaced.
     3. Conflict Resolution: When a field exists in both, the 'Law Book' (registry)
        determines the fusion method, optionally consulting 'ctx'.
     4. Metadata Synthesis:
@@ -463,11 +467,9 @@ def merge(
     a product lattice. This ensures the merge is commutative and idempotent,
     making it resilient to out-of-order or duplicate messages.
 
-    However, if monoidal (e.g., append) or adaptive strategies are used, the
-    system loses these guarantees: order matters and exactly-once delivery may be
-    required to prevent data corruption or unintended duplication. Even in these
-    cases, ⊕ remains monotone, ensuring that information only accumulates and
-    never vanishes.
+    However, if ordered strategies (keep, last_write, append, adaptive) are
+    used, order matters. ClaimStore's stable-id admission prevents duplicate
+    logical events; it does not make an ordered projection commutative.
     """
     if c1.tag == "⊥":
         return c2

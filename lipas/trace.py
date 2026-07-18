@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 
 from .calculus import Claim
 
@@ -13,12 +14,12 @@ __all__ = ["TraceEvent", "iter_trace", "render_trace", "write_jsonl"]
 
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
-        return {k: _jsonable(v) for k, v in asdict(value).items()}
+        return {k: _jsonable(v) for k, v in asdict(cast(Any, value)).items()}
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_jsonable(v) for v in value]
-    if hasattr(value, "value") and isinstance(getattr(value, "value"), str):
+    if isinstance(value, Enum) and isinstance(value.value, str):
         return value.value
     try:
         json.dumps(value)

@@ -419,6 +419,8 @@ class ToolReplayer:
         self,
         tool: Tool,
         arguments: Mapping[str, Any],
+        *,
+        exclude_effect_ids: frozenset[str] = frozenset(),
     ) -> Optional[EffectNode]:
         """Find a recorded tool effect matching (tool.name, arguments).
 
@@ -430,6 +432,8 @@ class ToolReplayer:
         reuse the match algorithm without re-implementing it.
         """
         for node in self._iter_visible_tool_nodes():
+            if node.effect_id in exclude_effect_ids:
+                continue
             intent = node.intent
             if intent is None:
                 continue
@@ -444,6 +448,8 @@ class ToolReplayer:
         self,
         tool: Tool,
         arguments: Mapping[str, Any],
+        *,
+        exclude_effect_ids: frozenset[str] = frozenset(),
     ) -> ReplayDecision:
         """Apply the replay decision matrix as a pure function.
 
@@ -451,7 +457,11 @@ class ToolReplayer:
         operation; ToolHarness is the canonical consumer.
         """
         declared = tool.side_effect
-        recorded = self.lookup(tool, arguments)
+        recorded = self.lookup(
+            tool,
+            arguments,
+            exclude_effect_ids=exclude_effect_ids,
+        )
 
         # Class-mismatch resolution (only when there is a recording).
         # Compares *declared* classes between recorded run and current

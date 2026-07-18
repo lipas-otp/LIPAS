@@ -67,6 +67,7 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, AsyncIterator, ClassVar
 
@@ -101,7 +102,7 @@ _DEFAULT_TIMEOUT_S = 500.0
 class OllamaAdapter:
     """Ollama HTTP adapter — implements LLMAdapter."""
 
-    name: ClassVar[str] = "ollama"
+    name: str = "ollama"
 
     def __init__(
         self,
@@ -126,10 +127,10 @@ class OllamaAdapter:
         self, request: Request,
     ) -> AsyncIterator[StreamEvent]:
         """Single-shot under the hood; yields exactly one Done."""
-        body = self._build_body(request)
-
         try:
+            body = self._build_body(request)
             payload = await self._post_chat(body)
+            reply = self._reply_from_payload(request, payload)
         except asyncio.CancelledError:
             raise
         except httpx.HTTPStatusError as exc:
@@ -146,7 +147,7 @@ class OllamaAdapter:
             ))
             return
 
-        yield Done(reply=self._reply_from_payload(request, payload))
+        yield Done(reply=reply)
 
     # ── LLMAdapter.estimate_cost ───────────────────────────────
 
@@ -195,7 +196,7 @@ class OllamaAdapter:
         if request.system:
             messages.append({"role": "system", "content": request.system})
         for msg in request.messages:
-            messages.append(_normalize_message(msg))
+            messages.extend(_normalize_messages(msg))
 
         options: dict[str, Any] = {
             "num_predict": request.max_tokens,
@@ -248,24 +249,39 @@ class OllamaAdapter:
 
         # done_reason → stop_reason, with tool_use override.
         sr_raw = payload.get("done_reason") or "stop"
+        usage = Usage(
+            input=int(payload.get("prompt_eval_count") or 0),
+            output=int(payload.get("eval_count") or 0),
+        )
+        model = payload.get("model") or request.model
         if tool_calls:
             stop_reason: StopReason = "tool_use"
         else:
-            stop_reason = _DONE_REASON_MAP.get(sr_raw, "end_turn")
             if sr_raw not in _DONE_REASON_MAP:
                 logger.warning(
                     "ollama adapter: unknown done_reason=%r, "
-                    "coerced to 'end_turn'.", sr_raw,
+                    "surfaced as a terminal provider error.", sr_raw,
                 )
+                return Reply(
+                    content=tuple(blocks),
+                    usage=usage,
+                    stop_reason="error",
+                    model=model,
+                    error_detail={
+                        "type": "provider_error",
+                        "provider_error": {
+                            "type": "unknown_done_reason",
+                            "done_reason": sr_raw,
+                        },
+                    },
+                )
+            stop_reason = _DONE_REASON_MAP[sr_raw]
 
         return Reply(
             content=tuple(blocks),
-            usage=Usage(
-                input=int(payload.get("prompt_eval_count") or 0),
-                output=int(payload.get("eval_count") or 0),
-            ),
+            usage=usage,
             stop_reason=stop_reason,
-            model=payload.get("model") or request.model,
+            model=model,
             error_detail=None,
         )
 
@@ -410,17 +426,9 @@ def _ollama_tool_call_to_block(tc: Any) -> dict[str, Any] | None:
          "function": {"name": "add",
                       "arguments": {"a": 1, "b": 2}}}
 
-    NOTE on IDs: we always synthesize our own ``call_<12-hex>`` id and
-    discard whatever Ollama returned. Reasons:
-      - Ollama's id format varies by model (gemma4: ``call_wxh6n020``,
-        8 alphanumeric; others: random other shapes). None of them
-        match lipas's effect schema regex ``^(call|tool)_[0-9a-f]{12}$``.
-      - The id only needs to be unique within the surrounding Reply
-        for tool_use ↔ tool_result pairing; it has no cross-turn
-        persistence in Ollama's protocol.
-      - Trying to "fix up" the upstream id (pad / hash / etc.) would
-        bake a model-specific quirk into the adapter; synthesizing is
-        cleaner and uniform across models.
+    Provider ids are correlation ids, distinct from LIPAS Effect ids. Preserve
+    a non-empty Ollama id so tool results round-trip faithfully; synthesize one
+    only for models that omit it.
     """
     if not isinstance(tc, dict):
         logger.warning(
@@ -440,28 +448,26 @@ def _ollama_tool_call_to_block(tc: Any) -> dict[str, Any] | None:
         import json
         try:
             args = json.loads(args) if args else {}
-        except json.JSONDecodeError:
-            logger.warning(
-                "ollama adapter: tool_call arguments not valid JSON; "
-                "passing through as raw string under '_raw'."
-            )
-            args = {"_raw": args}
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Ollama returned tool_call arguments that are not valid JSON",
+            ) from exc
     elif args is None:
         args = {}
+    if not isinstance(args, Mapping):
+        raise ValueError("Ollama returned non-object tool_call arguments")
 
-    # Always synthesize — Ollama's id format is model-dependent and
-    # does not satisfy lipas's effect schema. See docstring.
-    call_id = f"call_{uuid.uuid4().hex[:12]}"
+    call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
 
     return {
         "type":  "tool_use",
         "id":    call_id,
         "name":  name,
-        "input": args,
+        "input": dict(args),
     }
 
 
-def _normalize_message(msg: Any) -> dict[str, Any]:
+def _normalize_messages(msg: Any) -> list[dict[str, Any]]:
     """Coerce a Message-or-dict into Ollama's wire shape.
 
     For tool-flow messages we preserve structure where Ollama
@@ -479,7 +485,7 @@ def _normalize_message(msg: Any) -> dict[str, Any]:
         content = getattr(msg, "content", "")
 
     if isinstance(content, str):
-        return {"role": role, "content": content}
+        return [{"role": role, "content": content}]
 
     if isinstance(content, (list, tuple)):
         # Split into text parts, tool_use (assistant), tool_result (user).
@@ -508,28 +514,26 @@ def _normalize_message(msg: Any) -> dict[str, Any]:
                         c = "\n".join(_block_to_text(x) for x in c)
                     tool_results.append({
                         "role":         "tool",
-                        "tool_call_id": b.get("tool_use_id", ""),
+                        "tool_call_id": (
+                            b.get("tool_use_id")
+                            or b.get("tool_call_id")
+                            or ""
+                        ),
                         "content":      c if isinstance(c, str) else str(c),
                     })
                     continue
             text_parts.append(_block_to_text(b))
 
-        # tool_result blocks promote to standalone role=tool messages
-        # — but _normalize_message returns one dict, so the caller
-        # (which iterates messages 1:1) won't see them. Handle this
-        # by emitting a list-flatten helper instead. For backward
-        # compat we still return one dict here; tool_result-only
-        # user messages get serialised as text.
+        # Tool results are standalone role=tool messages. One normalized user
+        # turn may therefore expand to several Ollama wire messages.
         if tool_results and role == "user":
-            # Concatenate tool_result content into a synthesised
-            # user-text message — Ollama accepts role=tool but only
-            # immediately after a tool-calling assistant turn, and
-            # mis-ordering breaks gemma4. The flattened text path is
-            # safer for v0.0.3.
-            joined = "\n".join(r["content"] for r in tool_results)
+            out_messages = list(tool_results)
             if text_parts:
-                joined = "\n".join([*text_parts, joined])
-            return {"role": "user", "content": joined}
+                out_messages.append({
+                    "role": "user",
+                    "content": "\n".join(text_parts),
+                })
+            return out_messages
 
         out: dict[str, Any] = {
             "role": role,
@@ -537,13 +541,13 @@ def _normalize_message(msg: Any) -> dict[str, Any]:
         }
         if tool_calls and role == "assistant":
             out["tool_calls"] = tool_calls
-        return out
+        return [out]
 
     logger.warning(
         "ollama adapter: unrecognised message content type %r; "
         "stringified.", type(content).__name__,
     )
-    return {"role": role, "content": str(content)}
+    return [{"role": role, "content": str(content)}]
 
 
 def _block_to_text(block: Any) -> str:

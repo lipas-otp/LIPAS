@@ -6,6 +6,7 @@ operation becomes ``uncertain`` and cannot be resent until reconciliation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -21,18 +22,21 @@ TAG_OPERATION_PREPARED = "operation_prepared"
 TAG_OPERATION_UNCERTAIN = "operation_uncertain"
 TAG_OPERATION_SUCCEEDED = "operation_succeeded"
 TAG_OPERATION_FAILED = "operation_failed"
+OPERATION_SCHEMA_VERSION = 1
 
 __all__ = [
     "Operation", "OperationJournal", "IdempotentProvider", "PendingOperation",
     "OperationStateError",
+    "OperationSchemaVersionMismatch", "OPERATION_SCHEMA_VERSION",
     "TAG_OPERATION_PREPARED", "TAG_OPERATION_UNCERTAIN",
     "TAG_OPERATION_SUCCEEDED", "TAG_OPERATION_FAILED",
 ]
+T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
 
 
-class IdempotentProvider(Protocol):
-    def __call__(self, *, idempotency_key: str) -> T: ...
+class IdempotentProvider(Protocol[T_co]):
+    def __call__(self, *, idempotency_key: str) -> T_co: ...
 
 
 class PendingOperation(RuntimeError):
@@ -41,6 +45,10 @@ class PendingOperation(RuntimeError):
 
 class OperationStateError(RuntimeError):
     """A terminal operation cannot be rewritten to a different outcome."""
+
+
+class OperationSchemaVersionMismatch(OperationStateError):
+    """An operation journal uses an incompatible durable schema."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,21 +72,77 @@ class OperationJournal:
     """
     def __init__(self, path: str | Path = ":memory:", *, rowset: RowSet | None = None) -> None:
         ensure_sqlite_parent(path)
+        self._path = path
         self._conn = sqlite3.connect(path)
-        self._conn.execute("""CREATE TABLE IF NOT EXISTS operations (
-            key TEXT PRIMARY KEY, kind TEXT NOT NULL, request_json TEXT NOT NULL,
-            state TEXT NOT NULL CHECK(state IN ('pending','succeeded','failed','uncertain')),
-            result_json TEXT, provider_reference TEXT, error_json TEXT,
-            effect_id TEXT,
-            created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
-        # Existing journals predate effect linkage. SQLite's ALTER is safe and
-        # makes the audit feature an additive on-disk migration.
-        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(operations)")}
-        if "effect_id" not in columns:
-            self._conn.execute("ALTER TABLE operations ADD COLUMN effect_id TEXT")
-        self._conn.commit()
         self.rowset = rowset
         self._closed = False
+        self._audit_cursor = 0
+        try:
+            self._init_schema()
+            with self._conn:
+                self._seed_legacy_audit_events()
+            self.repair_audit()
+        except BaseException:
+            self._conn.close()
+            self._closed = True
+            raise
+
+    def _init_schema(self) -> None:
+        had_schema = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'",
+        ).fetchone() is not None
+        with self._conn:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS operation_meta "
+                "(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+            )
+        row = self._conn.execute(
+            "SELECT value FROM operation_meta WHERE key='schema_version'",
+        ).fetchone()
+        if row is None:
+            with self._conn:
+                self._conn.executemany(
+                    "INSERT INTO operation_meta(key,value) VALUES(?,?)",
+                    (
+                        ("schema_version", str(OPERATION_SCHEMA_VERSION)),
+                        ("created_at", repr(time.time())),
+                        ("adopted_legacy_schema", "1" if had_schema else "0"),
+                    ),
+                )
+        else:
+            try:
+                existing = int(row[0])
+            except (TypeError, ValueError) as exc:
+                raise OperationSchemaVersionMismatch(
+                    f"operation schema version is not an int: {row[0]!r}",
+                ) from exc
+            if existing != OPERATION_SCHEMA_VERSION:
+                raise OperationSchemaVersionMismatch(
+                    f"operation journal at {self._path!r} is schema version "
+                    f"{existing}; this LIPAS release supports "
+                    f"{OPERATION_SCHEMA_VERSION}. No automatic migration is available.",
+                )
+        with self._conn:
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS operations (
+                key TEXT PRIMARY KEY, kind TEXT NOT NULL, request_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending','succeeded','failed','uncertain')),
+                result_json TEXT, provider_reference TEXT, error_json TEXT,
+                effect_id TEXT,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS operation_audit_events (
+                claim_id TEXT PRIMARY KEY, tag TEXT NOT NULL,
+                fields_json TEXT NOT NULL, created_at REAL NOT NULL)""")
+            # Pre-0.10 development journals predate Effect linkage.
+            columns = {
+                column[1]
+                for column in self._conn.execute("PRAGMA table_info(operations)")
+            }
+            if "effect_id" not in columns:
+                self._conn.execute("ALTER TABLE operations ADD COLUMN effect_id TEXT")
+
+    @property
+    def schema_version(self) -> int:
+        return OPERATION_SCHEMA_VERSION
 
     def close(self) -> None:
         """Close the journal connection. Safe to call more than once."""
@@ -95,22 +159,36 @@ class OperationJournal:
         return Operation(row[0], row[1], json.loads(row[2]), row[3], json.loads(row[4]) if row[4] else None, row[5], json.loads(row[6]) if row[6] else None, row[7])
 
     def prepare(self, *, key: str, kind: str, request: Mapping[str, Any], effect_id: str | None = None) -> Operation:
-        if not key or not kind: raise ValueError("idempotency key and operation kind must be non-empty")
+        if not isinstance(key, str) or not key:
+            raise ValueError("idempotency key must be a non-empty string")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("operation kind must be a non-empty string")
+        if not isinstance(request, Mapping):
+            raise TypeError("operation request must be a mapping")
+        if effect_id is not None and (not isinstance(effect_id, str) or not effect_id):
+            raise ValueError("effect_id must be a non-empty string or None")
         payload = json.dumps(dict(request), sort_keys=True, separators=(",", ":"))
         now = time.time()
         try:
             with self._conn:
                 self._conn.execute("INSERT INTO operations(key,kind,request_json,state,effect_id,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?)", (key, kind, payload, effect_id, now, now))
+                self._record_audit_event(
+                    TAG_OPERATION_PREPARED,
+                    Operation(key, kind, dict(request), "pending", effect_id=effect_id),
+                )
         except sqlite3.IntegrityError:
             existing = self.get(key)
             assert existing is not None
             if existing.kind != kind or dict(existing.request) != dict(request) or (effect_id is not None and existing.effect_id != effect_id):
-                raise ValueError("idempotency key was reused for a different operation")
+                raise ValueError(
+                    "idempotency key was reused for a different operation",
+                ) from None
+            self.repair_audit()
             return existing
-        operation = self.get(key)
-        assert operation is not None
-        self._audit(TAG_OPERATION_PREPARED, operation)
-        return operation
+        settled_operation = self.get(key)
+        assert settled_operation is not None
+        self.repair_audit()
+        return settled_operation
 
     def _transition(self, key: str, state: str, *, result: Any = None, provider_reference: str | None = None, error: Mapping[str, Any] | None = None) -> Operation:
         """Move a non-terminal operation once, without rewriting history.
@@ -132,6 +210,7 @@ class OperationJournal:
             and (dict(current.error) if current.error else None) == new_error
         )
         if same_outcome:
+            self.repair_audit()
             return current
         if current.state in {"succeeded", "failed"}:
             raise OperationStateError(
@@ -158,6 +237,25 @@ class OperationJournal:
                     *allowed_from,
                 ),
             )
+            if cursor.rowcount == 1:
+                transitioned_operation = Operation(
+                    current.key,
+                    current.kind,
+                    current.request,
+                    state,
+                    result,
+                    provider_reference,
+                    new_error,
+                    current.effect_id,
+                )
+                self._record_audit_event(
+                    {
+                        "succeeded": TAG_OPERATION_SUCCEEDED,
+                        "failed": TAG_OPERATION_FAILED,
+                        "uncertain": TAG_OPERATION_UNCERTAIN,
+                    }.get(state, TAG_OPERATION_PREPARED),
+                    transitioned_operation,
+                )
         if cursor.rowcount != 1:
             latest = self.get(key)
             assert latest is not None
@@ -168,15 +266,15 @@ class OperationJournal:
                 and (dict(latest.error) if latest.error else None) == new_error
             )
             if latest_matches:
+                self.repair_audit()
                 return latest
             raise OperationStateError(
                 f"operation {key!r} changed concurrently; its current state is {latest.state!r}"
             )
-        operation = self.get(key)
-        assert operation is not None
-        self._audit({"succeeded": TAG_OPERATION_SUCCEEDED, "failed": TAG_OPERATION_FAILED,
-                     "uncertain": TAG_OPERATION_UNCERTAIN}.get(state, TAG_OPERATION_PREPARED), operation)
-        return operation
+        committed_operation = self.get(key)
+        assert committed_operation is not None
+        self.repair_audit()
+        return committed_operation
 
     def settle(self, key: str, *, result: Any, provider_reference: str | None = None) -> Operation:
         return self._transition(key, "succeeded", result=result, provider_reference=provider_reference)
@@ -221,6 +319,13 @@ class OperationJournal:
             # A concurrent reconciler/settler won the race. Its durable state
             # is more authoritative than this process's local exception.
             pass
+        except BaseException:
+            # A mirrored Claim is deliberately a second transaction. If that
+            # write failed after the uncertain transition committed, preserve
+            # the provider exception; the durable outbox will repair the Claim.
+            latest = self.get(key)
+            if latest is None or latest.state != "uncertain":
+                raise
 
     def pending(self) -> tuple[Operation, ...]:
         return tuple(op for (key,) in self._conn.execute("SELECT key FROM operations WHERE state IN ('pending','uncertain') ORDER BY created_at") if (op := self.get(key)) is not None)
@@ -237,23 +342,122 @@ class OperationJournal:
         # Reconciliation is idempotent after a known outcome.  Do not invoke a
         # possibly stale provider lookup or rewrite a terminal journal row.
         if op.state in {"succeeded", "failed"}:
+            self.repair_audit()
             return op
         found, result, reference = lookup(key)
         if found: return self.settle(key, result=result, provider_reference=reference)
         return self.fail(key, error={"type": "provider_not_found", "message": "reconciliation found no provider operation"})
 
-    def _audit(self, tag: str, operation: Operation) -> None:
+    @staticmethod
+    def _audit_claim_id(key: str, tag: str) -> str:
+        identity = f"operation\0{key}\0{tag}".encode("utf-8")
+        return f"operation_audit_{hashlib.sha256(identity).hexdigest()}"
+
+    @staticmethod
+    def _audit_fields(operation: Operation) -> dict[str, Any]:
+        return {
+            "operation_key": operation.key,
+            "operation_kind": operation.kind,
+            "state": operation.state,
+            "effect_id": operation.effect_id,
+            "provider_reference": operation.provider_reference,
+            "error": dict(operation.error) if operation.error else None,
+        }
+
+    def _record_audit_event(self, tag: str, operation: Operation) -> None:
+        """Record a Claim-shaped event inside the journal transaction."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO operation_audit_events"
+            "(claim_id,tag,fields_json,created_at) VALUES(?,?,?,?)",
+            (
+                self._audit_claim_id(operation.key, tag),
+                tag,
+                json.dumps(
+                    self._audit_fields(operation),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                time.time(),
+            ),
+        )
+
+    def _seed_legacy_audit_events(self) -> None:
+        """Make pre-outbox journals repairable from their current truth.
+
+        A legacy terminal row cannot reveal whether it was once uncertain, so
+        migration reconstructs the prepared event and the current state only.
+        New transitions retain their complete event sequence in the outbox.
+        """
+        for (key,) in self._conn.execute(
+            "SELECT key FROM operations ORDER BY created_at,key",
+        ):
+            operation = self.get(key)
+            assert operation is not None
+            prepared = Operation(
+                operation.key,
+                operation.kind,
+                operation.request,
+                "pending",
+                effect_id=operation.effect_id,
+            )
+            self._record_audit_event(TAG_OPERATION_PREPARED, prepared)
+            if operation.state != "pending":
+                self._record_audit_event(
+                    {
+                        "succeeded": TAG_OPERATION_SUCCEEDED,
+                        "failed": TAG_OPERATION_FAILED,
+                        "uncertain": TAG_OPERATION_UNCERTAIN,
+                    }[operation.state],
+                    operation,
+                )
+
+    def repair_audit(self) -> int:
+        """Idempotently mirror every durable outbox event into Claims.
+
+        The journal database remains authoritative. A failure here never rolls
+        back an already committed operation transition; reopening or calling
+        this method again resumes from the stable Claim ids.
+        """
         if self.rowset is None:
-            return
-        self.rowset.fold(Claim(
-            tag=tag,
-            fields={
-                "operation_key": operation.key,
-                "operation_kind": operation.kind,
-                "state": operation.state,
-                "effect_id": operation.effect_id,
-                "provider_reference": operation.provider_reference,
-                "error": dict(operation.error) if operation.error else None,
-            },
-            source="operations.journal",
-        ))
+            return 0
+        events = self._conn.execute(
+            "SELECT rowid,claim_id,tag,fields_json "
+            "FROM operation_audit_events WHERE rowid>? ORDER BY rowid",
+            (self._audit_cursor,),
+        ).fetchall()
+        if not events:
+            return 0
+        existing = list(self.rowset.store)
+        known = {claim.claim_id for claim in existing}
+        mirrored_payloads = {
+            (
+                claim.tag,
+                json.dumps(
+                    claim.fields, sort_keys=True, separators=(",", ":"),
+                ),
+            )
+            for claim in existing
+            if claim.source == "operations.journal"
+        }
+        repaired = 0
+        for rowid, claim_id, tag, fields_json in events:
+            claim = Claim(
+                tag=tag,
+                fields=json.loads(fields_json),
+                source="operations.journal",
+                claim_id=claim_id,
+            )
+            signature = (tag, fields_json)
+            if claim_id not in known and signature in mirrored_payloads:
+                # Journals created before the outbox used random Claim ids.
+                # Treat an exact legacy mirror as present instead of duplicating
+                # its logical event during migration.
+                self._audit_cursor = rowid
+                continue
+            self.rowset.fold(claim)
+            if claim_id not in known:
+                repaired += 1
+                known.add(claim_id)
+                mirrored_payloads.add(signature)
+            self._audit_cursor = rowid
+        return repaired

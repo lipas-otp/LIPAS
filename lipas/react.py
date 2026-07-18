@@ -31,13 +31,14 @@ file.  Unchanged.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from .adapter import Reply, Request
 from .behaviour import (
-    AgentBehaviour, AgentState, FinalResult, TerminationReason,
+    AgentState, FinalResult, TerminationReason,
 )
 from .calculus import Claim
 from .harness import LLMHarness
@@ -155,6 +156,20 @@ class ReActAgent:
             tool_calls = self._extract_tool_calls(reply)
 
             if not tool_calls:
+                if reply.stop_reason == "tool_use":
+                    return FinalResult(
+                        text="",
+                        state=state,
+                        stop_reason=TerminationReason.ERROR,
+                        error={
+                            "type": "malformed_tool_use",
+                            "message": (
+                                "model stopped for tool_use without a valid "
+                                "tool_use block"
+                            ),
+                        },
+                        metadata={"iterations": state.iteration},
+                    )
                 final_text = self._extract_text(reply)
                 next_state = state.with_messages(
                     self._message_from_reply(reply)
@@ -164,13 +179,17 @@ class ReActAgent:
                     tool_calls=(), tool_results=(),
                 )
                 logger.info(
-                    "react: natural stop at iteration %d",
-                    next_state.iteration,
+                    "react: terminal model stop=%s at iteration %d",
+                    reply.stop_reason, next_state.iteration,
                 )
                 result = FinalResult(
                     text=final_text,
                     state=next_state,
-                    stop_reason=TerminationReason.NATURAL_STOP,
+                    stop_reason=(
+                        TerminationReason.MAX_TOKENS
+                        if reply.stop_reason == "max_tokens"
+                        else TerminationReason.NATURAL_STOP
+                    ),
                     metadata={"iterations": next_state.iteration},
                 )
                 return self._maybe_supervisor_tick(next_state) or result
@@ -181,7 +200,8 @@ class ReActAgent:
                 result_dict = await self.tool_harness.call(
                     tool_name=tc["name"],
                     arguments=dict(tc.get("input") or {}),
-                    effect_id=tc["id"],
+                    effect_id=f"tool_{uuid.uuid4().hex[:12]}",
+                    tool_use_id=str(tc["id"]),
                     caused_by=caused_by,
                 )
                 tool_results.append(result_dict)
@@ -197,16 +217,21 @@ class ReActAgent:
                 tool_calls=tool_calls, tool_results=tool_results,
             )
 
-            # 6. Supervisor tick (B3) — runs only on the looping path.
-            #    Natural-stop / error / max-iterations paths do not tick;
-            #    those terminations are already final.
+            # 6. Supervisor tick (B3). Terminal reply paths above also tick
+            #    where an EffectView exists, allowing policy to replace the
+            #    behaviour's terminal result with an explicit recommendation.
             early = self._maybe_supervisor_tick(state)
             if early is not None:
                 return early
 
     # ── supervisor (B3) ───────────────────────────────────────
 
-    def _maybe_supervisor_tick(self, state: AgentState) -> FinalResult | None:
+    def _maybe_supervisor_tick(
+        self,
+        state: AgentState,
+        *,
+        claim_id_prefix: str | None = None,
+    ) -> FinalResult | None:
         if self.supervisor is None:
             return None
         eff_row = next(
@@ -226,7 +251,9 @@ class ReActAgent:
             return None
         view = eff_row.project(self.rowset.store)
         ctx  = self.rowset.store.ctx
-        emitted = self.supervisor.tick(view, ctx)
+        emitted = self.supervisor.tick(
+            view, ctx, claim_id_prefix=claim_id_prefix,
+        )
         return self._handle_supervisor_outcome(emitted, state)
 
     @staticmethod
@@ -292,7 +319,16 @@ class ReActAgent:
                 continue
             if block.get("type") != "tool_use":
                 continue
-            if "id" not in block or "name" not in block:
+            tool_id = block.get("id")
+            tool_name = block.get("name")
+            tool_input = block.get("input")
+            if (
+                not isinstance(tool_id, str)
+                or not tool_id
+                or not isinstance(tool_name, str)
+                or not tool_name
+                or (tool_input is not None and not isinstance(tool_input, Mapping))
+            ):
                 continue
             out.append(block)
         return tuple(out)
@@ -329,6 +365,7 @@ class ReActAgent:
         reply: Reply,
         tool_calls:   Sequence[Mapping[str, Any]],
         tool_results: Sequence[Mapping[str, Any]],
+        claim_id_prefix: str | None = None,
     ) -> None:
         """Fold this iteration into HistoryRow.
 
@@ -353,17 +390,27 @@ class ReActAgent:
             "stop_reason": getattr(reply, "stop_reason", None),
         }
 
+        observation_claim_id = (
+            f"{claim_id_prefix}:observation"
+            if claim_id_prefix is not None else None
+        )
         self.rowset.fold(Claim(
             tag="observation",
             fields={"_history": [triple]},
             source=f"react.iteration[{state.iteration}]",
+            claim_id=observation_claim_id or uuid.uuid4().hex[:8],
         ))
 
-        for tc, tr in zip(tool_calls, tool_results):
+        for index, (tc, tr) in enumerate(zip(tool_calls, tool_results)):
             if tr.get("is_error"):
                 tool_name = tc.get("name", "?")
+                outcome_claim_id = (
+                    f"{claim_id_prefix}:tool-error:{index}"
+                    if claim_id_prefix is not None else None
+                )
                 self.rowset.fold(Claim(
                     tag="outcome",
                     fields={"_fail_counts": {tool_name: 1}},
                     source=f"react.tool_error[{state.iteration}]",
+                    claim_id=outcome_claim_id or uuid.uuid4().hex[:8],
                 ))

@@ -1,4 +1,6 @@
 """Provider-neutral adapter contract and optional provider adapters."""
+from typing import TYPE_CHECKING
+
 from .errors import ErrorKind
 from .protocol import LLMAdapter, StreamProtocolError, complete
 from .types import (
@@ -7,6 +9,11 @@ from .types import (
     Thinking, ToolResultBlock, ToolSpec, ToolUseBlock, ToolUseDelta,
     UnknownModelError, Usage,
 )
+
+if TYPE_CHECKING:
+    from .anthropic import AnthropicAdapter
+    from .ollama import OllamaAdapter
+    from .openai import OpenAIResponsesAdapter
 
 __all__ = [
     # usage / errors

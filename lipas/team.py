@@ -10,7 +10,7 @@ import asyncio
 import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, cast
 
 from .orchestration import AgentOrchestrator, Mailbox
 from .rows import RowSet
@@ -69,7 +69,10 @@ class Team:
 
         is_async_callable = (
             inspect.iscoroutinefunction(handler)
-            or inspect.iscoroutinefunction(getattr(handler, "__call__", None))
+            or (
+                callable(handler)
+                and inspect.iscoroutinefunction(type(handler).__call__)
+            )
         )
         if not name or not callable(handler) or not (isinstance(handler, Agent) or is_async_callable):
             raise TypeError("team.add(name, handler) requires a non-empty name and async callable")
@@ -84,7 +87,8 @@ class Team:
                 return await handler.run(
                     prompt, state=AgentState(metadata={"caused_by": message.id}),
                 )
-            return await handler(prompt)
+            async_handler = cast(Callable[[Any], Awaitable[Any]], handler)
+            return await async_handler(prompt)
 
         self._orchestrator.register(name, receive)
         return self
