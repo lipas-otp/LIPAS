@@ -30,6 +30,7 @@ file.  Unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -43,6 +44,7 @@ from .behaviour import (
 from .calculus import Claim
 from .harness import LLMHarness
 from .rows import RowSet
+from .rows.capability import CapabilityRow
 from .rows.effect import EffectRow
 from .supervisor import (
     F_SUP_PAYLOAD,
@@ -52,7 +54,7 @@ from .supervisor import (
     TAG_SUPERVISOR_TERMINATE,
 )
 from .tool_harness import ToolHarness
-from .tools import ToolRegistry
+from .tools import SideEffectClass, ToolNotFoundError, ToolRegistry
 
 
 __all__ = ["ReActAgent"]
@@ -106,12 +108,21 @@ class ReActAgent:
     rowset:           RowSet
     request_template: Request
     max_iterations:   int = 10
+    max_parallel_tools: int = 4
     supervisor:       Supervisor | None = None
     name:             str = "react"
 
     _tool_descriptors: tuple[Any, ...] | None = field(
         default=None, init=False, repr=False,
     )
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_parallel_tools, bool)
+            or not isinstance(self.max_parallel_tools, int)
+            or self.max_parallel_tools < 1
+        ):
+            raise ValueError("max_parallel_tools must be a positive integer")
 
     # ── public API ─────────────────────────────────────────────
 
@@ -194,17 +205,29 @@ class ReActAgent:
                 )
                 return self._maybe_supervisor_tick(next_state) or result
 
-            # 4. Act — dispatch via ToolHarness, one call at a time.
+            # 4. Act — independent safe reads may run concurrently. Writes,
+            # guarded/replayed calls, and budgeted calls remain serial.
             tool_results: list[Mapping[str, Any]] = []
-            for tc in tool_calls:
-                result_dict = await self.tool_harness.call(
-                    tool_name=tc["name"],
-                    arguments=dict(tc.get("input") or {}),
-                    effect_id=f"tool_{uuid.uuid4().hex[:12]}",
-                    tool_use_id=str(tc["id"]),
-                    caused_by=caused_by,
+            tool_index = 0
+            while tool_index < len(tool_calls):
+                batch_size = self._parallel_tool_count(tool_calls, tool_index)
+                batch = tool_calls[tool_index:tool_index + batch_size]
+                calls = [
+                    self.tool_harness.call(
+                        tool_name=str(tc["name"]),
+                        arguments=dict(tc.get("input") or {}),
+                        effect_id=f"tool_{uuid.uuid4().hex[:12]}",
+                        tool_use_id=str(tc["id"]),
+                        caused_by=caused_by,
+                    )
+                    for tc in batch
+                ]
+                batch_results = (
+                    await asyncio.gather(*calls)
+                    if len(calls) > 1 else [await calls[0]]
                 )
-                tool_results.append(result_dict)
+                tool_results.extend(batch_results)
+                tool_index += batch_size
 
             # 5. Observe — append to messages, advance, fold.
             assistant_msg = self._message_from_reply(reply)
@@ -223,6 +246,52 @@ class ReActAgent:
             early = self._maybe_supervisor_tick(state)
             if early is not None:
                 return early
+
+    def _parallel_tool_count(
+        self,
+        tool_calls: Sequence[Mapping[str, Any]],
+        start: int,
+    ) -> int:
+        """Return a safe contiguous tool batch size, always at least one.
+
+        Concurrent preflight against hard budgets, stateful guards, or replay
+        cursors could admit work from a stale projection. Those configurations
+        therefore remain serial. Only PURE/READ_ONLY calls are eligible.
+        """
+        if self.max_parallel_tools == 1:
+            return 1
+        if (
+            self.tool_harness.guards
+            or self.tool_harness.tool_replayer is not None
+            or self.tool_harness.argument_resolver is not None
+            or self.tool_harness.result_sanitizer is not None
+        ):
+            return 1
+        capability = next(
+            (
+                row for row in self.rowset.rows
+                if isinstance(row, CapabilityRow)
+            ),
+            None,
+        )
+        if capability is not None and capability.budgets:
+            return 1
+
+        count = 0
+        stop = min(len(tool_calls), start + self.max_parallel_tools)
+        for index in range(start, stop):
+            call = tool_calls[index]
+            try:
+                tool = self.tools.get(str(call["name"]))
+            except ToolNotFoundError:
+                break
+            if tool.side_effect not in {
+                SideEffectClass.PURE,
+                SideEffectClass.READ_ONLY,
+            }:
+                break
+            count += 1
+        return max(1, count)
 
     # ── supervisor (B3) ───────────────────────────────────────
 

@@ -11,6 +11,7 @@ import pytest
 
 from lipas import (
     Agent,
+    DurablePhaseTimeout,
     ExecutionStateError,
     ExecutionStore,
     RunState,
@@ -39,6 +40,23 @@ class SimulatedCrash(BaseException):
     """Models process death: normal exception cleanup must not settle the run."""
 
 
+class SlowAdapter:
+    name = "slow"
+
+    async def estimate_cost(self, request):
+        from decimal import Decimal
+        from lipas.adapter import ResourceEstimate
+        return ResourceEstimate(
+            model=request.model, input_tokens=0,
+            max_output_tokens=request.max_tokens, max_cost_usd=Decimal("0"),
+        )
+
+    async def stream(self, request):
+        await asyncio.sleep(0.12)
+        from lipas.adapter import Done
+        yield Done(reply=_final_reply("slow but owned"))
+
+
 def _reply_with_tool() -> Reply:
     return Reply(
         content=(
@@ -47,6 +65,28 @@ def _reply_with_tool() -> Reply:
                 "id": "tool_aaaaaaaaaaaa",
                 "name": "write_note",
                 "input": {"text": "saved"},
+            },
+        ),
+        usage=Usage(input=2, output=1),
+        stop_reason="tool_use",
+        model="fake",
+    )
+
+
+def _reply_with_two_tools(tool_name: str) -> Reply:
+    return Reply(
+        content=(
+            {
+                "type": "tool_use",
+                "id": "tool_first",
+                "name": tool_name,
+                "input": {"value": "first"},
+            },
+            {
+                "type": "tool_use",
+                "id": "tool_second",
+                "name": tool_name,
+                "input": {"value": "second"},
             },
         ),
         usage=Usage(input=2, output=1),
@@ -73,6 +113,397 @@ def _reclaim(store: ExecutionStore, run_id: str):
     stale = store.get_run(run_id)
     assert stale is not None and stale.lease_expires is not None
     return store.claim_run(run_id, now=stale.lease_expires + 1)
+
+
+def test_automatic_heartbeat_keeps_a_slow_model_phase_owned(tmp_path):
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=SlowAdapter(), model="fake",
+            session_path=tmp_path / "claims.db",
+        )
+        try:
+            result = asyncio.run(agent.run_durable(
+                "wait safely", execution_store=store, run_id=run.id,
+                lease_seconds=0.06, heartbeat_interval_s=0.015,
+            ))
+        finally:
+            agent.close()
+        assert result.text == "slow but owned"
+        settled = store.get_run(run.id)
+        assert settled is not None and settled.state is RunState.COMPLETED
+        assert settled.attempt == 1
+
+
+def test_cancelling_runner_stops_its_heartbeat_task(tmp_path):
+    async def scenario(agent, store, run_id):
+        running = asyncio.create_task(agent.run_durable(
+            "cancel worker",
+            execution_store=store,
+            run_id=run_id,
+            lease_seconds=0.1,
+            heartbeat_interval_s=0.02,
+        ))
+        await asyncio.sleep(0.04)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        cancelled_at = store.get_run(run_id)
+        assert cancelled_at is not None
+        lease_expires = cancelled_at.lease_expires
+        await asyncio.sleep(0.05)
+        after = store.get_run(run_id)
+        assert after is not None
+        assert after.lease_expires == lease_expires
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=SlowAdapter(), model="fake",
+            session_path=tmp_path / "claims.db",
+        )
+        try:
+            asyncio.run(scenario(agent, store, run.id))
+        finally:
+            agent.close()
+
+
+def test_model_phase_timeout_is_typed_and_fails_the_run(tmp_path):
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=SlowAdapter(), model="fake",
+            session_path=tmp_path / "claims.db",
+        )
+        try:
+            with pytest.raises(DurablePhaseTimeout) as raised:
+                asyncio.run(agent.run_durable(
+                    "time out", execution_store=store, run_id=run.id,
+                    lease_seconds=1, heartbeat_interval_s=0.1,
+                    phase_timeout_s=0.01,
+                ))
+        finally:
+            agent.close()
+        assert raised.value.phase == "model"
+        failed = store.get_run(run.id)
+        assert failed is not None and failed.state is RunState.FAILED
+
+
+def test_automatic_heartbeat_continues_during_a_slow_sync_tool(tmp_path):
+    calls: list[str] = []
+
+    @tool(side_effect="idempotent_write")
+    def write_note(text: str) -> str:
+        """Block in ordinary sync Python longer than one lease."""
+        time.sleep(0.12)
+        calls.append(text)
+        return text
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([_reply_with_tool(), _final_reply()]),
+            model="fake", tools=[write_note],
+            session_path=tmp_path / "claims.db",
+        )
+        try:
+            result = asyncio.run(agent.run_durable(
+                "write slowly", execution_store=store, run_id=run.id,
+                lease_seconds=0.06, heartbeat_interval_s=0.015,
+            ))
+        finally:
+            agent.close()
+        assert result.text == "done"
+        assert calls == ["saved"]
+        settled = store.get_run(run.id)
+        assert settled is not None and settled.state is RunState.COMPLETED
+
+
+def test_durable_runner_executes_independent_reads_in_parallel(tmp_path):
+    started: list[str] = []
+    both_started = asyncio.Event()
+
+    @tool(side_effect="read_only")
+    async def read_value(value: str) -> str:
+        """Wait until both independent reads have started."""
+        started.append(value)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return value
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([
+                _reply_with_two_tools("read_value"),
+                _final_reply(),
+            ]),
+            model="fake",
+            tools=[read_value],
+            session_path=tmp_path / "claims.db",
+            max_parallel_tools=2,
+        )
+        try:
+            result = asyncio.run(agent.run_durable(
+                "read both", execution_store=store, run_id=run.id,
+            ))
+        finally:
+            agent.close()
+
+    assert result.text == "done"
+    assert started == ["first", "second"]
+    tool_results = result.state.messages[-2]["content"]
+    assert [value["tool_use_id"] for value in tool_results] == [
+        "tool_first", "tool_second",
+    ]
+
+
+def test_ordinary_agent_executes_independent_reads_in_parallel():
+    started: list[str] = []
+    both_started = asyncio.Event()
+
+    @tool(side_effect="read_only")
+    async def read_value(value: str) -> str:
+        """Wait until both ordinary-Agent reads have started."""
+        started.append(value)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return value
+
+    agent = Agent(
+        adapter=FakeAdapter.from_replies([
+            _reply_with_two_tools("read_value"),
+            _final_reply(),
+        ]),
+        model="fake",
+        tools=[read_value],
+        max_parallel_tools=2,
+    )
+    try:
+        result = asyncio.run(agent.run("read both"))
+    finally:
+        agent.close()
+
+    assert result.text == "done"
+    assert started == ["first", "second"]
+
+
+def test_durable_runner_keeps_writes_serial(tmp_path):
+    active = 0
+    maximum_active = 0
+    calls: list[str] = []
+
+    @tool(side_effect="idempotent_write")
+    async def write_value(value: str) -> str:
+        """Record write concurrency without touching the filesystem."""
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        calls.append(value)
+        active -= 1
+        return value
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([
+                _reply_with_two_tools("write_value"),
+                _final_reply(),
+            ]),
+            model="fake",
+            tools=[write_value],
+            session_path=tmp_path / "claims.db",
+            max_parallel_tools=2,
+        )
+        try:
+            result = asyncio.run(agent.run_durable(
+                "write both", execution_store=store, run_id=run.id,
+            ))
+        finally:
+            agent.close()
+
+    assert result.text == "done"
+    assert calls == ["first", "second"]
+    assert maximum_active == 1
+
+
+def test_durable_runner_keeps_budgeted_reads_serial(tmp_path):
+    active = 0
+    maximum_active = 0
+
+    @tool(side_effect="read_only")
+    async def read_value(value: str) -> str:
+        """Measure concurrency for a budgeted read."""
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return value
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([
+                _reply_with_two_tools("read_value"),
+                _final_reply(),
+            ]),
+            model="fake",
+            tools=[read_value],
+            session_path=tmp_path / "claims.db",
+            budgets={"tool_calls": 10},
+            max_parallel_tools=2,
+        )
+        try:
+            result = asyncio.run(agent.run_durable(
+                "read within budget", execution_store=store, run_id=run.id,
+            ))
+        finally:
+            agent.close()
+
+    assert result.text == "done"
+    assert maximum_active == 1
+
+
+def test_parallel_read_results_recover_after_checkpoint_crash(tmp_path):
+    calls: list[str] = []
+
+    @tool(side_effect="read_only")
+    def read_value(value: str) -> str:
+        """Return one value while recording actual executions."""
+        calls.append(value)
+        return value
+
+    path = tmp_path / "execution.db"
+    claims = tmp_path / "claims.db"
+    store = ExecutionStore(path)
+    _, pending = _task_run(store, tmp_path)
+    claimed = store.claim_run(pending.id)
+    first = Agent(
+        adapter=FakeAdapter.from_replies([_reply_with_two_tools("read_value")]),
+        model="fake",
+        tools=[read_value],
+        session_path=claims,
+        max_parallel_tools=2,
+    )
+    original_save = store.save_checkpoint
+
+    def crash_before_parallel_checkpoint(*args, **kwargs):
+        if kwargs.get("phase") == "after_tool":
+            raise SimulatedCrash()
+        return original_save(*args, **kwargs)
+
+    store.save_checkpoint = crash_before_parallel_checkpoint  # type: ignore[method-assign]
+    try:
+        with pytest.raises(SimulatedCrash):
+            asyncio.run(DurableReActRunner(
+                first.behaviour, store, claimed,
+            ).run_to_completion(
+                AgentState(messages=({"role": "user", "content": "read"},)),
+            ))
+    finally:
+        store.save_checkpoint = original_save  # type: ignore[method-assign]
+        first.close()
+
+    assert calls == ["first", "second"]
+    replacement = _reclaim(store, pending.id)
+    second = Agent(
+        adapter=FakeAdapter.from_replies([_final_reply("recovered")]),
+        model="fake",
+        tools=[read_value],
+        session_path=claims,
+        max_parallel_tools=2,
+    )
+    try:
+        result = asyncio.run(DurableReActRunner(
+            second.behaviour, store, replacement,
+        ).run_to_completion())
+    finally:
+        second.close()
+        store.close()
+
+    assert result.text == "recovered"
+    assert calls == ["first", "second"]
+
+
+def test_parallel_reads_checkpoint_before_write_approval_and_resume(tmp_path):
+    reads: list[str] = []
+    writes: list[str] = []
+    both_started = asyncio.Event()
+
+    @tool(side_effect="read_only")
+    async def read_value(value: str) -> str:
+        """Wait for both reads before returning."""
+        reads.append(value)
+        if len(reads) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return value
+
+    @tool(side_effect="idempotent_write")
+    def write_value(value: str) -> str:
+        """Record the approved write."""
+        writes.append(value)
+        return value
+
+    reply = Reply(
+        content=(
+            {
+                "type": "tool_use", "id": "read_first",
+                "name": "read_value", "input": {"value": "first"},
+            },
+            {
+                "type": "tool_use", "id": "read_second",
+                "name": "read_value", "input": {"value": "second"},
+            },
+            {
+                "type": "tool_use", "id": "write_last",
+                "name": "write_value", "input": {"value": "saved"},
+            },
+        ),
+        usage=Usage(input=3, output=1),
+        stop_reason="tool_use",
+        model="fake",
+    )
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([reply, _final_reply()]),
+            model="fake",
+            tools=[read_value, write_value],
+            session_path=tmp_path / "claims.db",
+            max_parallel_tools=2,
+        )
+        try:
+            with pytest.raises(RunSuspended) as suspended:
+                asyncio.run(agent.run_durable(
+                    "read then write",
+                    execution_store=store,
+                    run_id=run.id,
+                    approval_policy=writes_require_approval,
+                ))
+
+            checkpoint = store.get_checkpoint(run.id)
+            assert checkpoint is not None
+            assert checkpoint.state["next_tool_index"] == 2
+            assert reads == ["first", "second"]
+            assert writes == []
+
+            store.resolve_interrupt(suspended.value.interrupt.id, allow=True)
+            result = asyncio.run(agent.resume_durable(
+                execution_store=store,
+                run_id=run.id,
+                approval_policy=writes_require_approval,
+            ))
+        finally:
+            agent.close()
+
+    assert result.text == "done"
+    assert reads == ["first", "second"]
+    assert writes == ["saved"]
 
 
 def test_agent_run_durable_completes_and_persists_terminal_checkpoint(tmp_path):

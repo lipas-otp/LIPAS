@@ -645,6 +645,24 @@ class ExecutionStore:
             return None
         return Task(row[0], row[1], row[2], TaskState(row[3]), row[4], row[5])
 
+    def list_tasks(self, *, state: TaskState | None = None) -> tuple[Task, ...]:
+        """Return tasks newest first for workbench and operator projections."""
+        if state is not None and not isinstance(state, TaskState):
+            raise TypeError("state must be TaskState or None")
+        sql = (
+            "SELECT id,goal,workspace,state,created_at,updated_at "
+            "FROM execution_tasks"
+        )
+        params: tuple[Any, ...] = ()
+        if state is not None:
+            sql += " WHERE state=?"
+            params = (state.value,)
+        sql += " ORDER BY created_at DESC,id DESC"
+        return tuple(
+            Task(row[0], row[1], row[2], TaskState(row[3]), row[4], row[5])
+            for row in self._conn.execute(sql, params)
+        )
+
     # -- runs and leases -----------------------------------------------
 
     def create_run(self, task_id: str, *, run_id: str | None = None) -> Run:
@@ -708,6 +726,65 @@ class ExecutionStore:
             created_at=row[10],
             updated_at=row[11],
         )
+
+    def list_runs(self, *, task_id: str | None = None) -> tuple[Run, ...]:
+        """Return runs newest first, optionally restricted to one task."""
+        sql = (
+            "SELECT id,task_id,state,attempt,checkpoint_version,lease_token,"
+            "lease_expires,cancel_requested,result_json,error_json,created_at,updated_at "
+            "FROM execution_runs"
+        )
+        params: tuple[Any, ...] = ()
+        if task_id is not None:
+            sql += " WHERE task_id=?"
+            params = (task_id,)
+        sql += " ORDER BY created_at DESC,id DESC"
+        runs: list[Run] = []
+        for row in self._conn.execute(sql, params):
+            runs.append(Run(
+                id=row[0],
+                task_id=row[1],
+                state=RunState(row[2]),
+                attempt=row[3],
+                checkpoint_version=row[4],
+                lease_token=row[5],
+                lease_expires=row[6],
+                cancel_requested=bool(row[7]),
+                result=_from_json(row[8]) if row[8] is not None else None,
+                error=_from_json(row[9]) if row[9] is not None else None,
+                created_at=row[10],
+                updated_at=row[11],
+            ))
+        return tuple(runs)
+
+    def list_claimable_runs(self, *, now: float | None = None) -> tuple[Run, ...]:
+        """Return open pending/expired runs in FIFO dispatch order.
+
+        Discovery is intentionally not a claim. Multiple dispatchers may see
+        the same candidate; the later conditional ``claim_run`` transition is
+        the authoritative race boundary and only one worker can win it.
+        """
+        now = _timestamp(now)
+        run_ids = tuple(
+            row[0]
+            for row in self._conn.execute(
+                "SELECT r.id FROM execution_runs AS r "
+                "JOIN execution_tasks AS t ON t.id=r.task_id "
+                "WHERE "
+                "(t.state='open' AND r.state='pending' "
+                " AND r.cancel_requested=0) OR "
+                "(r.state='running' AND r.lease_expires IS NOT NULL "
+                " AND r.lease_expires<=?) "
+                "ORDER BY r.created_at,r.id",
+                (now,),
+            )
+        )
+        runs: list[Run] = []
+        for run_id in run_ids:
+            run = self.get_run(run_id)
+            if run is not None:
+                runs.append(run)
+        return tuple(runs)
 
     def claim_run(
         self,
@@ -985,6 +1062,40 @@ class ExecutionStore:
             response=_from_json(row[5]) if row[5] is not None else None,
             created_at=row[6],
             resolved_at=row[7],
+        )
+
+    def list_interrupts(
+        self,
+        *,
+        run_id: str | None = None,
+        state: InterruptState | None = None,
+    ) -> tuple[Interrupt, ...]:
+        """Return durable approval/interrupt records newest first."""
+        if state is not None and not isinstance(state, InterruptState):
+            raise TypeError("state must be InterruptState or None")
+        conditions: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            conditions.append("run_id=?")
+            params.append(run_id)
+        if state is not None:
+            conditions.append("state=?")
+            params.append(state.value)
+        sql = (
+            "SELECT id,run_id,kind,request_json,state,response_json,"
+            "created_at,resolved_at FROM execution_interrupts"
+        )
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC,id DESC"
+        return tuple(
+            Interrupt(
+                id=row[0], run_id=row[1], kind=row[2],
+                request=_from_json(row[3]), state=InterruptState(row[4]),
+                response=_from_json(row[5]) if row[5] is not None else None,
+                created_at=row[6], resolved_at=row[7],
+            )
+            for row in self._conn.execute(sql, tuple(params))
         )
 
     def resolve_interrupt(

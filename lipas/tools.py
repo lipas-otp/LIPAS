@@ -242,16 +242,24 @@ class Tool:
         return self._handler(*bound.args, **bound.kwargs)
 
     async def acall(self, arguments: dict) -> Any:
-        """Async invocation."""
+        """Invoke without blocking the event loop on synchronous handlers.
+
+        A thread cannot be force-killed safely. If its awaiting task is
+        cancelled, the handler may still finish later; the harness therefore
+        leaves the Effect as an orphan/uncertain intent instead of recording a
+        false terminal failure. Product deployments that need hard
+        cancellation must use an OS-isolated process/container capability.
+        """
         try:
             bound = self._signature.bind(**arguments)
         except TypeError as e:
             raise InvalidArgumentsError(str(e)) from e
         bound.apply_defaults()
-        result = self._handler(*bound.args, **bound.kwargs)
-        if asyncio.iscoroutine(result):
-            result = await result
-        return result
+        if asyncio.iscoroutinefunction(self._handler):
+            return await self._handler(*bound.args, **bound.kwargs)
+        return await asyncio.to_thread(
+            self._handler, *bound.args, **bound.kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -7,8 +7,10 @@ reuses recorded terminal effects instead of submitting them again.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
+import math
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Mapping
@@ -29,6 +31,7 @@ from .tools import SideEffectClass, Tool, ToolNotFoundError
 
 __all__ = [
     "ApprovalPolicy",
+    "DurablePhaseTimeout",
     "DurableReActRunner",
     "final_result_from_checkpoint",
     "writes_require_approval",
@@ -36,6 +39,15 @@ __all__ = [
 
 
 ApprovalPolicy = Callable[[Tool, Mapping[str, Any]], Mapping[str, Any] | None]
+
+
+class DurablePhaseTimeout(ExecutionStateError):
+    """A durable model or tool phase exceeded its configured deadline."""
+
+    def __init__(self, phase: str, timeout_s: float) -> None:
+        self.phase = phase
+        self.timeout_s = timeout_s
+        super().__init__(f"durable {phase} phase exceeded {timeout_s:g}s")
 
 
 def writes_require_approval(
@@ -211,10 +223,28 @@ class DurableReActRunner:
     store: ExecutionStore
     run: Run
     approval_policy: ApprovalPolicy | None = None
+    lease_seconds: float = 60.0
+    heartbeat_interval_s: float | None = None
+    phase_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         if self.run.state is not RunState.RUNNING or not self.run.lease_token:
             raise ValueError("DurableReActRunner requires a claimed running Run")
+        self.lease_seconds = self._positive_seconds(
+            self.lease_seconds, "lease_seconds",
+        )
+        if self.heartbeat_interval_s is None:
+            self.heartbeat_interval_s = self.lease_seconds / 3
+        else:
+            self.heartbeat_interval_s = self._positive_seconds(
+                self.heartbeat_interval_s, "heartbeat_interval_s",
+            )
+        if self.heartbeat_interval_s >= self.lease_seconds:
+            raise ValueError("heartbeat_interval_s must be less than lease_seconds")
+        if self.phase_timeout_s is not None:
+            self.phase_timeout_s = self._positive_seconds(
+                self.phase_timeout_s, "phase_timeout_s",
+            )
 
     @property
     def _token(self) -> str:
@@ -231,6 +261,56 @@ class DurableReActRunner:
         return store_id
 
     async def run_to_completion(
+        self,
+        initial: AgentState | None = None,
+    ) -> FinalResult:
+        """Run with an automatic lease heartbeat around the phase machine."""
+        execution = asyncio.create_task(self._run_to_completion(initial))
+        heartbeat = asyncio.create_task(self._heartbeat())
+        try:
+            done, _ = await asyncio.wait(
+                {execution, heartbeat},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if execution in done:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+                return await execution
+
+            execution.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await execution
+            # The heartbeat only terminates when renewal fails.
+            await heartbeat
+            raise AssertionError("lease heartbeat terminated without an error")
+        finally:
+            for task in (execution, heartbeat):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                execution, heartbeat, return_exceptions=True,
+            )
+
+    async def _heartbeat(self) -> None:
+        assert self.heartbeat_interval_s is not None
+        while True:
+            await asyncio.sleep(self.heartbeat_interval_s)
+            self.run = self.store.renew_lease(
+                self.run.id,
+                self._token,
+                lease_seconds=self.lease_seconds,
+            )
+
+    async def _await_phase(self, awaitable: Any, phase: str) -> Any:
+        if self.phase_timeout_s is None:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(awaitable, timeout=self.phase_timeout_s)
+        except TimeoutError as exc:
+            raise DurablePhaseTimeout(phase, self.phase_timeout_s) from exc
+
+    async def _run_to_completion(
         self,
         initial: AgentState | None = None,
     ) -> FinalResult:
@@ -368,11 +448,11 @@ class DurableReActRunner:
                     if not isinstance(effect_id_value, str):
                         raise TypeError("before_llm checkpoint has no llm_effect_id")
                     request = self.behaviour._build_request(state)
-                    reply = await self.behaviour.harness.call(
+                    reply = await self._await_phase(self.behaviour.harness.call(
                         request,
                         caused_by=self.run.id,
                         effect_id=effect_id_value,
-                    )
+                    ), "model")
                     tool_calls = self.behaviour._extract_tool_calls(reply)
                     payload = self._payload(
                         state,
@@ -470,10 +550,15 @@ class DurableReActRunner:
                     raise ValueError("next_tool_index is outside tool_calls")
 
                 if next_index < len(tool_calls):
-                    tool_call = tool_calls[next_index]
-                    arguments = dict(tool_call.get("input") or {})
+                    batch_size = self.behaviour._parallel_tool_count(
+                        tool_calls, next_index,
+                    )
+                    approval_request: Mapping[str, Any] | None = None
                     approval_id = payload.get("approval_interrupt_id")
                     if approval_id is not None:
+                        # A restored approval applies to exactly the current
+                        # tool. Do not infer authority for later calls.
+                        batch_size = 1
                         if not isinstance(approval_id, str):
                             raise TypeError("approval_interrupt_id must be a string")
                         interrupt = self.store.get_interrupt(approval_id)
@@ -487,57 +572,89 @@ class DurableReActRunner:
                                 "not allowed",
                             )
                     elif self.approval_policy is not None:
-                        try:
-                            tool = self.behaviour.tools.get(str(tool_call["name"]))
-                        except ToolNotFoundError:
-                            tool = None
-                        approval_request = (
-                            self.approval_policy(tool, arguments)
-                            if tool is not None else None
+                        # Approval policies are consulted before any member of
+                        # a candidate parallel batch starts. A later approval
+                        # boundary shortens the batch; the current call then
+                        # checkpoints before that boundary is revisited.
+                        for offset in range(batch_size):
+                            candidate = tool_calls[next_index + offset]
+                            try:
+                                tool = self.behaviour.tools.get(
+                                    str(candidate["name"]),
+                                )
+                            except ToolNotFoundError:
+                                break
+                            approval_decision = self.approval_policy(
+                                tool, dict(candidate.get("input") or {}),
+                            )
+                            if approval_decision is None:
+                                continue
+                            if offset == 0:
+                                approval_request = approval_decision
+                                batch_size = 1
+                            else:
+                                batch_size = offset
+                            break
+                    if approval_request is not None:
+                        approval_id = self._approval_interrupt_id(
+                            state.iteration, next_index,
                         )
-                        if approval_request is not None:
-                            approval_id = self._approval_interrupt_id(
-                                state.iteration, next_index,
-                            )
-                            suspended_payload = {
-                                **payload,
-                                "approval_interrupt_id": approval_id,
-                            }
-                            interrupt = self.store.suspend(
-                                self.run.id,
-                                self._token,
-                                expected_version=version,
-                                phase=phase,
-                                checkpoint_state=suspended_payload,
-                                kind="approval",
-                                request=approval_request,
-                                interrupt_id=approval_id,
-                            )
-                            raise RunSuspended(interrupt)
+                        suspended_payload = {
+                            **payload,
+                            "approval_interrupt_id": approval_id,
+                        }
+                        interrupt = self.store.suspend(
+                            self.run.id,
+                            self._token,
+                            expected_version=version,
+                            phase=phase,
+                            checkpoint_state=suspended_payload,
+                            kind="approval",
+                            request=approval_request,
+                            interrupt_id=approval_id,
+                        )
+                        raise RunSuspended(interrupt)
+
                     # Provider tool-use ids are correlation ids inside the
                     # conversation, not globally unique effect identities.
                     # Namespace the durable effect by run/iteration/index so
                     # two runs sharing one claim session can never replay one
-                    # another's tool result.  The original id is restored on
-                    # the tool_result block sent back to the model.
-                    provider_tool_id = str(tool_call["id"])
-                    result_dict = await self.behaviour.tool_harness.call(
-                        tool_name=str(tool_call["name"]),
-                        arguments=arguments,
-                        effect_id=self._tool_effect_id(
-                            state.iteration, next_index,
+                    # another's tool result. The original ids and result order
+                    # are restored on the blocks sent back to the model.
+                    batch = tool_calls[next_index:next_index + batch_size]
+                    calls = [
+                        self.behaviour.tool_harness.call(
+                            tool_name=str(tool_call["name"]),
+                            arguments=dict(tool_call.get("input") or {}),
+                            effect_id=self._tool_effect_id(
+                                state.iteration, next_index + offset,
+                            ),
+                            tool_use_id=str(tool_call["id"]),
+                            caused_by=self.run.id,
+                        )
+                        for offset, tool_call in enumerate(batch)
+                    ]
+                    batch_results = await self._await_phase(
+                        (
+                            asyncio.gather(*calls)
+                            if len(calls) > 1 else calls[0]
                         ),
-                        tool_use_id=provider_tool_id,
-                        caused_by=self.run.id,
+                        (
+                            f"tools:{len(calls)}"
+                            if len(calls) > 1
+                            else f"tool:{batch[0]['name']}"
+                        ),
                     )
-                    tool_results.append(result_dict)
+                    if len(calls) == 1:
+                        batch_results = [batch_results]
+                    tool_results.extend(batch_results)
                     payload = self._payload(
                         state,
                         llm_effect_id=payload.get("llm_effect_id"),
                         reply=reply,
                         tool_calls=tool_calls,
                         tool_results=tool_results,
-                        next_tool_index=next_index + 1,
+                        next_tool_index=next_index + batch_size,
                     )
                     checkpoint = self.store.save_checkpoint(
                         self.run.id,
@@ -691,3 +808,14 @@ class DurableReActRunner:
             f"{self.run.id}:approval:{iteration}:{tool_index}".encode("utf-8"),
         ).hexdigest()[:20]
         return f"approval_{digest}"
+
+    @staticmethod
+    def _positive_seconds(value: float, name: str) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive finite number")
+        return float(value)

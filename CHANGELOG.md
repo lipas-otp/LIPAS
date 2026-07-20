@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.20.0] — 2026-07-20 · Local Task Product Alpha
+
+### Added
+
+- The first local workspace task workbench: durable `lipas task` commands,
+  Workspace/Approval/Artifact/Verification/Report product models, bounded
+  filesystem/Shell/Git capabilities, persistent approvals, and evidence-based
+  task reports.
+- Automatic durable-run lease heartbeats and typed model/tool phase timeouts.
+- Safe multi-tool concurrency: contiguous independent `pure`/`read_only` calls
+  may run in parallel and checkpoint as one ordered batch. Writes and calls
+  with hard budgets, guards, replay, or custom execution hooks remain serial;
+  completed batch Effects restore without re-execution after a checkpoint
+  interruption.
+- Operator queries for listing Tasks, Runs, and Interrupts.
+- A framework-neutral `ActionGateway` plus LangGraph node/tool adapters, a
+  standard MCP stdio server for Hermes and other hosts, and an OpenClaw/
+  OpenCrew JSON action backend. Stable external request ids recover recorded
+  terminal Effects on redelivery. These third-party compatibility adapters are
+  explicitly experimental and are not core LIPAS product surfaces.
+- A product-ingress `SecretPolicy` that rejects common raw credentials before
+  any approval or Effect Claim is persisted and permits opaque `secret://`
+  references.
+- An allowlisted `EnvironmentSecretResolver` for `secret://env/NAME` values.
+  References remain in Effect intents; values are resolved immediately before
+  tool execution and redacted from outputs or exceptions before persistence.
+- A Bubblewrap command backend for the local workbench with a minimal
+  filesystem, writable workspace, cleared environment, and isolated network.
+  `auto` and `bwrap` fail closed; `local` is an explicit trusted-code fallback.
+- Persistent workbench `RunEvent` history for task/run creation, approvals,
+  artifacts, verifications, state transitions, and reports, exposed as JSONL
+  through `lipas task events`.
+- A persistent local `TaskDispatcher` and `lipas task submit/worker` flow with
+  FIFO discovery, atomic lease ownership, bounded Task concurrency, expired
+  lease reclaim, cancellation closeout, approval slot release, deferred resume,
+  a durable CLI approval inbox, and dispatch events. Each Run now receives an
+  isolated Claim/Effect session; checkpointed legacy Runs retain their
+  original session.
+- Per-Run staged file `ChangeSet` delivery for CLI Tasks. Agents modify and
+  verify a bounded snapshot while the original workspace stays unchanged;
+  `lipas task diff/apply/discard` provides complete review, explicit delivery,
+  baseline drift rejection, per-file atomic replacement, restartable apply,
+  persistent delivery events, and report state.
+- A provider-free local-task product lesson covering staged writes, durable
+  command approval, restart, verification, diff review, and explicit apply.
+- A single-source package version exposed through `lipas.__version__` and
+  `lipas --version`.
+
+### Changed
+
+- The `0.20.x` line marks LIPAS's transition from a runtime-led project to its
+  first independently usable local task product. The runtime remains the
+  reliability foundation and advanced embedding surface.
+
+### Fixed
+
+- Core-only installations no longer import the optional Ollama/httpx adapter
+  while starting the CLI. Version, help, task, and inspection commands now
+  work without provider extras; custom-factory errors also remain reportable.
+- Installed console scripts now resolve explicitly requested
+  `module:callable` factories from the operator's working directory, so the
+  documented local `agent:build_agent` and task-worker factory flows work from
+  a wheel installation as well as from a source checkout.
+
+### Safety
+
+- Workspace paths are contained after symlink resolution; direct `.git`
+  internals and likely secret files are denied. Command execution uses an
+  allowlist, no shell expansion, a workspace cwd, a scrubbed environment,
+  bounded time/output, and approval before execution.
+- Common secret assignments, bearer tokens, provider tokens, and private keys
+  are redacted from readable text, command evidence, Git diff, and reports.
+- Synchronous Python tools run outside the event loop so lease heartbeats keep
+  advancing. Cancellation leaves an orphan intent because a thread cannot be
+  proven stopped; it no longer records a false terminal failure.
+
+### Verified
+
+- 547 tests pass, including the full CLI flow from staged write through
+  verification approval and report delivery.
+- Ruff passes on every changed source/test file and mypy passes the complete
+  public package.
+
 ## [0.10.0] — 2026-07-18
 
 ### Added

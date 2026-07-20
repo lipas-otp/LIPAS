@@ -1,0 +1,518 @@
+Metadata-Version: 2.4
+Name: lipas
+Version: 0.20.0
+Summary: LIPAS — a trustworthy local task agent with durable execution, approvals, verification, and staged delivery.
+Project-URL: Homepage, https://github.com/lipas-otp/lipas
+Project-URL: Repository, https://github.com/lipas-otp/lipas
+Project-URL: Changelog, https://github.com/lipas-otp/lipas/blob/main/CHANGELOG.md
+Project-URL: Issues, https://github.com/lipas-otp/lipas/issues
+License:                                  Apache License
+                                   Version 2.0, January 2004
+                                http://www.apache.org/licenses/
+        
+           TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+        
+           1. Definitions.
+        
+              "License" shall mean the terms and conditions for use, reproduction,
+              and distribution as defined by Sections 1 through 9 of this document.
+        
+              "Licensor" shall mean the copyright owner or entity authorized by
+              the copyright owner that is granting the License.
+        
+              "Legal Entity" shall mean the union of the acting entity and all
+              other entities that control, are controlled by, or are under common
+              control with that entity. For the purposes of this definition,
+              "control" means (i) the power, direct or indirect, to cause the
+              direction or management of such entity, whether by contract or
+              otherwise, or (ii) ownership of fifty percent (50%) or more of the
+              outstanding shares, or (iii) beneficial ownership of such entity.
+        
+              "You" (or "Your") shall mean an individual or Legal Entity
+              exercising permissions granted by this License.
+        
+              "Source" form shall mean the preferred form for making modifications,
+              including but not limited to software source code, documentation
+              source, and configuration files.
+        
+              "Object" form shall mean any form resulting from mechanical
+              transformation or translation of a Source form, including but
+              not limited to compiled object code, generated documentation,
+              and conversions to other media types.
+        
+              "Work" shall mean the work of authorship, whether in Source or
+              Object form, made available under the License, as indicated by a
+              copyright notice that is included in or attached to the work
+              (an example is provided in the Appendix below).
+        
+              "Derivative Works" shall mean any work, whether in Source or Object
+              form, that is based on (or derived from) the Work and for which the
+              editorial revisions, annotations, elaborations, or other modifications
+              represent, as a whole, an original work of authorship. For the purposes
+              of this License, Derivative Works shall not include works that remain
+              separable from, or merely link (or bind by name) to the interfaces of,
+              the Work and Derivative Works thereof.
+        
+              "Contribution" shall mean any work of authorship, including
+              the original version of the Work and any modifications or additions
+              to that Work or Derivative Works thereof, that is intentionally
+              submitted to Licensor for inclusion in the Work by the copyright owner
+              or by an individual or Legal Entity authorized to submit on behalf of
+              the copyright owner. For the purposes of this definition, "submitted"
+              means any form of electronic, verbal, or written communication sent
+              to the Licensor or its representatives, including but not limited to
+              communication on electronic mailing lists, source code control systems,
+              and issue tracking systems that are managed by, or on behalf of, the
+              Licensor for the purpose of discussing and improving the Work, but
+              excluding communication that is conspicuously marked or otherwise
+              designated in writing by the copyright owner as "Not a Contribution."
+        
+              "Contributor" shall mean Licensor and any individual or Legal Entity
+              on behalf of whom a Contribution has been received by Licensor and
+              subsequently incorporated within the Work.
+        
+           2. Grant of Copyright License. Subject to the terms and conditions of
+              this License, each Contributor hereby grants to You a perpetual,
+              worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+              copyright license to reproduce, prepare Derivative Works of,
+              publicly display, publicly perform, sublicense, and distribute the
+              Work and such Derivative Works in Source or Object form.
+        
+           3. Grant of Patent License. Subject to the terms and conditions of
+              this License, each Contributor hereby grants to You a perpetual,
+              worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+              (except as stated in this section) patent license to make, have made,
+              use, offer to sell, sell, import, and otherwise transfer the Work,
+              where such license applies only to those patent claims licensable
+              by such Contributor that are necessarily infringed by their
+              Contribution(s) alone or by combination of their Contribution(s)
+              with the Work to which such Contribution(s) was submitted. If You
+              institute patent litigation against any entity (including a
+              cross-claim or counterclaim in a lawsuit) alleging that the Work
+              or a Contribution incorporated within the Work constitutes direct
+              or contributory patent infringement, then any patent licenses
+              granted to You under this License for that Work shall terminate
+              as of the date such litigation is filed.
+        
+           4. Redistribution. You may reproduce and distribute copies of the
+              Work or Derivative Works thereof in any medium, with or without
+              modifications, and in Source or Object form, provided that You
+              meet the following conditions:
+        
+              (a) You must give any other recipients of the Work or
+                  Derivative Works a copy of this License; and
+        
+              (b) You must cause any modified files to carry prominent notices
+                  stating that You changed the files; and
+        
+              (c) You must retain, in the Source form of any Derivative Works
+                  that You distribute, all copyright, patent, trademark, and
+                  attribution notices from the Source form of the Work,
+                  excluding those notices that do not pertain to any part of
+                  the Derivative Works; and
+        
+              (d) If the Work includes a "NOTICE" text file as part of its
+                  distribution, then any Derivative Works that You distribute must
+                  include a readable copy of the attribution notices contained
+                  within such NOTICE file, excluding those notices that do not
+                  pertain to any part of the Derivative Works, in at least one
+                  of the following places: within a NOTICE text file distributed
+                  as part of the Derivative Works; within the Source form or
+                  documentation, if provided along with the Derivative Works; or,
+                  within a display generated by the Derivative Works, if and
+                  wherever such third-party notices normally appear. The contents
+                  of the NOTICE file are for informational purposes only and
+                  do not modify the License. You may add Your own attribution
+                  notices within Derivative Works that You distribute, alongside
+                  or as an addendum to the NOTICE text from the Work, provided
+                  that such additional attribution notices cannot be construed
+                  as modifying the License.
+        
+              You may add Your own copyright statement to Your modifications and
+              may provide additional or different license terms and conditions
+              for use, reproduction, or distribution of Your modifications, or
+              for any such Derivative Works as a whole, provided Your use,
+              reproduction, and distribution of the Work otherwise complies with
+              the conditions stated in this License.
+        
+           5. Submission of Contributions. Unless You explicitly state otherwise,
+              any Contribution intentionally submitted for inclusion in the Work
+              by You to the Licensor shall be under the terms and conditions of
+              this License, without any additional terms or conditions.
+              Notwithstanding the above, nothing herein shall supersede or modify
+              the terms of any separate license agreement you may have executed
+              with Licensor regarding such Contributions.
+        
+           6. Trademarks. This License does not grant permission to use the trade
+              names, trademarks, service marks, or product names of the Licensor,
+              except as required for reasonable and customary use in describing the
+              origin of the Work and reproducing the content of the NOTICE file.
+        
+           7. Disclaimer of Warranty. Unless required by applicable law or
+              agreed to in writing, Licensor provides the Work (and each
+              Contributor provides its Contributions) on an "AS IS" BASIS,
+              WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+              implied, including, without limitation, any warranties or conditions
+              of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+              PARTICULAR PURPOSE. You are solely responsible for determining the
+              appropriateness of using or redistributing the Work and assume any
+              risks associated with Your exercise of permissions under this License.
+        
+           8. Limitation of Liability. In no event and under no legal theory,
+              whether in tort (including negligence), contract, or otherwise,
+              unless required by applicable law (such as deliberate and grossly
+              negligent acts) or agreed to in writing, shall any Contributor be
+              liable to You for damages, including any direct, indirect, special,
+              incidental, or consequential damages of any character arising as a
+              result of this License or out of the use or inability to use the
+              Work (including but not limited to damages for loss of goodwill,
+              work stoppage, computer failure or malfunction, or any and all
+              other commercial damages or losses), even if such Contributor
+              has been advised of the possibility of such damages.
+        
+           9. Accepting Warranty or Additional Liability. While redistributing
+              the Work or Derivative Works thereof, You may choose to offer,
+              and charge a fee for, acceptance of support, warranty, indemnity,
+              or other liability obligations and/or rights consistent with this
+              License. However, in accepting such obligations, You may act only
+              on Your own behalf and on Your sole responsibility, not on behalf
+              of any other Contributor, and only if You agree to indemnify,
+              defend, and hold each Contributor harmless for any liability
+              incurred by, or claims asserted against, such Contributor by reason
+              of your accepting any such warranty or additional liability.
+        
+           END OF TERMS AND CONDITIONS
+        
+           APPENDIX: How to apply the Apache License to your work.
+        
+              To apply the Apache License to your work, attach the following
+              boilerplate notice, with the fields enclosed by brackets "[]"
+              replaced with your own identifying information. (Don't include
+              the brackets!)  The text should be enclosed in the appropriate
+              comment syntax for the file format. We also recommend that a
+              file or class name and description of purpose be included on the
+              same "printed page" as the copyright notice for easier
+              identification within third-party archives.
+        
+           Copyright [yyyy] [name of copyright owner]
+        
+           Licensed under the Apache License, Version 2.0 (the "License");
+           you may not use this file except in compliance with the License.
+           You may obtain a copy of the License at
+        
+               http://www.apache.org/licenses/LICENSE-2.0
+        
+           Unless required by applicable law or agreed to in writing, software
+           distributed under the License is distributed on an "AS IS" BASIS,
+           WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+           See the License for the specific language governing permissions and
+           limitations under the License.
+License-File: LICENSE
+Keywords: agent,audit,budget,llm,local-agent,react,replay,side-effects,task-agent,tool-use
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Typing :: Typed
+Requires-Python: >=3.10
+Provides-Extra: all
+Requires-Dist: httpx>=0.27; extra == 'all'
+Requires-Dist: prompt-toolkit>=3.0; extra == 'all'
+Provides-Extra: cli
+Requires-Dist: prompt-toolkit>=3.0; extra == 'cli'
+Provides-Extra: dev
+Requires-Dist: httpx>=0.27; extra == 'dev'
+Requires-Dist: pytest-asyncio>=0.23; extra == 'dev'
+Requires-Dist: pytest>=8.0; extra == 'dev'
+Provides-Extra: ollama
+Requires-Dist: httpx>=0.27; extra == 'ollama'
+Provides-Extra: openai
+Requires-Dist: httpx>=0.27; extra == 'openai'
+Description-Content-Type: text/markdown
+
+# LIPAS
+
+> Language: [English](README.md) | [中文](README.zh-CN.md)
+
+LIPAS is a local trustworthy task agent for individuals and small teams. It
+works inside a selected workspace, asks before risky actions, survives
+interruptions, verifies the result, and delivers evidence instead of merely
+ending a chat. Its Python runtime is the internal reliability foundation and
+an optional advanced embedding surface.
+
+```text
+Agent  = one assistant that thinks and uses tools
+@tool  = an explicit capability with a declared side effect
+Team   = a durable handoff between named assistants or functions
+```
+
+> **0.20.0 local task product alpha.** This release adds the first-party task
+> workbench and CLI, durable background dispatch with heartbeat and recovery,
+> staged workspace changes, approval inboxes, isolated command execution,
+> secret-safe persistence, verification evidence, and explicit apply/discard.
+
+## One system, two layers
+
+```text
+LIPAS local task workbench (0.20.0 product alpha)
+  Task / Workspace / Approval / Artifact / Task CLI / future Local Web
+                              │
+                              ▼
+LIPAS Python runtime (available today)
+  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation / Team
+```
+
+The workbench is the first-party way to use LIPAS for workspace tasks such as
+inspecting files, making controlled changes, running checks, and delivering a
+report. The Python API remains independently useful for applications that need
+their own domain model or interface. Both layers share the same Effects and
+audit record; the workbench does not create a second execution model.
+
+## The one idea underneath
+
+LIPAS does not ask you to write a graph or a special workflow language. You
+write ordinary Python; an `Agent` calls a model and ordinary `@tool` functions.
+The runtime admits the reliability-relevant parts of that work as immutable
+stored snapshots called **Claims**. A caller may still edit a Claim object it
+has not submitted; mutation cannot rewrite a Claim after the store accepts it.
+
+A **fold** accepts each stable claim once, validates it, and updates small
+derived views of the same record: history answers what happened, capability
+enforces spend limits, and effects record `intent → result | rejection`.
+
+```text
+ordinary Python Agent / Tool / Execution / Operation / Team
+                 │
+                 ▼
+           append-only Claims
+                 ├── history:    decisions and handoffs
+                 ├── capability: budgets and spend
+                 └── effect:     intent, result, lineage
+```
+
+That one evidence tape is why the pieces fit together rather than becoming
+unrelated features: guards and budgets decide before a call; replay substitutes a
+recorded result; supervision records its recommendation; a Team handoff has a
+stable causal id; an external write can be reconciled against its recorded
+intent; execution control stores mirror their transitions through recoverable
+outboxes. Your code remains natural Python because LIPAS records the boundary
+around it instead of replacing its control flow.
+
+For the precise guarantees and limits, read the short [Execution
+model](docs/execution-model.md).
+
+## Start here
+
+```bash
+pip install 'lipas[ollama]'
+ollama pull gemma4:12b
+```
+
+```python
+from lipas import Agent, tool
+
+
+@tool(side_effect="read_only")
+def lookup_customer(customer_id: str) -> str:
+    """Look up a customer without changing external state."""
+    return f"customer={customer_id}"
+
+
+with Agent.ollama(
+    tools=[lookup_customer],
+    instructions="Use tools when useful; answer concisely.",
+    session="runs/support.db",  # omit for in-memory use
+) as agent:
+    result = agent.ask("Find customer C-42")
+    print(result.text)
+```
+
+`agent.ask(...)` is the normal-script API. In an async application, use
+`await agent.run(...)`. The first runnable example is
+[`examples/01_first_agent.py`](examples/01_first_agent.py).
+
+New to LIPAS? Read [LIPAS, step by step](docs/tutorial.md) as a small,
+linear introduction: first Agent, tools, side effects, results, sessions,
+budgets, replay, durable recovery, writes, Skills, Teams, and then complete
+runnable projects. The numbered
+[example course](examples/README.md) remains the reference collection for
+focused scenarios.
+
+## When to add more
+
+Keep one Agent when one coherent goal shares one conversation, tool set,
+budget, and answer. Multiple steps or multiple tools do not require a Team.
+
+Add a `Team` only when work needs a separate owner or recovery boundary: an
+independently restartable task, a different authority/budget, a separately
+audited result, or a human/external-operation handoff. A Team member is usually
+an Agent, but can be a plain async function. In a normal script:
+
+```python
+from lipas import Team
+
+
+async def researcher(prompt):
+    return {"finding": f"researched: {prompt}"}
+
+
+with Team.open("runs/team.db") as team:
+    team.add("research", researcher)
+    finding = team.ask_sync("research", "check release risks")
+```
+
+## Reliability, only when you ask for it
+
+| Add | LIPAS provides |
+|---|---|
+| `@tool(side_effect="read_only")` | explicit replay and retry safety class |
+| `session="runs/app.db"` | durable trace of intent, result, spend, and decisions |
+| `budgets={...}` | pre-flight rejection before a known limit is exceeded |
+| `tool_guards=[...]` | recorded policy denial before a live call |
+| `OperationJournal` | idempotency-key persistence and reconciliation state for an external write |
+| `Team` | durable, at-least-once handoff with leases and acknowledgement |
+| `ExecutionStore` + `Agent.run_durable()` | leased ReAct checkpoints, approval interruption, cancellation, and crash recovery |
+
+The record is not a magic memory system and LIPAS is not a graph/workflow DSL.
+Your application still owns its domain data, business rules, and user-facing
+workflow.
+
+The high-level `Agent` API returns a final result. Lower-level
+`LLMHarness.stream(...)` supports normalized stream events for integrations
+that need them, but LIPAS does not yet offer token streaming from `Agent`.
+
+## Local workspace tasks (product alpha)
+
+The 0.20.0 release begins the product line with its first runnable local-task
+vertical. It
+reuses the same `ExecutionStore` and Effect tape from a separate product layer;
+Workspace, Artifact, and Report concepts do not leak back into the Agent
+runtime. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
+`--home`.
+
+```bash
+lipas task start . "fix the documentation error and run relevant tests"
+lipas task submit . "update two local reports and verify them"
+lipas task worker --max-concurrency 2
+lipas task list
+lipas task approvals
+lipas task show <task-id>
+lipas task approve <approval-id>
+lipas task diff <task-id>
+lipas task apply <task-id>
+# or: lipas task discard <task-id>
+lipas task events <task-id>
+lipas task report <task-id>
+```
+
+CLI Tasks modify a per-Run staging workspace rather than the selected
+workspace. Staged file writes do not interrupt one-by-one; commands still wait
+for durable approval and resume the same checkpointed Run. The first tool set is limited to contained workspace files,
+read-only Git status/diff, and an allowlisted command runner without shell
+expansion. Reports show recorded changes, verification commands, exit states,
+and unresolved risks. A Python factory may accept `tools`, `session_path`, and
+`workspace`; without one, the task CLI uses local Ollama.
+
+Command execution defaults to `--sandbox auto`, which uses Bubblewrap with a
+minimal filesystem and no network and fails closed when that isolation cannot
+be established. `--sandbox local` is an explicit unsafe fallback for trusted
+code. `task events` prints the durable product history as stream-friendly
+JSONL, including approvals, artifacts, verifications, run states, and reports.
+Within one model turn, independent `pure`/`read_only` tools may run in parallel;
+writes and policy/accounting-sensitive calls remain serial. Heartbeats keep the
+run lease alive, and stable Effects restore completed calls after interruption.
+
+After a Run completes, `task diff` shows its complete staged file ChangeSet.
+`task apply` is the explicit delivery approval; it verifies that every original
+path still matches the snapshot baseline before applying anything. External
+workspace drift fails closed. Applying is per-file atomic and retryable if the
+process stops between files. `task discard` removes an unapplied stage without
+changing the workspace. Reports expose `delivery: ready|applied|discarded`.
+
+`task submit` persists work without tying it to the submitting process.
+`task worker` is the local persistent dispatcher: it runs several Tasks with a
+bounded concurrency, reclaims expired leases after restart, and releases a slot
+when a Run waits for approval. `task approvals` is the durable operator inbox.
+Use `task approve <id> --defer-resume` to queue
+the allowed Run for a worker. Each Run has its own Claim/Effect session while
+the global `ExecutionStore` remains the authoritative queue, preventing
+parallel Tasks from sharing budget or single-writer journal state.
+
+For Git workspaces, staging snapshots tracked and non-ignored untracked files;
+for other workspaces it snapshots ordinary files. Secret-like paths and text
+content, symlinks, generated cache directories, and files above the per-file
+limit are excluded; aggregate file/size limits fail closed.
+This first snapshot backend is intentionally bounded; dependency directories
+excluded by Git may need installation or a later read-only mount design for
+verification.
+
+## Experimental interoperability
+
+LIPAS develops its own task product first. LangGraph, MCP-server, and
+OpenCrew/OpenClaw adapters are experimental compatibility samples: they are
+not core product surfaces and carry no compatibility commitment. See the
+[experimental integration guide](docs/integrations.md) only when an existing
+system genuinely needs such an entry point.
+
+## Reusable Skills
+
+A Skill is a portable `SKILL.md` instruction file: it captures how an Agent
+should approach recurring work without granting it any new authority. Tools
+remain the only executable capability. Start by copying one of the ready-made
+[example skills](examples/skills), then point an Agent at its directory:
+
+```python
+from lipas import Agent
+from my_app.tools import search_papers
+
+agent = Agent.ollama(
+    tools=[search_papers],
+    skills="skills/research-brief",
+)
+```
+
+The research, support-triage, daily-brief, and safe-external-actions Skills are
+deliberately small templates: edit them for your own standards rather than
+treating prompt text as a permission system.
+
+## Try and inspect
+
+The optional CLI is for trying an ordinary Python Agent and inspecting its
+session; it is not a second configuration language.
+
+```bash
+pip install 'lipas[ollama,cli]'
+lipas init support-demo --model gemma4:12b
+cd support-demo
+lipas chat --factory agent:build_agent
+lipas trace runs/chat.db
+lipas effects runs/chat.db
+```
+
+From a source checkout before installation, use `python -m lipas.cli` instead.
+The session file is created automatically. Ollama is local but accessed through
+its local HTTP service; a timeout means the local daemon/model did not answer
+in time, not that LIPAS contacted the internet.
+
+## Read only what you need
+
+- [LIPAS, step by step](docs/tutorial.md) — the recommended linear tutorial,
+  from one Agent through complete projects.
+- [Execution model](docs/execution-model.md) — the exact semantics and limits
+  of claims, effects, durable runs, replay, external operations, and Teams.
+- [Roadmap](docs/roadmap.md) — how the runtime and local task workbench advance
+  as one LIPAS project.
+- [Experimental integrations](docs/integrations.md) — optional LangGraph,
+  MCP-server, OpenCrew/OpenClaw, and Action Gateway compatibility samples.
+- [Examples](examples/README.md) — focused, runnable scenarios from the high
+  level API down to the lower-level harnesses.
+- [Changelog](CHANGELOG.md) — release history.
+
+## License
+
+[Apache License 2.0](LICENSE)

@@ -2,9 +2,11 @@
 
 > Language: [English](README.md) | [中文](README.zh-CN.md)
 
-LIPAS is a trustworthy AI execution system.
-It starts with one assistant. Add only the reliability boundary the application
-actually needs.
+LIPAS is a local trustworthy task agent for individuals and small teams. It
+works inside a selected workspace, asks before risky actions, survives
+interruptions, verifies the result, and delivers evidence instead of merely
+ending a chat. Its Python runtime is the internal reliability foundation and
+an optional advanced embedding surface.
 
 ```text
 Agent  = one assistant that thinks and uses tools
@@ -12,16 +14,16 @@ Agent  = one assistant that thinks and uses tools
 Team   = a durable handoff between named assistants or functions
 ```
 
-> **0.10.0 public beta.** This release adds checkpointed ReAct execution,
-> durable approvals, cancellation, and crash recovery to the Ollama,
-> injected-client Anthropic, OpenAI Responses, durable SQLite session, safe
-> replay, supervision, and at-least-once Team foundations.
+> **0.20.0 local task product alpha.** This release adds the first-party task
+> workbench and CLI, durable background dispatch with heartbeat and recovery,
+> staged workspace changes, approval inboxes, isolated command execution,
+> secret-safe persistence, verification evidence, and explicit apply/discard.
 
 ## One system, two layers
 
 ```text
-LIPAS local task workbench (in development)
-  Task / Workspace / Approval / Artifact / Task CLI / Local Web
+LIPAS local task workbench (0.20.0 product alpha)
+  Task / Workspace / Approval / Artifact / Task CLI / future Local Web
                               │
                               ▼
 LIPAS Python runtime (available today)
@@ -147,6 +149,79 @@ The high-level `Agent` API returns a final result. Lower-level
 `LLMHarness.stream(...)` supports normalized stream events for integrations
 that need them, but LIPAS does not yet offer token streaming from `Agent`.
 
+## Local workspace tasks (product alpha)
+
+The 0.20.0 release begins the product line with its first runnable local-task
+vertical. It
+reuses the same `ExecutionStore` and Effect tape from a separate product layer;
+Workspace, Artifact, and Report concepts do not leak back into the Agent
+runtime. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
+`--home`.
+
+```bash
+lipas task start . "fix the documentation error and run relevant tests"
+lipas task submit . "update two local reports and verify them"
+lipas task worker --max-concurrency 2
+lipas task list
+lipas task approvals
+lipas task show <task-id>
+lipas task approve <approval-id>
+lipas task diff <task-id>
+lipas task apply <task-id>
+# or: lipas task discard <task-id>
+lipas task events <task-id>
+lipas task report <task-id>
+```
+
+CLI Tasks modify a per-Run staging workspace rather than the selected
+workspace. Staged file writes do not interrupt one-by-one; commands still wait
+for durable approval and resume the same checkpointed Run. The first tool set is limited to contained workspace files,
+read-only Git status/diff, and an allowlisted command runner without shell
+expansion. Reports show recorded changes, verification commands, exit states,
+and unresolved risks. A Python factory may accept `tools`, `session_path`, and
+`workspace`; without one, the task CLI uses local Ollama.
+
+Command execution defaults to `--sandbox auto`, which uses Bubblewrap with a
+minimal filesystem and no network and fails closed when that isolation cannot
+be established. `--sandbox local` is an explicit unsafe fallback for trusted
+code. `task events` prints the durable product history as stream-friendly
+JSONL, including approvals, artifacts, verifications, run states, and reports.
+Within one model turn, independent `pure`/`read_only` tools may run in parallel;
+writes and policy/accounting-sensitive calls remain serial. Heartbeats keep the
+run lease alive, and stable Effects restore completed calls after interruption.
+
+After a Run completes, `task diff` shows its complete staged file ChangeSet.
+`task apply` is the explicit delivery approval; it verifies that every original
+path still matches the snapshot baseline before applying anything. External
+workspace drift fails closed. Applying is per-file atomic and retryable if the
+process stops between files. `task discard` removes an unapplied stage without
+changing the workspace. Reports expose `delivery: ready|applied|discarded`.
+
+`task submit` persists work without tying it to the submitting process.
+`task worker` is the local persistent dispatcher: it runs several Tasks with a
+bounded concurrency, reclaims expired leases after restart, and releases a slot
+when a Run waits for approval. `task approvals` is the durable operator inbox.
+Use `task approve <id> --defer-resume` to queue
+the allowed Run for a worker. Each Run has its own Claim/Effect session while
+the global `ExecutionStore` remains the authoritative queue, preventing
+parallel Tasks from sharing budget or single-writer journal state.
+
+For Git workspaces, staging snapshots tracked and non-ignored untracked files;
+for other workspaces it snapshots ordinary files. Secret-like paths and text
+content, symlinks, generated cache directories, and files above the per-file
+limit are excluded; aggregate file/size limits fail closed.
+This first snapshot backend is intentionally bounded; dependency directories
+excluded by Git may need installation or a later read-only mount design for
+verification.
+
+## Experimental interoperability
+
+LIPAS develops its own task product first. LangGraph, MCP-server, and
+OpenCrew/OpenClaw adapters are experimental compatibility samples: they are
+not core product surfaces and carry no compatibility commitment. See the
+[experimental integration guide](docs/integrations.md) only when an existing
+system genuinely needs such an entry point.
+
 ## Reusable Skills
 
 A Skill is a portable `SKILL.md` instruction file: it captures how an Agent
@@ -195,6 +270,8 @@ in time, not that LIPAS contacted the internet.
   of claims, effects, durable runs, replay, external operations, and Teams.
 - [Roadmap](docs/roadmap.md) — how the runtime and local task workbench advance
   as one LIPAS project.
+- [Experimental integrations](docs/integrations.md) — optional LangGraph,
+  MCP-server, OpenCrew/OpenClaw, and Action Gateway compatibility samples.
 - [Examples](examples/README.md) — focused, runnable scenarios from the high
   level API down to the lower-level harnesses.
 - [Changelog](CHANGELOG.md) — release history.

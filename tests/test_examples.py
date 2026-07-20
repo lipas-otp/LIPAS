@@ -42,7 +42,7 @@ def test_single_agent_lessons_build_durable_agents(tmp_path):
 
 
 def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsys):
-    """Lessons 05–11 must work without Ollama, a network, or pre-made runs/."""
+    """Lessons 05–12 must work without Ollama, a network, or pre-made runs/."""
     monkeypatch.chdir(tmp_path)
     budget = import_module("examples.05_budget_limit").build_agent(
         session=tmp_path / "runs" / "budget.db",
@@ -61,6 +61,7 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
         "examples.09_external_operation",
         "examples.10_research_review_team",
         "examples.11_durable_execution",
+        "examples.12_local_task_product",
     ):
         module = import_module(module_name)
         module.main()
@@ -74,6 +75,12 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
     assert "run state before approval: waiting" in output
     assert "saved notes: ['approved note']" in output
     assert "final run state: completed" in output
+    assert "staged note before approval: after" in output
+    assert "original before apply: before" in output
+    assert "verified: True" in output
+    assert "change set state: ready" in output
+    assert "applied files: ['note.txt']" in output
+    assert "original after apply: after" in output
 
 
 def test_documentation_local_links_resolve():
@@ -115,5 +122,7 @@ def test_lesson_catalogues_and_tutorial_cover_every_numbered_example():
         assert module in chinese
     assert "examples/11_durable_execution.py" in tutorial
     assert "examples/11_durable_execution.py" in tutorial_zh
+    assert "examples/12_local_task_product.py" in tutorial
+    assert "examples/12_local_task_product.py" in tutorial_zh
     assert not Path("docs/getting-started.md").exists()
     assert not Path("docs/getting-started.zh-CN.md").exists()

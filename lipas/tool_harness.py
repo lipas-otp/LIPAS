@@ -74,6 +74,7 @@ raises (ReplayRefused / ReplayMissing) so the session terminates.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import logging
@@ -267,6 +268,8 @@ class ToolHarness:
     rowset: RowSet
     guards: Sequence[Guard] = ()
     tool_replayer: Optional[ToolReplayer] = None
+    argument_resolver: Any | None = None
+    result_sanitizer: Any | None = None
 
     # Internal: tracks whether the session-init claim has been folded
     # for the configured replayer. One harness == one session.
@@ -456,17 +459,33 @@ class ToolHarness:
         status: str  = "ok"
         error_detail: dict | None = None
         try:
-            output = await tool.acall(args)
+            execution_args = (
+                self.argument_resolver(tool, deepcopy(args))
+                if self.argument_resolver is not None else args
+            )
+            raw_output = await tool.acall(execution_args)
+            output = (
+                self.result_sanitizer(raw_output)
+                if self.result_sanitizer is not None else raw_output
+            )
+        except asyncio.CancelledError:
+            # Cancellation cannot prove a sync thread or remote operation
+            # stopped. Keep the already-recorded intent orphaned so recovery
+            # fails closed instead of persisting a false terminal error.
+            raise
         except BaseException as e:
             # BaseException intentional: KeyboardInterrupt / SystemExit
             # still need to fold a result + spend before propagating,
             # otherwise we get an orphan effect_intent and the wall_seconds
             # we burned vanishes.
             status = "error"
+            message: Any = str(e)
+            if self.result_sanitizer is not None:
+                message = self.result_sanitizer(message)
             error_detail = {
                 "type":      "tool_exception",
                 "exception": type(e).__name__,
-                "message":   str(e),
+                "message":   str(message),
             }
             wall_seconds = time.monotonic() - t0
             spend = self._compute_spend(estimate, wall_seconds)

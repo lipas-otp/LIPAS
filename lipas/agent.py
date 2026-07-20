@@ -26,7 +26,7 @@ from .tools import Tool, ToolRegistry
 
 if TYPE_CHECKING:
     from .durable import ApprovalPolicy
-    from .execution import ExecutionStore
+    from .execution import ExecutionStore, Run
 
 __all__ = ["Agent"]
 
@@ -50,6 +50,7 @@ class Agent:
     instructions: str | None = None
     max_tokens: int = 4096
     max_iterations: int = 10
+    max_parallel_tools: int = 4
     skills: SkillRegistry | Sequence[Skill] | str | Path = field(default_factory=SkillRegistry)
     session_path: str | Path | None = None
     budgets: Mapping[str, float] | None = None
@@ -153,6 +154,7 @@ class Agent:
                 extra=dict(self.request_extras),
             ),
             max_iterations=self.max_iterations,
+            max_parallel_tools=self.max_parallel_tools,
             supervisor=supervisor,
         )
 
@@ -171,7 +173,10 @@ class Agent:
         execution_store: ExecutionStore,
         run_id: str,
         lease_seconds: float = 300.0,
+        heartbeat_interval_s: float | None = None,
+        phase_timeout_s: float | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        _claimed_run: Run | None = None,
     ) -> FinalResult:
         """Run or resume this Agent through the durable ReAct phase machine.
 
@@ -219,15 +224,30 @@ class Agent:
                     "resume a durable run with prompt=None; its input is checkpointed",
                 )
             initial = None
-        claimed = execution_store.claim_run(
-            run_id,
-            lease_seconds=lease_seconds,
-        )
+        if _claimed_run is None:
+            claimed = execution_store.claim_run(
+                run_id,
+                lease_seconds=lease_seconds,
+            )
+        else:
+            current = execution_store.get_run(run_id)
+            if (
+                _claimed_run.id != run_id
+                or current is None
+                or current.state is not RunState.RUNNING
+                or not current.lease_token
+                or current.lease_token != _claimed_run.lease_token
+            ):
+                raise ValueError("_claimed_run is not the active Run lease")
+            claimed = current
         runner = DurableReActRunner(
             self.behaviour,
             execution_store,
             claimed,
             approval_policy=approval_policy,
+            lease_seconds=lease_seconds,
+            heartbeat_interval_s=heartbeat_interval_s,
+            phase_timeout_s=phase_timeout_s,
         )
         return await runner.run_to_completion(initial)
 
@@ -237,6 +257,8 @@ class Agent:
         execution_store: ExecutionStore,
         run_id: str,
         lease_seconds: float = 300.0,
+        heartbeat_interval_s: float | None = None,
+        phase_timeout_s: float | None = None,
         approval_policy: ApprovalPolicy | None = None,
     ) -> FinalResult:
         """Resume a checkpointed durable run without appending new input."""
@@ -245,6 +267,8 @@ class Agent:
             execution_store=execution_store,
             run_id=run_id,
             lease_seconds=lease_seconds,
+            heartbeat_interval_s=heartbeat_interval_s,
+            phase_timeout_s=phase_timeout_s,
             approval_policy=approval_policy,
         )
 
