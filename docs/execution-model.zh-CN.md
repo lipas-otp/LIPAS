@@ -125,11 +125,20 @@ runner 会在任何实时模型或工具调用之前 fail closed。
 transition 还会从其 transactional outbox 镜像至该 Claim tape；控制决策仍以
 execution database 为准。
 
-持久循环会在每次模型调用前后、每个工具结果之后、每次 observation 完成后，以及
-terminal settlement 之前保存 checkpoint。模型与工具 Effect 使用 run 范围内的
+持久循环会在每次模型调用前后、每个串行工具结果或安全并行 batch 完成后、每次
+observation 完成后，以及 terminal settlement 之前保存 checkpoint。模型与工具 Effect 使用 run 范围内的
 确定性 identity。如果进程在 terminal Effect 已记录、对应 checkpoint 尚未写入时
 中止，下一位 lease owner 会从 Effect tape 恢复结果；如果只有 intent，则恢复会抛出
 `OrphanedEffectError`，不会猜测再次提交是否安全。
+
+同一模型 reply 可以请求多个彼此独立的工具。最多
+`Agent(max_parallel_tools=4)` 个连续 `pure`/`read_only` 调用可以并发执行；返回给模型的
+result block 仍保持原顺序，每个调用也保留各自确定性的 Effect identity。因此，结果已经
+完成、batch checkpoint 尚未写入时发生崩溃，恢复不会重复实时执行。write 始终串行；
+启用硬 budget、guard、tool replay cursor 或自定义 argument/result hook 时也保持串行，
+因为并发 preflight 可能依据过期的 policy/accounting state 错误放行。只有 intent 的
+在途调用仍是 orphan；并行不会
+削弱这条失败关闭规则。
 
 审批 policy 可以在工具执行前以原子方式保存 checkpoint，并把 Run 转为 `waiting`。
 使用 `allow=True` 解决 Interrupt 后，Run 会重新变为可 claim；
@@ -137,10 +146,51 @@ terminal settlement 之前保存 checkpoint。模型与工具 Effect 使用 run 
 目前要求 Agent 使用 SQLite session。协作式 cancellation 会写入 checkpoint；带取消
 请求且已经过期的 lease 可以被重新 claim，但只能用于完成取消。durable run 中的
 supervisor tick 使用稳定 claim identity，因此 recommendation 已写入、checkpoint 尚未
-保存时发生崩溃，也能在恢复时修复而不重复 recommendation。timeout policy 与自动
-lease heartbeat 仍属于后续工作。恢复契约还通过真实 subprocess 测试验证：已完成
+保存时发生崩溃，也能在恢复时修复而不重复 recommendation。开发主线已加入自动
+lease heartbeat 和模型/工具阶段 timeout；同步工具移出 event loop，取消时因无法证明
+线程已经停止而保留 orphan。更广泛的 timeout recovery policy 仍属于后续工作。恢复
+契约还通过真实 subprocess 测试验证：已完成
 write Effect、尚未写入其 checkpoint 时发送 `SIGKILL`，重启会恢复 Effect result，
 不会第二次执行 write。
+
+## 持久本地 Task 调度
+
+`TaskDispatcher` 把 pending Run 变成有并发上限的本地 worker 队列，但不创建第二份
+scheduler 数据库。发现 candidate 只是提示；带条件的 `ExecutionStore.claim_run()`
+transition 才是原子所有权边界，因此两个 worker 不能执行同一 active lease。pending Run
+按 FIFO 调度；重启后可以领取过期 running lease，包括只用于完成取消的恢复路径。
+
+多个 Task 可以并发，但每个 Run 都拥有独立 SQLite Claim/Effect session。全局 execution
+database 负责 Task/Run/lease 状态；每 Run session 负责模型/工具证据和 budget。这样不会
+让无关 Task 共享 single-writer Claim seq 或同一 budget projection。旧布局产生、已经绑定
+checkpoint 的 Run 会继续使用原来的 session。
+
+Run 因审批进入 `waiting` 时会释放 lease 和 worker 槽位；使用 `allow=True` 解决 Interrupt
+后，它回到 `pending`，可由 worker 重新领取并恢复。`lipas task submit` 持久化任务，
+`lipas task worker` 持续调度，`--max-concurrency` 限制同时执行的 Task 数。停止 worker
+会取消其本地 heartbeat；尚未结算的 lease 必须过期后才能被另一 worker 领取。
+
+## Staged ChangeSet 与交付
+
+第一方 CLI Task 会获得每 Run 独立 staging workspace。Agent 在其中读取、写入和运行验证；
+Run 执行期间，用户选择的 source workspace 保持不变。staged write 仍保留正常的
+idempotent Effect 分类，但因为它被限制在产品状态内部，不再逐项要求人工审批。command
+仍保留审批与 OS 隔离边界。
+
+Run 完成后，workbench 将 stage 与 baseline 比较，把 ChangeSet 标记为 `ready`。报告和
+`lipas task diff` 展示完整文件变更；`lipas task apply` 是显式交付决定，并且只允许用于
+已完成 Run。修改任何 destination 之前，它会验证每个 changed path 仍等于记录的 baseline，
+或已经等于 staged desired hash；任何无关漂移都会失败关闭。
+
+每个文件替换都是原子的。多文件 apply 不是一个 filesystem transaction，但可以在重启后
+继续：已经等于 desired hash 的 path 被视为已完成，其余仍处于 baseline 的 path 继续应用。
+discarded stage 不可 apply，applied stage 不可 discard。apply/discard transition 会持久化为
+产品事件，并更新报告 delivery 状态。
+
+首版 snapshot backend 对 Git workspace 复制 tracked/未 ignore 文件，对非 Git workspace
+复制普通文件；在持久化前排除疑似 secret 路径/文本、symlink、超大文件和常见生成 cache，
+并执行总文件数/字节上限。它是
+受限安全 backend，尚不是 copy-on-write filesystem 或 Git worktree transaction。
 
 ## Team：可靠 handoff，不是图 DSL
 

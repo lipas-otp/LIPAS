@@ -309,8 +309,8 @@ checkpoint 无法证明某项 effect 是否已经完成。应通过 `resume_dura
 checkpoint。
 
 运行 [`examples/11_durable_execution.py`](../examples/11_durable_execution.py) 可查看
-完全不依赖 provider 的审批/恢复流程。自动 lease heartbeat、timeout recovery 和
-Agent-level token streaming 目前仍未提供；精确失败语义见
+完全不依赖 provider 的审批/恢复流程。自动 lease heartbeat 与有类型的模型/工具阶段
+timeout 已经提供；更广泛的 timeout recovery 和 Agent-level token streaming 尚未提供。精确失败语义见
 [执行模型](execution-model.zh-CN.md#持久-react-run)。
 
 ## 11. 引导式项目
@@ -326,6 +326,7 @@ Agent-level token streaming 目前仍未提供；精确失败语义见
 | [Safe external operation](../examples/09_external_operation.py) | 第 7–8 章 | idempotency key、失败后的不确定性、reconciliation 和 audit record。 |
 | [Research review Team](../examples/10_research_review_team.py) | 第 9 章 | 两个独立 owner 的 handoff，以及稳定 message identity。 |
 | [Durable execution](../examples/11_durable_execution.py) | 第 10 章 | 分离的 execution/effect store、持久审批 Interrupt，以及恢复同一个 run。 |
+| [Local task product](../examples/12_local_task_product.py) | 第 10 章 | 隔离的 ChangeSet、命令审批、重启恢复、验证证据、review 与显式 apply。 |
 
 例如，使用本地 Ollama 模型运行前三个：
 
@@ -335,7 +336,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-后三个不依赖 provider。包括 replay 和 supervision 的完整示例目录见
+后四个不依赖 provider。包括 replay 和 supervision 的完整示例目录见
 [examples/README.zh-CN.md](../examples/README.zh-CN.md)。
 
 ## API 卡片

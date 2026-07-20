@@ -145,13 +145,25 @@ opened by an incompatible release. If `ExecutionStore` is constructed with
 from its transactional outbox into that Claim tape; the execution database
 remains authoritative for control decisions.
 
-The durable loop checkpoints before and after each model call, after every tool
-result, after each completed observation, and before terminal settlement. Model
-and tool Effects receive deterministic identities scoped to the run. If a
+The durable loop checkpoints before and after each model call, after each
+serial tool result or completed safe parallel batch, after each observation,
+and before terminal settlement. Model and tool Effects receive deterministic
+identities scoped to the run. If a
 process stops after a terminal Effect was recorded but before its checkpoint,
 the next lease owner restores that result from the Effect tape. If only the
 intent exists, recovery raises `OrphanedEffectError` instead of guessing that a
 second submission is safe.
+
+One model reply may request several independent tools. Up to
+`Agent(max_parallel_tools=4)` contiguous `pure`/`read_only` calls can execute
+concurrently. Result blocks retain the model's original order, and every call
+keeps its own deterministic Effect identity, so a crash after results but
+before the batch checkpoint restores them without repeating live work. Writes
+always remain serial. Calls also remain serial when hard budgets, guards, a
+tool replay cursor, or custom argument/result hooks are active, because
+concurrent preflight could otherwise admit work against stale
+policy/accounting state. An in-flight call with only
+an intent remains an orphan; parallelism does not weaken that fail-closed rule.
 
 An approval policy can atomically checkpoint and move the Run to `waiting`
 before a tool executes. Resolving the Interrupt with `allow=True` makes the Run
@@ -161,10 +173,64 @@ SQLite Agent session. Cooperative cancellation is checkpointed and an expired
 cancel-requested lease can be reclaimed solely to finish cancellation.
 Supervisor ticks use stable claim identities in durable runs, so recovery can
 repair a crash between a recommendation and its checkpoint without duplicating
-the recommendation. Timeout policy and automatic lease heartbeats remain
-future work. The recovery contract is exercised with a real subprocess
+the recommendation. The development line now includes automatic lease
+heartbeats and model/tool phase timeouts. Sync tools leave the event loop;
+cancellation leaves an orphan when the runtime cannot prove that the thread
+stopped. Broader timeout recovery policy remains future work. The recovery
+contract is exercised with a real subprocess
 `SIGKILL` after a completed write Effect and before its checkpoint: restart
 restores the Effect result and does not execute the write a second time.
+
+## Persistent local Task dispatch
+
+`TaskDispatcher` turns pending Runs into a bounded local worker queue without
+creating another scheduler database. Discovery is advisory; the conditional
+`ExecutionStore.claim_run()` transition is the atomic ownership boundary, so
+two workers cannot execute the same active lease. Pending Runs are dispatched
+FIFO. Expired running leases are reclaimable after restart, including the
+cancel-only recovery path.
+
+Several Tasks may execute concurrently, but each Run owns a separate SQLite
+Claim/Effect session. The global execution database owns Task/Run/lease state;
+per-Run sessions own model/tool evidence and budgets. This avoids sharing the
+single-writer Claim sequence or one budget projection across unrelated Tasks.
+Runs created before this layout retain their checkpoint-bound legacy session.
+
+A Run that suspends for approval becomes `waiting`, drops its lease, and frees
+the worker slot. Resolving the Interrupt with `allow=True` returns it to
+`pending`; a worker may then claim and resume it. `lipas task submit` persists
+work, `lipas task worker` continuously dispatches it, and `--max-concurrency`
+bounds simultaneous Tasks. Stopping a worker cancels its local heartbeat; the
+unsettled lease must expire before another worker can reclaim the Run.
+
+## Staged ChangeSets and delivery
+
+First-party CLI Tasks receive a per-Run staging workspace. The Agent reads,
+writes, and runs verification there; the selected source workspace remains
+unchanged while the Run executes. Staged writes retain their normal idempotent
+Effect classification but do not require individual human approval because
+they are contained inside product state. Commands keep their approval and OS
+isolation boundary.
+
+When the Run completes, the workbench compares the stage with its baseline and
+marks the ChangeSet `ready`. The report and `lipas task diff` expose the full
+file change. `lipas task apply` is the explicit delivery decision and is
+allowed only for a completed Run. Before touching any destination, it verifies
+that every changed path is still either at its recorded baseline or already at
+the desired staged hash. Any unrelated drift fails closed.
+
+Each file replacement is atomic. Applying several files is not one filesystem
+transaction, but the operation is restartable: a path already equal to its
+desired hash is accepted, while remaining baseline paths continue. A discarded
+stage cannot be applied, and an applied stage cannot be discarded. Apply and
+discard transitions are persistent product events and update report delivery
+state.
+
+The first snapshot backend copies Git tracked/non-ignored files, or ordinary
+files for a non-Git workspace. Before persistence it excludes likely secret
+paths/text, symlinks, oversized files, and common generated caches, and it
+enforces aggregate file/byte limits. This is a bounded safety
+backend, not yet a copy-on-write filesystem or Git worktree transaction.
 
 ## Teams: reliable handoff, not a graph DSL
 

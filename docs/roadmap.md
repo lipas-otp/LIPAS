@@ -2,20 +2,30 @@
 
 > Language: [English](roadmap.md) | [中文](roadmap.zh-CN.md)
 >
-> Status: Draft 0.2  
-> Date: 2026-07-18
+> Status: Draft 0.3
+> Date: 2026-07-20
 
 ## Product direction
 
-LIPAS is one trustworthy AI execution system with two layers:
+LIPAS is a local trustworthy task agent for individuals and small teams. It
+owns the complete path from a selected workspace and task to approval,
+interruption recovery, verification, and evidence-backed delivery. It has two
+implementation layers:
 
 - an embeddable Python runtime for Agents, tools, effects, replay, budgets,
   supervision, and durable coordination;
 - a first-party local task workbench for running real workspace tasks with
   approvals, recovery, and delivery evidence.
 
-The runtime is available today. The workbench is in development. They share
-one repository, roadmap, release line, and execution model.
+The runtime is available today. The workbench is available as a bounded
+0.20.0 product alpha and remains under active development. They share one
+repository, roadmap, release line, and execution model.
+
+Product precedence is explicit: the local task workbench and later product
+surfaces are the independent user-facing product; the Python runtime is its
+internal reliability foundation and an optional advanced embedding surface.
+LangGraph, MCP-server, and OpenCrew/OpenClaw adapters are experimental
+compatibility samples, not roadmap commitments or core product surfaces.
 
 The first product goal is not to support the most models or Agent roles. It is
 to make users willing to delegate a real write operation because they can see
@@ -40,8 +50,10 @@ Filesystem / Shell / Git / HTTP / MCP / Model providers
 
 This is an internal architecture boundary, not a project boundary. The
 workbench may depend on the runtime; the runtime must not depend on workbench
-concepts. Both layers use the runtime Effect record rather than maintaining
-parallel audit-event models.
+concepts. Tool/model execution evidence remains in the runtime Effect record;
+the workbench adds only product-lifecycle events such as task creation,
+approval, artifact, verification, and report delivery rather than duplicating
+the Effect tape.
 
 A capability moves into the runtime only when a real workbench flow needs it,
 it contains no Task, Workspace, UI, or product-policy concepts, and it can be
@@ -98,31 +110,60 @@ a crash. A real subprocess
 `SIGKILL` test verifies that a completed write Effect is restored rather than
 executed again when its following checkpoint was interrupted.
 
-Caller-facing token streaming, automatic lease heartbeats, and the complete
-task-workbench experience remain roadmap work. The execution state store and
-the claim/Effect session are deliberately separate durable records, and a
-durable Agent currently requires both SQLite stores.
+The 0.10.0 release did not yet include caller-facing token streaming,
+automatic lease heartbeats, or the complete task-workbench experience. The
+execution state store and the claim/Effect session are deliberately separate
+durable records, and a durable Agent currently requires both SQLite stores.
+
+The 0.20.0 product alpha begins the product release line and adds automatic
+lease heartbeat, model/tool
+phase timeouts, safe parallel execution for independent read tools, the first
+Workspace/Approval/Artifact/Verification/Report product models, bounded
+filesystem/Shell/Git capabilities, a persistent bounded multi-Task dispatcher,
+staged ChangeSets with drift-checked apply/discard delivery, and the `lipas task`
+CLI. Each Run owns an isolated Claim/Effect session while
+the global execution store remains the queue. Workbench commands use fail-closed Bubblewrap filesystem/network isolation
+by default; raw secrets are rejected before persistence, and allowlisted
+environment references are resolved only at tool execution. Product-lifecycle
+events are durable and available as JSONL. An end-to-end test covers task
+creation, write approval, recovery, verification approval, recovery, and report
+delivery. Live UI streaming, broader timeout recovery policy, and validation
+with real design partners remain unfinished.
 
 ## Delivery phases
 
 ### Phase 1: reliable execution slice
 
-- Extend the shipped ReAct checkpoints with lease heartbeats and timeout
-  handling.
-- Add high-level model and tool streaming.
-- Add timeout recovery around the shipped durable cancellation, approval
+- [x] Extend the shipped ReAct checkpoints with lease heartbeats and phase
+  timeouts.
+- [x] Execute independent reads concurrently while keeping writes and
+  policy/accounting-sensitive calls serial and recoverable.
+- [x] Persist submitted Tasks and dispatch several Runs concurrently with
+  atomic leases, heartbeat, expired-run reclaim, and approval slot release.
+- [x] Keep task writes in a per-Run staging workspace and require an explicit,
+  drift-checked ChangeSet apply or discard delivery decision.
+- [ ] Add high-level model and tool streaming.
+- [ ] Add timeout recovery around the shipped durable cancellation, approval
   interrupt/resume, and orphan detection paths.
-- Add Task, Workspace, Run, Approval, Artifact, and Report application models.
-- Add bounded filesystem, Shell, and Git capabilities.
-- Run an end-to-end `inspect → change → verify → report` flow from the CLI.
+- [x] Add Task, Workspace, Run, Approval, Artifact, Verification, and Report
+  application models.
+- [x] Add bounded filesystem, Shell, and Git capabilities.
+- [x] Add fail-closed OS isolation for first-party command execution.
+- [x] Reject raw secrets before persistence and resolve allowlisted references
+  only at tool execution.
+- [x] Persist task lifecycle events for stream-friendly product consumption.
+- [x] Run an end-to-end `inspect → change → verify → report` flow from the CLI.
 
-Exit criterion: the same task can recover after process termination without
-silently losing state or repeating a completed write.
+Exit criterion: the same CLI workspace task recovers across long calls and
+process termination without silently losing state or repeating a completed
+write; path escapes are denied; every write and command has approval and
+evidence; and the report states changes, verification, and uncertainty.
 
 ### Phase 2: CLI private alpha
 
-- Add HTTP and MCP capabilities.
-- Persist the approval inbox and approval consumption.
+- Add first-party HTTP and MCP client capabilities needed by real LIPAS tasks.
+- Turn the shipped CLI approval inbox and its single-consumption state into a
+  focused diff/risk operator experience.
 - Show risk, budget, diff, commands, verification, and uncertain operations.
 - Make installation and the first real task usable without maintainer help.
 - Work with 3–5 design partners on recurring workspace tasks.

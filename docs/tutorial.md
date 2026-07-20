@@ -334,9 +334,10 @@ a lease or calling the provider again. Execution schema mismatches fail at open
 time instead of interpreting an incompatible checkpoint.
 
 Run [`examples/11_durable_execution.py`](../examples/11_durable_execution.py)
-for a provider-free approval/resume flow. Automatic lease heartbeat, timeout
-recovery, and Agent-level token streaming are not yet provided; the exact
-failure semantics are in the [execution model](execution-model.md#durable-react-runs).
+for a provider-free approval/resume flow. Automatic lease heartbeat and typed
+model/tool phase timeouts are provided; broader timeout recovery and Agent-level
+token streaming are not. The exact failure semantics are in the
+[execution model](execution-model.md#durable-react-runs).
 
 ## 11. Guided projects
 
@@ -352,6 +353,7 @@ the LIPAS boundary before replacing a tool body with a real client.
 | [Safe external operation](../examples/09_external_operation.py) | Chapters 7–8 | Idempotency keys, uncertainty after failure, reconciliation, and an audit record. |
 | [Research review Team](../examples/10_research_review_team.py) | Chapter 9 | Two independently owned handoffs with stable message identities. |
 | [Durable execution](../examples/11_durable_execution.py) | Chapter 10 | Separate execution/effect stores, a durable approval Interrupt, and resume of the same run. |
+| [Local task product](../examples/12_local_task_product.py) | Chapter 10 | An isolated ChangeSet, command approval, restart, verification evidence, review, and explicit apply. |
 
 Run the first three with a local Ollama model, for example:
 
@@ -361,7 +363,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-The latter three are provider-free. The complete example catalogue, including
+The latter four are provider-free. The complete example catalogue, including
 replay and supervision, is in [examples/README.md](../examples/README.md).
 
 ## API card

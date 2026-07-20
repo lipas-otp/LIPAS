@@ -41,7 +41,7 @@ main()                      # 一项清晰的业务请求与可见结果
 ## 第二部分：每次增加一个可靠性边界
 
 这些课程均可独立运行。第 05 课需要 `ollama` extra，因为它会构建 Ollama-backed
-Agent；但它会在联系 Ollama daemon 或模型之前拒绝请求。第 06–11 课只使用 core
+Agent；但它会在联系 Ollama daemon 或模型之前拒绝请求。第 06–12 课只使用 core
 package，完全可以离线运行。
 
 | 课次 | 运行 | 所讲边界 | 在何时加入 |
@@ -53,6 +53,7 @@ package，完全可以离线运行。
 | 09 | `python -m examples.09_external_operation` | idempotency、不确定性与 reconciliation | provider write 可能在崩溃前已经发生。 |
 | 10 | `python -m examples.10_research_review_team` | 双 owner 的证据与 review workflow | 一个 assistant 已不再适合承担全部归属。 |
 | 11 | `python -m examples.11_durable_execution` | 带 checkpoint 的审批暂停与恢复 | 同一个 Agent run 必须在等待或中断后安全继续。 |
+| 12 | `python -m examples.12_local_task_product` | 暂存变更、审批、重启恢复、验证与显式交付 | 需要完整理解第一方本地任务产品边界。 |
 
 ## 可复用 Skill
 
