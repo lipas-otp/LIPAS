@@ -127,6 +127,22 @@ def test_expired_run_is_fenced_across_store_connections(tmp_path):
         second_store.close()
 
 
+def test_late_heartbeat_can_renew_until_a_replacement_changes_the_token(tmp_path):
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, first = _active_run(store, tmp_path)
+        renewed = store.renew_lease(
+            first.id, first.lease_token or "", lease_seconds=10, now=161,
+        )
+        assert renewed.lease_expires == 171
+
+        replacement = store.claim_run(first.id, lease_seconds=10, now=172)
+        assert replacement.lease_token != first.lease_token
+        with pytest.raises(ExecutionLeaseError):
+            store.renew_lease(
+                first.id, first.lease_token or "", lease_seconds=10, now=173,
+            )
+
+
 def test_live_run_cannot_be_claimed_twice(tmp_path):
     with ExecutionStore(tmp_path / "execution.db") as store:
         _, run = _active_run(store, tmp_path)

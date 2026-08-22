@@ -1,7 +1,8 @@
 # tests/conftest.py —— pytest autoload it, to add project root to sys.path
 # """Shared fixtures for B2 replay-tools tests."""
 from __future__ import annotations
-import sys, pathlib
+import sys
+import pathlib
 import pytest
 
 from lipas.calculus import make_default_registry

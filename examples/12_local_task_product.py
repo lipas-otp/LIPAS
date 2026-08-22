@@ -103,7 +103,7 @@ async def run_demo(root: Path = Path("runs")) -> None:
             tools=workbench.workspace_tools(task.id, run.id),
             session_path=claims_path,
         ) as agent:
-            workbench.attach_rowset(agent.rowset)
+            workbench.attach_rowset(agent.rowset, run_id=run.id)
             try:
                 await agent.run_durable(
                     task.goal,
@@ -139,7 +139,7 @@ async def run_demo(root: Path = Path("runs")) -> None:
             tools=workbench.workspace_tools(task.id, run.id),
             session_path=workbench.claims_path_for_run(run.id),
         ) as agent:
-            workbench.attach_rowset(agent.rowset)
+            workbench.attach_rowset(agent.rowset, run_id=run.id)
             result = await agent.resume_durable(
                 execution_store=workbench.execution,
                 run_id=run.id,

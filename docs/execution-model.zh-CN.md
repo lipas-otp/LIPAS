@@ -203,12 +203,13 @@ recovery。投递是 at-least-once：崩溃成员的 lease 可到期，同一稳
 自己的 authority 和 budget；跨 Team budget sharing、capability delegation 与
 mailbox replay 都是明确的应用工作。
 
-## 当前的 streaming 边界在更底层
+## 一套公共 streaming event 协议
 
 `LLMHarness.stream(...)` 可以产出规范化的 `Delta`、`ToolUseDelta` 和终止的
 `Done` event，同时保存相同 effect record。一旦 event 对外可见，该 attempt 不会
-重试：已经输出的内容无法收回。高层 `Agent` API 有意只返回最终 `FinalResult`，
-目前尚不提供面向调用者的 token streaming。
+重试：已经输出的内容无法收回。`Agent.run()` 返回最终 `FinalResult`；
+`Agent.stream()`、`Session` 与 durable cursor catch-up 在应用边界提供规范化事件。
+诚实标记为 single-shot 的 adapter 只提供生命周期事件，不伪装成 token delta。
 
 ## 有意不做的边界
 

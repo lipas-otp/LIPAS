@@ -36,7 +36,6 @@ from lipas.supervisor import (
     Supervisor,
     TAG_GOAL_BLOCKED,
     TAG_SUPERVISOR_ESCALATE,
-    TAG_SUPERVISOR_RETRY,
     TAG_SUPERVISOR_TERMINATE,
     TerminateAction,
 )

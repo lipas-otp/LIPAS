@@ -104,6 +104,12 @@ class TestKindCoverage:
             ErrorKind.TIMEOUT,
         )
 
+    def test_timeout_via_http_408(self):
+        self._assert_triple(
+            err_reply({"type": "http_error", "status_code": 408, "body": {}}),
+            ErrorKind.TIMEOUT,
+        )
+
     def test_network_via_connect_error(self):
         self._assert_triple(
             err_reply({
@@ -145,6 +151,18 @@ class TestKindCoverage:
             ErrorKind.AUTH,
         )
 
+    def test_auth_via_provider_code(self):
+        self._assert_triple(
+            err_reply({
+                "type": "provider_error",
+                "provider_error": {
+                    "code": "invalid_api_key",
+                    "message": "the supplied key is invalid",
+                },
+            }),
+            ErrorKind.AUTH,
+        )
+
     def test_invalid_request_via_http_400(self):
         self._assert_triple(
             err_reply({
@@ -167,6 +185,16 @@ class TestKindCoverage:
                     "type": "invalid_request_error",
                     "message": "prompt is too long: 250000 tokens > 200000",
                 }},
+            }),
+            ErrorKind.CONTEXT_LENGTH,
+        )
+
+    def test_context_length_via_http_400_code(self):
+        self._assert_triple(
+            err_reply({
+                "type": "http_error",
+                "status_code": 400,
+                "body": {"error": {"code": "context_length_exceeded"}},
             }),
             ErrorKind.CONTEXT_LENGTH,
         )

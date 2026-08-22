@@ -244,13 +244,15 @@ This is intentionally smaller than distributed ownership or a workflow graph.
 Each Agent keeps its own authority and budget today; cross-Team budget sharing,
 capability delegation, and mailbox replay are explicit application work.
 
-## Streaming: a lower-level boundary today
+## Streaming: one public event protocol
 
 `LLMHarness.stream(...)` can yield normalized `Delta`, `ToolUseDelta`, and
 terminal `Done` events while preserving the same effect record. Once an event
 is visible, that attempt is not retried: emitted output cannot be taken back.
-The high-level `Agent` API deliberately returns a final `FinalResult` only; it
-does not yet expose caller-facing token streaming.
+`Agent.run()` returns a final `FinalResult`; `Agent.stream()`, `Session`, and
+durable cursor catch-up expose the normalized events at the application
+boundary. Adapters that are honestly marked single-shot emit lifecycle events
+without pretending to provide token deltas.
 
 ## Deliberate boundaries
 

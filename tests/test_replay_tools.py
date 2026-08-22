@@ -15,10 +15,26 @@ class mismatch policy, and non-STRICT modes.
 """
 from __future__ import annotations
 
+import warnings as _warnings
+
 import pytest
 import pytest_asyncio
 
 from lipas.replay_tools import (
+    F_DECISION_DECLARED_CLASS,
+    F_DECISION_EFFECTIVE_CLASS,
+    F_DECISION_FROZEN_MAX_SEQ,
+    F_DECISION_MODE,
+    F_DECISION_OPERATION,
+    F_DECISION_SESSION_INIT,
+    F_DECISION_SOURCE_EFFECT_ID,
+    F_DECISION_TARGET_EFFECT_ID,
+    LipasDangerousReplayWarning,
+    LipasIdempotencyKeyMissingWarning,
+    LipasReplayClassDowngradeError,
+    LipasReplayClassDowngradeWarning,
+    LipasReplayClassUpgradeWarning,
+    ReplayConfigError,
     ReplayMissing,
     ReplayMode,
     TAG_REPLAY_DECISION,
@@ -28,8 +44,7 @@ from lipas.rows.capability import CapabilityRow
 from lipas.rows.effect import EffectRow
 from lipas.rows.history import HistoryRow
 from lipas.tool_harness import ToolHarness
-
-
+from lipas.tools import SideEffectClass
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -320,31 +335,6 @@ class TestStoreIsolation:
 
         assert len(rs_live.store) == snapshot, \
             "replay must never fold into the recording store"
-
-
-# ─────────────────────────────────────────────────────────────────────
-
-import warnings as _warnings
-
-from lipas.replay_tools import (
-    F_DECISION_DECLARED_CLASS,
-    F_DECISION_EFFECTIVE_CLASS,
-    F_DECISION_FROZEN_MAX_SEQ,
-    F_DECISION_MODE,
-    F_DECISION_OPERATION,
-    F_DECISION_REASON,
-    F_DECISION_SESSION_INIT,
-    F_DECISION_SOURCE_EFFECT_ID,
-    F_DECISION_TARGET_EFFECT_ID,
-    LipasDangerousReplayWarning,
-    LipasIdempotencyKeyMissingWarning,
-    LipasReplayClassDowngradeError,
-    LipasReplayClassDowngradeWarning,
-    LipasReplayClassUpgradeWarning,
-    ReplayConfigError,
-    ReplayDecision,
-)
-from lipas.tools import SideEffectClass
 
 
 # ── helpers for direct-decide tests ──────────────────────────────────

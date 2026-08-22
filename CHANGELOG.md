@@ -1,5 +1,156 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `lipas model check` validates an OpenAI-compatible URL, model, API-key
+  environment source, transport mode, token-limit field, and honest default
+  capabilities without sending a network request. Explicit `--live` performs
+  one minimal, potentially billable provider contract probe and reports
+  normalized usage or a classified, credential-redacted error.
+- Compatible CLI routes accept explicit `--no-api-key` for trusted local
+  no-auth gateways. Credential flags are mutually exclusive, provider-only
+  arguments fail when they would be ignored, and a custom probe prompt is
+  rejected unless `--live` is present.
+
+## [0.32.0] — 2026-08-11 · Compatible Model Endpoints Alpha
+
+### Added
+
+- `OpenAICompatibleAdapter` for the de-facto `/chat/completions` contract used
+  by OpenAI, Volcengine Ark, Alibaba Bailian, Tencent Hunyuan, DeepSeek,
+  private gateways, and other compatible providers. A versioned API root or
+  complete endpoint URL, model name, and Bearer API key are explicit.
+- `Agent.openai_compatible(...)` as the high-level factory, with the same
+  Session, Effect, tool, cancellation, deadline, durable execution, and
+  Workbench semantics as existing Agents.
+- Compatible endpoint flags for `lipas chat` and every Task command that
+  executes a model: `--base-url`, `--api-key-env`, `--model-streaming`, and
+  `--max-tokens-field`.
+- Compatibility-first single-response parsing plus opt-in SSE streaming for
+  text, reasoning, tool-call arguments, terminal usage, comments, and common
+  SSE data framing.
+- A bilingual provider guide with secure Python/CLI examples and current URL
+  shapes for the named provider families.
+- A provider-neutral `lipas[compatible]` installation extra; the existing
+  `lipas[openai]` extra remains an equivalent compatibility alias.
+
+### Changed
+
+- Generic compatible endpoints now advertise two honest transport capability
+  identities: `openai-compatible` is single-response and
+  `openai-compatible-stream` is real SSE. Model-specific tool, structured
+  output, reasoning, context, and locality capabilities remain unknown until
+  the application registers a tested route. Vision is explicitly unsupported
+  by the current text/tool-only adapter boundary.
+- Non-streaming is the compatible-provider default. Streaming, usage stream
+  options, custom non-authentication headers, and
+  `max_completion_tokens` are explicit rather than silently guessed.
+
+### Safety
+
+- Endpoint validation rejects non-HTTP(S), relative, credential-bearing,
+  query-bearing, and fragment-bearing URLs, and appends
+  `/chat/completions` exactly once.
+- The CLI accepts only an API-key environment-variable name; it never accepts
+  a plaintext API key argument. Authorization, host, content framing, and
+  adapter-owned request fields cannot be overridden through custom headers or
+  request extras.
+- Exact API-key values echoed by a provider are redacted from HTTP error
+  bodies. Authentication, rate-limit, timeout, network, 4xx/5xx, content
+  filter, malformed JSON/tool calls/usage, multiple choices, unknown finish
+  reasons, and incomplete streams all terminate through the audited Reply
+  error contract.
+
+### Verified
+
+- 610 tests pass, including provider URL shapes, message/tool translation,
+  deterministic legacy tool ids, SSE assembly, capability validation, CLI
+  construction, error classification, and credential redaction.
+- Mypy passes the complete public package. Ruff passes every 0.32-changed
+  source and test; bytecode compilation, documentation links, the provider-free
+  authority Tour, and whitespace checks pass.
+
+## [0.31.0] — 2026-08-10 · Unified Local Runtime Alpha
+
+### Added
+
+- `LIPASRuntime.open()` as the lifecycle owner for execution, Claims,
+  operations, artifacts, and persistent audit checks.
+- Provider-neutral `AgentEvent`, persisted durable event cursors, `Session`,
+  optimistic SQLite conversation snapshots, and cancellable `RunHandle`.
+- Run-wide `RunContext` identity, cooperative cancellation, absolute monotonic
+  deadlines, and a scoped context accessor for async and sync tools.
+- Authority-separated durable `InputPolicy` interrupts.
+- Honest `ModelCapabilities`, explicit `ModelRequirements`, and explainable
+  compatibility reports.
+- Behaviour-neutral read-only `RunObserver` snapshots and advisory recorded
+  recommendations.
+- Workspace schema v2: compatible execution, product, operation, handoff,
+  conversation, and global evidence tables now share `workspace.db` behind
+  `LIPASRuntime`. Per-Run Claim/Effect tapes remain isolated deliberately.
+- Explicit `lipas migrate plan/apply/verify/rollback` commands. Migration uses
+  consistent SQLite backups, assembles a temporary target, verifies row
+  counts, integrity, foreign keys, event cursors, and control invariants, then
+  atomically activates it. Legacy files are retained.
+- Read-only `lipas doctor` and `lipas audit` diagnostics, with an explicit
+  `audit --repair` path for recoverable audit mirrors.
+- A provider-free `lipas tour --offline` vertical that proves Input cannot
+  execute its tool body or grant write authority, Approval authorizes one
+  write, and the resumed Run produces durable events, an Artifact, a Report,
+  and a healthy audit in a disposable workspace.
+
+### Changed
+
+- Ordinary and durable ReAct execution now reuse terminal and state-transition
+  reducers. Existing Supervisor and Workbench APIs remain compatible.
+- Every first-party `lipas task` command now opens state through
+  `LIPASRuntime`; CLI, Python API, Sessions, Handoffs, Operations, and the
+  Workbench no longer select independent global database paths.
+- Opening legacy state never performs an implicit migration. It fails with an
+  actionable migration command, while direct legacy Store constructors remain
+  available through the compatibility window.
+- Removed the obsolete duplicated getting-started documents; the tested
+  tutorial is the single onboarding path.
+- `doctor` now probes the default sandbox instead of treating discovery on
+  `PATH` as operational capability. Migration verification remains a focused
+  storage-only check, and read-only audit explicitly reports Claim lint as
+  not run.
+
+### Fixed
+
+- Runtime, Agent, Workbench, and schema-bootstrap cleanup now attempts every
+  owned resource while preserving the original execution/composition error.
+- Durable event catch-up and terminal reconnect tolerate a failed UI event
+  sink without hiding the persisted Run result.
+- Runtime Claim audit/repair now covers every registered per-Run evidence tape
+  rather than linting and repairing only the global audit projection.
+- Runtime durable convenience calls are serialized so concurrent callers
+  cannot replace and close one another's attached ExecutionStore.
+- Workbench RowSet replacement is failure-atomic. The legacy unscoped
+  `attach_rowset(rowset)` mirror is deprecated in favour of an explicit Run.
+- The offline Tour uses one event loop for its complete suspend/resume flow.
+
+### Safety
+
+- Workspace migration is copy-on-write and preserves both a migration-time
+  backup and the original v1 files. Rollback preserves all v2-only writes in a
+  separate backup instead of deleting them.
+- Persistent audit checks detect SQLite corruption, foreign-key violations,
+  event cursor gaps, invalid waiting/interrupt relationships, and escaped
+  Run-evidence paths.
+- Runtime lifetime leases, stale migration-lock diagnosis, WAL checkpointing,
+  active-writer refusal, and verified SQLite backup prevent rollback from
+  moving live or incomplete workspace state.
+
+### Verified
+
+- 577 tests pass, including schema-v2 migration/rollback, per-Run evidence
+  isolation, concurrent worker recovery, and the provider-free authority tour.
+- Mypy passes the complete public package. Ruff passes every 0.31-changed
+  source, test, and example; bytecode compilation and whitespace checks pass.
+
 ## [0.20.0] — 2026-07-20 · Local Task Product Alpha
 
 ### Added

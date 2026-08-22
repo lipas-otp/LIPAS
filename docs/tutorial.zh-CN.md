@@ -57,7 +57,8 @@ agent = Agent.ollama("qwen2.5:7b", instructions="Be concise.")
 ```
 
 对大多数脚本，`ask()` 是唯一需要的方法。它会运行 async Agent loop，返回一个
-`FinalResult`。当前 API 没有 Agent-level token streaming。
+`FinalResult`。async host 可以使用 `Agent.stream()` 或 `Session`/`RunHandle`
+接收 provider-neutral 生命周期与模型/工具事件。
 
 ## 2. 给 assistant 一项 capability
 
@@ -310,7 +311,7 @@ checkpoint。
 
 运行 [`examples/11_durable_execution.py`](../examples/11_durable_execution.py) 可查看
 完全不依赖 provider 的审批/恢复流程。自动 lease heartbeat 与有类型的模型/工具阶段
-timeout 已经提供；更广泛的 timeout recovery 和 Agent-level token streaming 尚未提供。精确失败语义见
+timeout 已经提供；跨阶段绝对 deadline 与 durable event catch-up 使用同一公共契约。精确失败语义见
 [执行模型](execution-model.zh-CN.md#持久-react-run)。
 
 ## 11. 引导式项目
@@ -346,6 +347,7 @@ python -m examples.04_daily_brief
 | Surface | 日常用途 |
 | --- | --- |
 | `Agent.ollama(model="gemma4:12b", ...)` | 构建本地 Agent；`model` 参数可省略。 |
+| `Agent.openai_compatible(model=..., base_url=..., api_key=...)` | 使用显式 Chat Completions endpoint 构建，不做 provider fallback。 |
 | `Agent(adapter=..., model=..., ...)` | 使用 provider-specific adapter 构建；此处 `adapter` 必填。 |
 | `agent.ask(prompt)` | 同步运行，收到 `FinalResult`。 |
 | `await agent.run(prompt, state=None)` | async 运行；只有刻意续接时才传入之前 state。 |

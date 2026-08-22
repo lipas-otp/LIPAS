@@ -7,26 +7,16 @@ session_init is folded exactly once.
 """
 from __future__ import annotations
 
-import warnings
-from dataclasses import replace
 
 import pytest
 import pytest_asyncio
-
-pytestmark = pytest.mark.asyncio
-
-from lipas.calculus import Claim
 from lipas.replay_tools import (
-    F_DECISION_DECLARED_CLASS,
-    F_DECISION_EFFECTIVE_CLASS,
     F_DECISION_FROZEN_MAX_SEQ,
     F_DECISION_MODE,
     F_DECISION_OPERATION,
-    F_DECISION_REASON,
     F_DECISION_SESSION_INIT,
     F_DECISION_SOURCE_EFFECT_ID,
     F_DECISION_TARGET_EFFECT_ID,
-    LipasDangerousReplayWarning,
     ReplayMissing,
     ReplayMode,
     ReplayRefused,
@@ -36,26 +26,25 @@ from lipas.replay_tools import (
 from lipas.rows.capability import (
     F_AMOUNT,
     F_BUCKET,
-    TAG_BUDGET_OVERRUN,
     TAG_RESOURCE_SPENT,
 )
 from lipas.rows.effect import (
     EffectRow,
-    F_ARGUMENTS,
     F_DETAIL,
     F_EFFECT_ID,
-    F_KIND,
     F_OUTPUT,
     F_REASON,
     F_SIDE_EFFECT,
     F_STATUS,
-    F_TOOL_NAME,
     TAG_EFFECT_INTENT,
     TAG_EFFECT_REJECTED,
     TAG_EFFECT_RESULT,
 )
 from lipas.tool_harness import ToolHarness
 from lipas.tools import SideEffectClass, ToolRegistry, tool
+
+
+pytestmark = pytest.mark.asyncio
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -119,7 +108,8 @@ async def recording(spy_tools, call_log, fresh_rowset):
     await src_h.call(tool_name="spy_add",  arguments={"a": 1, "b": 2})
     await src_h.call(tool_name="spy_send", arguments={"target": "t", "payload": "p"})
     await src_h.call(tool_name="spy_fail", arguments={"x": 7})
-    for k in list(call_log): call_log[k] = 0
+    for k in list(call_log):
+        call_log[k] = 0
     return effect_view(src_rs)  # effect_view helper from conftest.py
 
 

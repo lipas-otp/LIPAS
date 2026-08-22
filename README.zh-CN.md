@@ -12,14 +12,15 @@ Agent  = 一个会思考并使用工具的 assistant
 Team   = 在具名 assistant 或函数之间建立可持久化 handoff
 ```
 
-> **0.20.0 本地任务产品 alpha。** 此版本加入第一方任务工作台与 CLI、带 heartbeat
-> 和恢复能力的持久后台调度、workspace 暂存变更、审批收件箱、隔离命令执行、
-> secret-safe 持久化、验证证据，以及显式 apply/discard。
+> **0.32.0 Compatible 模型端点 Alpha。** 统一 Runtime 现在可以通过显式 URL、model
+> 与 API key 连接 OpenAI-compatible Chat Completions provider，包括火山引擎方舟、
+> 阿里百炼、腾讯混元与 DeepSeek 提供的兼容接口。LIPAS 不隐式 fallback provider/model；
+> 0.31 的 storage 与每 Run 证据边界保持不变。
 
 ## 一个系统，两层能力
 
 ```text
-LIPAS 本地任务工作台（0.20.0 产品 alpha）
+LIPAS 本地任务工作台（0.32.0 compatible-endpoint alpha）
   Task / Workspace / Approval / Artifact / Task CLI / 未来的 Local Web
                               │
                               ▼
@@ -30,6 +31,31 @@ LIPAS Python runtime（当前可用）
 工作台是 LIPAS 执行工作区任务的第一方体验，例如检查文件、进行受控修改、运行验证并
 交付报告。对于需要自有领域模型或界面的应用，Python API 仍然可以独立嵌入。两层能力
 共享同一套 Effect 与审计记录；工作台不会另建一套执行模型。
+
+应用现在可以通过一个 lifecycle owner 打开这些边界：
+
+```python
+from lipas import LIPASRuntime
+
+with LIPASRuntime.open(".lipas") as runtime:
+    runtime.execution
+    runtime.claims
+    runtime.operations
+    runtime.handoffs
+    runtime.sessions
+    runtime.artifacts
+```
+
+全局控制与产品表位于 `.lipas/workspace.db`。每个 Run 的 Claim/Effect tape 继续位于
+`.lipas/runs/<run-id>/claims.db`，从而保持 budget 与 replay 隔离，而不会形成第二套
+Task/Run 状态机。打开旧工作区绝不会静默改写数据；请先运行 `lipas migrate plan`，再以
+`lipas migrate apply --yes` 显式迁移。migration 与 rollback 采用 copy-on-write，保留并
+验证备份、处理 SQLite WAL 状态，并拒绝活跃 Runtime 或 SQLite writer。死亡进程留下的
+stale migration lock 可以恢复；活跃 lock 绝不会被删除。
+
+Agent 调用、对话 Session 与 durable Run 也共享 `RunContext`、`AgentEvent`、取消、
+deadline 和事件 cursor。权威来源与兼容边界见
+[统一 runtime 契约](docs/runtime-contracts.zh-CN.md)。
 
 ## 底层的一个核心想法
 
@@ -90,6 +116,33 @@ with Agent.ollama(
 `await agent.run(...)`。第一个可运行示例是
 [`examples/01_first_agent.py`](examples/01_first_agent.py)。
 
+接入 OpenAI-compatible `/chat/completions` 端点时，请不要把 credential 写入源码，
+并显式提供 route：
+
+```bash
+pip install 'lipas[compatible]'
+```
+
+```python
+import os
+
+from lipas import Agent
+
+agent = Agent.openai_compatible(
+    model="deepseek-chat",
+    base_url="https://api.deepseek.com",
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+)
+```
+
+同一个 factory 可以覆盖火山引擎方舟、阿里百炼、腾讯混元、OpenAI、private gateway
+和其他 compatible route。非 streaming 是兼容优先的默认值；SSE 必须显式开启，
+provider/model-specific capability 在登记前保持 unknown。URL、安全 CLI 使用、
+streaming、tool、错误语义和精确兼容边界见
+[OpenAI-compatible 模型端点](docs/model-providers.zh-CN.md)。
+运行 Agent 前，可以用 `lipas model check --base-url ... --model ...` 在不访问网络的
+情况下验证配置；只有确实要执行一次可能计费的 provider probe 时才显式加入 `--live`。
+
 第一次接触 LIPAS？请按顺序阅读[循序上手 LIPAS](docs/tutorial.zh-CN.md)：从第一个
 Agent、工具、副作用、结果、session，逐步到 budget、replay、持久恢复、write、
 Skill、Team 和完整可运行项目。编号的
@@ -132,12 +185,13 @@ with Team.open("runs/team.db") as team:
 这份记录不是魔法 memory system，LIPAS 也不是 graph/workflow DSL。应用仍然拥有自己
 的领域数据、业务规则和面向用户的流程。
 
-高层 `Agent` API 返回最终结果。需要对接底层流事件时，`LLMHarness.stream(...)`
-提供规范化 stream event；但 LIPAS 尚未从 `Agent` 提供 token streaming。
+`Agent.run(...)` 返回最终结果；`Agent.stream(...)`、`Session` 与 durable event
+cursor 提供规范化 run/model/tool 事件。adapter 产出的真实 delta 也通过同一套
+`AgentEvent` 协议向上提供。
 
 ## 本地工作区任务（产品 alpha）
 
-0.20.0 版本开启产品发布线，并提供第一条可运行的本地任务产品纵切。它在独立产品层复用同一个
+0.31.0 让本地任务产品纵切默认使用统一 runtime。它在独立产品层复用同一个
 `ExecutionStore` 与 Effect tape，不会把 Workspace、Artifact 或 Report 概念反向塞进
 Agent runtime。默认状态目录是 `~/.lipas`，也可以用 `LIPAS_HOME` 或 `--home` 指定。
 
@@ -154,13 +208,22 @@ lipas task apply <task-id>
 # 或：lipas task discard <task-id>
 lipas task events <task-id>
 lipas task report <task-id>
+lipas doctor
+lipas audit
+lipas tour --offline
 ```
+
+`doctor` 分别报告 storage health 与完整 runtime readiness，并实际执行有界的默认 sandbox
+启动探测。`audit` 默认只读：检查 storage invariant，并明确把 Claim lint 标记为
+`not_run`。`audit --repair` 会打开 Runtime，修复可恢复的 audit outbox，并 lint 全局证据
+以及每一个已登记的 per-Run Claim tape。
 
 CLI Task 现在修改每 Run 独立的 staging workspace，不直接修改用户选择的 workspace。
 staged 文件写入不再逐个打断；命令仍持久等待审批，批准后同一个 Run 从 checkpoint 恢复。首版工具
 仅支持选定工作区内的受限文件操作、只读 Git status/diff，以及无 shell 展开的命令白名单。
 报告会列出实际变更、验证命令、退出状态与尚未解决的风险。Python factory 可以接收
-`tools`、`session_path` 和 `workspace` 关键字；不提供 factory 时使用本地 Ollama。
+`tools`、`session_path` 和 `workspace` 关键字；不提供 factory 时默认使用本地
+Ollama，除非显式提供 OpenAI-compatible `--base-url`、model 与 key 环境变量。
 
 命令执行默认使用 `--sandbox auto`：通过 Bubblewrap 提供最小文件系统和无网络环境，无法
 建立隔离时会失败关闭。`--sandbox local` 是仅面向可信代码的显式不安全 fallback。
@@ -187,6 +250,10 @@ Git workspace 会快照 tracked 与未被 ignore 的 untracked 文件；其他 w
 文件。疑似 secret 的路径和文本内容、symlink、生成式 cache 目录以及超过单文件限制的文件
 会被排除，超出总文件/大小上限则失败关闭。首版 snapshot backend 有意保持受限；被 Git ignore 的依赖目录在验证时可能需要重新
 安装，后续可增加 read-only mount 方案。
+
+0.31 的边界也保持明确：legacy `Team` 仍是兼容 orchestration 层，mailbox ownership 尚未
+完全迁移到 `ExecutionStore`；对所有模型/工具阶段 timeout 的广泛自动恢复也仍在路线图中。
+durable cancellation、审批恢复、orphan 检测和已完成 Effect 恢复当前已经可用。
 
 ## 实验性互操作
 
@@ -238,6 +305,8 @@ lipas effects runs/chat.db
   external operation 与 Team 的精确语义和限制。
 - [路线图](docs/roadmap.zh-CN.md) —— runtime 与本地任务工作台如何作为同一个
   LIPAS 项目推进。
+- [OpenAI-compatible 模型端点](docs/model-providers.zh-CN.md) —— 通过显式 Chat
+  Completions URL、model 与 API key 接入，不使用隐藏 fallback。
 - [实验性 Integration](docs/integrations.zh-CN.md) —— 可选 LangGraph、MCP server、
   OpenCrew/OpenClaw 和 Action Gateway 兼容样例。
 - [示例](examples/README.zh-CN.md) —— 从高层 API 到更底层 harness 的聚焦、可运行

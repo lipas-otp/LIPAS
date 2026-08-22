@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "lipas"
 dynamic = ["version"]
-description = "LIPAS — a trustworthy local task agent with durable execution, approvals, verification, and staged delivery."
+description = "LIPAS — a trustworthy local task agent with durable execution, approvals, staged delivery, and OpenAI-compatible model endpoints."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
@@ -18,7 +18,8 @@ dependencies = [
 # Used by PyPI search — pick terms people actually search for.
 keywords = [
     "llm", "agent", "local-agent", "task-agent", "audit", "replay",
-    "side-effects", "budget", "react", "tool-use",
+    "side-effects", "budget", "react", "tool-use", "openai-compatible",
+    "chat-completions",
 ]
 
 classifiers = [
@@ -39,12 +40,14 @@ ollama = [
     "httpx>=0.27",
 ]
 cli = ["prompt-toolkit>=3.0"]
-openai = [ "httpx>=0.27" ]
+compatible = ["httpx>=0.27"]
+# Compatibility alias for existing installs and the OpenAI Responses adapter.
+openai = ["httpx>=0.27"]
 # anthropic = [ "anthropic>=0.28", ]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",        # needed by OllamaAdapter in tests
+    "httpx>=0.27",        # needed by HTTP adapters in tests
 ]
 all = ["httpx>=0.27", "prompt-toolkit>=3.0"]
 

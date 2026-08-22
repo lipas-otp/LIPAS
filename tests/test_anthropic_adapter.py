@@ -22,9 +22,12 @@ PRICE_TABLE = PriceTable(prices={"claude-test": ModelPrice(Decimal("3"), Decimal
 
 
 class Messages:
-    def __init__(self, result=None, error: Exception | None = None): self.result, self.error = result, error
+    def __init__(self, result=None, error: Exception | None = None):
+        self.result, self.error = result, error
+
     async def create(self, **kwargs):
-        if self.error: raise self.error
+        if self.error:
+            raise self.error
         return self.result
 
 

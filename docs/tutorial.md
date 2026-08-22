@@ -62,8 +62,8 @@ agent = Agent.ollama("qwen2.5:7b", instructions="Be concise.")
 ```
 
 For most scripts, `ask()` is the only method you need. It runs the async agent
-loop and returns one `FinalResult`. The current API has no Agent-level token
-streaming.
+loop and returns one `FinalResult`. Async hosts can use `Agent.stream()` or a
+`Session`/`RunHandle` for provider-neutral lifecycle and model/tool events.
 
 ## 2. Give the assistant one capability
 
@@ -335,8 +335,9 @@ time instead of interpreting an incompatible checkpoint.
 
 Run [`examples/11_durable_execution.py`](../examples/11_durable_execution.py)
 for a provider-free approval/resume flow. Automatic lease heartbeat and typed
-model/tool phase timeouts are provided; broader timeout recovery and Agent-level
-token streaming are not. The exact failure semantics are in the
+model/tool phase timeouts are provided. Run-wide absolute deadlines and
+durable event catch-up use the same public contract. The exact failure
+semantics are in the
 [execution model](execution-model.md#durable-react-runs).
 
 ## 11. Guided projects
@@ -373,6 +374,7 @@ Keep this reference nearby while working through the book:
 | Surface | Everyday use |
 | --- | --- |
 | `Agent.ollama(model="gemma4:12b", ...)` | Build a local Agent. The model argument is optional. |
+| `Agent.openai_compatible(model=..., base_url=..., api_key=...)` | Build against an explicit Chat Completions endpoint without provider fallback. |
 | `Agent(adapter=..., model=..., ...)` | Build with a provider-specific adapter. `adapter` is required here. |
 | `agent.ask(prompt)` | Run synchronously and receive `FinalResult`. |
 | `await agent.run(prompt, state=None)` | Run asynchronously; pass a prior state only to continue deliberately. |

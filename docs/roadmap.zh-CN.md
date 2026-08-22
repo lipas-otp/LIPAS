@@ -2,8 +2,8 @@
 
 > 语言：[English](roadmap.md) | [中文](roadmap.zh-CN.md)
 >
-> 状态：Draft 0.3
-> 日期：2026-07-20
+> 状态：0.32 执行计划
+> 日期：2026-08-11
 
 ## 产品方向
 
@@ -14,8 +14,8 @@ LIPAS 是面向个人与小团队的本地可信任务 Agent。它负责从选�
   supervision 和持久协调；
 - 第一方本地任务工作台，让真实工作区任务具有审批、恢复和交付证据。
 
-runtime 当前已经可用。任务工作台已作为范围受限的 0.20.0 产品 alpha 提供，并继续
-积极开发。两者共享一个仓库、一条路线、一个发布主线和一套执行模型。
+runtime 与范围受限的工作台已经作为 0.31.0 统一本地 runtime alpha 提供。两者共享一个
+仓库、一条路线、一个发布主线、一个 composition root、一个全局数据库和一套执行模型。
 
 产品主次已经明确：本地任务工作台与后续产品界面是面向用户的独立产品，Python runtime
 是内部可靠性基础和可选的高级嵌入能力。LangGraph、MCP server、OpenCrew/OpenClaw
@@ -107,6 +107,21 @@ apply/discard 交付的 staged ChangeSet，
 → 恢复 → 验证审批 → 恢复 → 报告”。面向 UI 的实时 streaming、timeout 后的更多自动
 恢复策略和真实设计伙伴验证仍未完成。
 
+LIPA 架构复盘后的两条契约纵切现已落地：`LIPASRuntime` 成为 composition root；
+普通、Session 与 durable 调用共享 `RunContext` 和 `AgentEvent`；durable event cursor
+支持重连 catch-up；`InputPolicy` 与 approval 完成权限隔离；模型能力要求显式失败；
+behaviour-neutral `RunObserver` 的 recommendation 默认只有建议性。schema v2 现在把兼容
+全局状态统一进 `workspace.db`，提供显式 backup/verify/rollback 与持久审计诊断，并继续
+隔离 per-Run evidence。把 legacy Team ownership 完全迁移到 ExecutionStore 仍是兼容迁移，
+不作为当前已完成保证。
+
+0.32 的模型接入纵切增加一条第一方 OpenAI-compatible Chat Completions 边界，而不是为
+每个 provider 建立独立子系统。显式 URL、model、API-key source、streaming mode 与
+token-limit field 可以覆盖 OpenAI、火山引擎方舟、阿里百炼、腾讯混元、DeepSeek 和
+private compatible gateway。adapter 会验证和 redact transport boundary，规范化
+tool/usage/SSE/error，并让未经证明的模型 capability 保持 unknown。它不会改变
+Workbench authority model，也不会把 provider availability 误当成 durability guarantee。
+
 ## 交付阶段
 
 ### 阶段一：可靠执行纵切
@@ -115,7 +130,17 @@ apply/discard 交付的 staged ChangeSet，
 - [x] 并发执行彼此独立的 read，同时让 write 和涉及 policy/accounting 的调用保持串行且可恢复；
 - [x] 持久化提交的 Task，以原子 lease、heartbeat、过期重领和审批释放槽位的方式并发调度多个 Run；
 - [x] 把任务写入限制在每 Run staging workspace，并要求显式、带漂移检查的 ChangeSet apply 或 discard；
-- [ ] 增加高层模型与工具 streaming；
+- [x] 增加高层模型与工具事件 streaming，并支持 durable catch-up；
+- [x] 增加 Session、RunHandle 与跨阶段 cancellation/绝对 deadline 上下文；
+- [x] 把缺失用户输入与 capability approval 分开；
+- [x] 增加显式模型能力要求和诊断；
+- [x] 为 Python、CLI 与 Task worker 增加加固的 OpenAI-compatible Chat Completions
+  route，不做 provider/model fallback；
+- [x] 引入 behaviour-neutral、只读的 RunObserver 边界；
+- [ ] 把 legacy Team handoff 迁移至 ExecutionStore，并在有迁移说明后淘汰 mailbox
+  authority；
+- [x] 在 `LIPASRuntime` 背后物理整合兼容的控制、事件、产品和证据表，同时保持
+  per-Run budget 隔离；
 - [ ] 在已经交付的持久 cancellation、审批 interrupt/resume 与 orphan 检测之上增加
   timeout recovery；
 - [x] 增加 Task、Workspace、Run、Approval、Artifact、Verification 和 Report 应用模型；

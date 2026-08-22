@@ -54,6 +54,38 @@ def _complete_control_run(workbench: Workbench, run_id: str) -> None:
     )
 
 
+def test_attach_rowset_requires_explicit_run_scope_and_is_failure_atomic(
+    tmp_path, monkeypatch,
+):
+    from lipas import workbench as workbench_module
+    from lipas.session import open_session
+
+    rowset = open_session(tmp_path / "claims.db")
+    try:
+        with Workbench(tmp_path / "home", sandbox="local") as workbench:
+            _, run = workbench.create_task("scope", tmp_path)
+            with pytest.warns(DeprecationWarning, match="without run_id"):
+                workbench.attach_rowset(rowset)
+
+            previous = workbench.execution
+
+            class AttachFailure(RuntimeError):
+                pass
+
+            def fail_replacement(*_args, **_kwargs):
+                raise AttachFailure("cannot attach")
+
+            monkeypatch.setattr(
+                workbench_module, "ExecutionStore", fail_replacement,
+            )
+            with pytest.raises(AttachFailure, match="cannot attach"):
+                workbench.attach_rowset(rowset, run_id=run.id)
+            assert workbench.execution is previous
+            assert workbench.execution.get_run(run.id) is not None
+    finally:
+        rowset.store.close()
+
+
 def test_workspace_capabilities_reject_escape_and_record_evidence(tmp_path):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
@@ -268,9 +300,9 @@ def test_workbench_durable_approval_to_verified_report(tmp_path):
             ]),
             model="fake",
             tools=workbench.workspace_tools(task.id, run.id),
-            session_path=workbench.claims_path,
+            session_path=workbench.claims_path_for_run(run.id),
         )
-        workbench.attach_rowset(agent.rowset)
+        workbench.attach_rowset(agent.rowset, run_id=run.id)
         try:
             with pytest.raises(RunSuspended) as write_approval:
                 asyncio.run(agent.run_durable(

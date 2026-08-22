@@ -2,8 +2,8 @@
 
 > Language: [English](roadmap.md) | [中文](roadmap.zh-CN.md)
 >
-> Status: Draft 0.3
-> Date: 2026-07-20
+> Status: 0.32 execution plan
+> Date: 2026-08-11
 
 ## Product direction
 
@@ -17,9 +17,9 @@ implementation layers:
 - a first-party local task workbench for running real workspace tasks with
   approvals, recovery, and delivery evidence.
 
-The runtime is available today. The workbench is available as a bounded
-0.20.0 product alpha and remains under active development. They share one
-repository, roadmap, release line, and execution model.
+The runtime and bounded workbench are available today as the 0.31.0 unified
+local-runtime alpha. They share one repository, roadmap, release line,
+composition root, global database, and execution model.
 
 Product precedence is explicit: the local task workbench and later product
 surfaces are the independent user-facing product; the Python runtime is its
@@ -130,6 +130,26 @@ creation, write approval, recovery, verification approval, recovery, and report
 delivery. Live UI streaming, broader timeout recovery policy, and validation
 with real design partners remain unfinished.
 
+The post-LIPA architecture review has now landed two contract slices:
+`LIPASRuntime` is the composition root; ordinary, Session, and durable calls
+share `RunContext` and `AgentEvent`; durable event cursors support reconnect;
+`InputPolicy` is authority-separated from approval; model capability
+requirements fail explicitly; and behaviour-neutral `RunObserver`
+recommendations are advisory by default. Schema v2 now consolidates compatible
+global state into `workspace.db`, with explicit backup/verify/rollback tooling
+and persistent audit diagnostics. Per-Run evidence remains isolated. Moving
+legacy Team ownership fully onto ExecutionStore is still a compatibility
+migration, not a claimed current guarantee.
+
+The 0.32 model-access slice adds one first-party OpenAI-compatible Chat
+Completions boundary instead of separate provider subsystems. Explicit URL,
+model, API-key source, streaming mode, and token-limit field cover OpenAI,
+Volcengine Ark, Alibaba Bailian, Tencent Hunyuan, DeepSeek, and private
+compatible gateways. The adapter validates and redacts the transport boundary,
+normalizes tools/usage/SSE/errors, and leaves unproven model capabilities
+unknown. It does not change the Workbench authority model or make provider
+availability a durability guarantee.
+
 ## Delivery phases
 
 ### Phase 1: reliable execution slice
@@ -142,7 +162,18 @@ with real design partners remain unfinished.
   atomic leases, heartbeat, expired-run reclaim, and approval slot release.
 - [x] Keep task writes in a per-Run staging workspace and require an explicit,
   drift-checked ChangeSet apply or discard delivery decision.
-- [ ] Add high-level model and tool streaming.
+- [x] Add high-level model and tool event streaming with durable catch-up.
+- [x] Add Session, RunHandle, and a run-wide context for cancellation and
+  absolute deadlines.
+- [x] Separate missing user input from capability approval.
+- [x] Add explicit model capability requirements and diagnostics.
+- [x] Add a hardened OpenAI-compatible Chat Completions route for Python, CLI,
+  and Task workers without provider/model fallback.
+- [x] Introduce a behaviour-neutral, read-only RunObserver boundary.
+- [ ] Move legacy Team handoffs onto ExecutionStore and retire mailbox
+  authority after a documented migration.
+- [x] Physically consolidate compatible control, event, product, and evidence
+  tables behind `LIPASRuntime` without losing per-Run budget isolation.
 - [ ] Add timeout recovery around the shipped durable cancellation, approval
   interrupt/resume, and orphan detection paths.
 - [x] Add Task, Workspace, Run, Approval, Artifact, Verification, and Report

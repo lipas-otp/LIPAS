@@ -14,15 +14,16 @@ Agent  = one assistant that thinks and uses tools
 Team   = a durable handoff between named assistants or functions
 ```
 
-> **0.20.0 local task product alpha.** This release adds the first-party task
-> workbench and CLI, durable background dispatch with heartbeat and recovery,
-> staged workspace changes, approval inboxes, isolated command execution,
-> secret-safe persistence, verification evidence, and explicit apply/discard.
+> **0.32.0 compatible model endpoints alpha.** The unified Runtime now connects
+> to OpenAI-compatible Chat Completions providers through an explicit URL,
+> model, and API key, including the compatible surfaces offered by Volcengine
+> Ark, Alibaba Bailian, Tencent Hunyuan, and DeepSeek. No provider/model
+> fallback is implicit; the 0.31 storage and per-Run evidence boundaries remain.
 
 ## One system, two layers
 
 ```text
-LIPAS local task workbench (0.20.0 product alpha)
+LIPAS local task workbench (0.32.0 compatible-endpoint alpha)
   Task / Workspace / Approval / Artifact / Task CLI / future Local Web
                               │
                               ▼
@@ -35,6 +36,34 @@ inspecting files, making controlled changes, running checks, and delivering a
 report. The Python API remains independently useful for applications that need
 their own domain model or interface. Both layers share the same Effects and
 audit record; the workbench does not create a second execution model.
+
+Applications can open those layers through one lifecycle owner:
+
+```python
+from lipas import LIPASRuntime
+
+with LIPASRuntime.open(".lipas") as runtime:
+    runtime.execution
+    runtime.claims
+    runtime.operations
+    runtime.handoffs
+    runtime.sessions
+    runtime.artifacts
+```
+
+The global control and product tables live in `.lipas/workspace.db`. Each Run
+keeps its Claim/Effect tape under `.lipas/runs/<run-id>/claims.db`, preserving
+budget and replay isolation without creating another Task/Run state machine.
+Legacy workspaces are never changed on open: inspect and migrate them with
+`lipas migrate plan` and `lipas migrate apply --yes`. Migration and rollback
+are copy-on-write, preserve verified backups, account for SQLite WAL state,
+and refuse an active Runtime or SQLite writer. A dead process's stale
+migration lock can be recovered; a live lock is never removed.
+
+Agent calls, conversational Sessions, and durable Runs also share
+`RunContext`, `AgentEvent`, cancellation, deadlines, and event cursors. See
+[Unified runtime contracts](docs/runtime-contracts.md) for the authority and
+compatibility boundaries.
 
 ## The one idea underneath
 
@@ -99,6 +128,35 @@ with Agent.ollama(
 `await agent.run(...)`. The first runnable example is
 [`examples/01_first_agent.py`](examples/01_first_agent.py).
 
+For an OpenAI-compatible `/chat/completions` endpoint, keep the credential out
+of source control and provide the route explicitly:
+
+```bash
+pip install 'lipas[compatible]'
+```
+
+```python
+import os
+
+from lipas import Agent
+
+agent = Agent.openai_compatible(
+    model="deepseek-chat",
+    base_url="https://api.deepseek.com",
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+)
+```
+
+The same factory covers compatible routes from Volcengine Ark, Alibaba
+Bailian, Tencent Hunyuan, OpenAI, private gateways, and other providers.
+Non-streaming is the compatibility-first default; SSE is explicit, and
+provider/model-specific capabilities remain unknown until registered. See
+[OpenAI-compatible model endpoints](docs/model-providers.md) for URLs, secure
+CLI use, streaming, tools, error semantics, and exact compatibility limits.
+Before running an Agent, `lipas model check --base-url ... --model ...` validates
+the configuration without network access; add explicit `--live` only for an
+intended, potentially billable provider probe.
+
 New to LIPAS? Read [LIPAS, step by step](docs/tutorial.md) as a small,
 linear introduction: first Agent, tools, side effects, results, sessions,
 budgets, replay, durable recovery, writes, Skills, Teams, and then complete
@@ -145,14 +203,14 @@ The record is not a magic memory system and LIPAS is not a graph/workflow DSL.
 Your application still owns its domain data, business rules, and user-facing
 workflow.
 
-The high-level `Agent` API returns a final result. Lower-level
-`LLMHarness.stream(...)` supports normalized stream events for integrations
-that need them, but LIPAS does not yet offer token streaming from `Agent`.
+`Agent.run(...)` returns a final result. `Agent.stream(...)`, `Session`, and
+durable event cursors expose normalized run/model/tool events; adapters that
+produce real deltas surface them through the same `AgentEvent` protocol.
 
 ## Local workspace tasks (product alpha)
 
-The 0.20.0 release begins the product line with its first runnable local-task
-vertical. It
+The 0.31.0 release makes the local-task vertical use the unified runtime by
+default. It
 reuses the same `ExecutionStore` and Effect tape from a separate product layer;
 Workspace, Artifact, and Report concepts do not leak back into the Agent
 runtime. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
@@ -171,7 +229,16 @@ lipas task apply <task-id>
 # or: lipas task discard <task-id>
 lipas task events <task-id>
 lipas task report <task-id>
+lipas doctor
+lipas audit
+lipas tour --offline
 ```
+
+`doctor` reports storage health and full runtime readiness separately and
+executes a bounded launch probe of the default sandbox. `audit` is read-only by
+default: it checks storage invariants and explicitly reports Claim lint as
+`not_run`. `audit --repair` opens the Runtime to repair recoverable audit
+outboxes and lint both global evidence and every registered per-Run Claim tape.
 
 CLI Tasks modify a per-Run staging workspace rather than the selected
 workspace. Staged file writes do not interrupt one-by-one; commands still wait
@@ -179,7 +246,8 @@ for durable approval and resume the same checkpointed Run. The first tool set is
 read-only Git status/diff, and an allowlisted command runner without shell
 expansion. Reports show recorded changes, verification commands, exit states,
 and unresolved risks. A Python factory may accept `tools`, `session_path`, and
-`workspace`; without one, the task CLI uses local Ollama.
+`workspace`; without one, the task CLI uses local Ollama unless an explicit
+OpenAI-compatible `--base-url`, model, and key environment variable are given.
 
 Command execution defaults to `--sandbox auto`, which uses Bubblewrap with a
 minimal filesystem and no network and fails closed when that isolation cannot
@@ -213,6 +281,12 @@ limit are excluded; aggregate file/size limits fail closed.
 This first snapshot backend is intentionally bounded; dependency directories
 excluded by Git may need installation or a later read-only mount design for
 verification.
+
+The 0.31 boundary is explicit: legacy `Team` remains a compatibility
+orchestration layer whose mailbox ownership has not yet moved completely onto
+`ExecutionStore`, and broad automatic recovery after every model/tool phase
+timeout is still roadmap work. Durable cancellation, approval resume, orphan
+detection, and completed-Effect restoration are available today.
 
 ## Experimental interoperability
 
@@ -270,6 +344,8 @@ in time, not that LIPAS contacted the internet.
   of claims, effects, durable runs, replay, external operations, and Teams.
 - [Roadmap](docs/roadmap.md) — how the runtime and local task workbench advance
   as one LIPAS project.
+- [OpenAI-compatible model endpoints](docs/model-providers.md) — connect an
+  explicit Chat Completions URL, model, and API key without hidden fallback.
 - [Experimental integrations](docs/integrations.md) — optional LangGraph,
   MCP-server, OpenCrew/OpenClaw, and Action Gateway compatibility samples.
 - [Examples](examples/README.md) — focused, runnable scenarios from the high
