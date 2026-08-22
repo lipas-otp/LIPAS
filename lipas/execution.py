@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .calculus import Claim
+from .events import AgentEvent
 from .rows import RowSet
 from .serialization.store_sqlite import ensure_sqlite_parent
 from .serialization.codec import decode, encode, make_default_codec_registry
@@ -242,6 +243,21 @@ CREATE TABLE IF NOT EXISTS execution_audit_events (
     fields_json  TEXT NOT NULL,
     created_at   REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS execution_agent_events (
+    event_id    TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES execution_runs(id),
+    identity    TEXT NOT NULL,
+    sequence    INTEGER NOT NULL CHECK(sequence > 0),
+    type        TEXT NOT NULL,
+    iteration   INTEGER NOT NULL CHECK(iteration >= 0),
+    data_json   TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    UNIQUE(run_id, identity),
+    UNIQUE(run_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_agent_events_run
+ON execution_agent_events(run_id, sequence);
 """
 
 
@@ -310,12 +326,18 @@ class ExecutionStore:
         path: str | Path = ":memory:",
         *,
         rowset: RowSet | None = None,
+        audit_run_id: str | None = None,
     ) -> None:
+        if audit_run_id is not None and (
+            not isinstance(audit_run_id, str) or not audit_run_id.strip()
+        ):
+            raise ValueError("audit_run_id must be a non-empty string or None")
         ensure_sqlite_parent(path)
         self._path = path
         self._conn = sqlite3.connect(path, timeout=5.0)
         self._conn.execute("PRAGMA foreign_keys = ON")
         self.rowset = rowset
+        self.audit_run_id = audit_run_id
         self._audit_cursor = 0
         self._closed = False
         try:
@@ -580,6 +602,12 @@ class ExecutionStore:
             fields = _from_json(fields_json)
             if not isinstance(fields, Mapping):
                 raise TypeError(f"execution audit {claim_id!r} fields are not a mapping")
+            if (
+                self.audit_run_id is not None
+                and fields.get("run_id") != self.audit_run_id
+            ):
+                self._audit_cursor = rowid
+                continue
             self.rowset.fold(Claim(
                 tag=tag,
                 fields=dict(fields),
@@ -591,6 +619,137 @@ class ExecutionStore:
                 known.add(claim_id)
             self._audit_cursor = rowid
         return repaired
+
+    # -- public Agent event stream ------------------------------------
+
+    @staticmethod
+    def _agent_event_id(run_id: str, identity: str) -> str:
+        digest = hashlib.sha256(
+            f"agent-event\0{run_id}\0{identity}".encode("utf-8"),
+        ).hexdigest()
+        return f"event_{digest}"
+
+    @staticmethod
+    def _agent_event_from_row(row: tuple[Any, ...]) -> AgentEvent:
+        event_id, run_id, sequence, event_type, iteration, data_json, created_at = row
+        data = _from_json(data_json)
+        if not isinstance(data, Mapping):
+            raise TypeError(f"durable AgentEvent {event_id!r} data is not a mapping")
+        return AgentEvent(
+            event_id=str(event_id),
+            run_id=str(run_id),
+            sequence=int(sequence),
+            type=str(event_type),
+            iteration=int(iteration),
+            data=dict(data),
+            created_at=float(created_at),
+        )
+
+    def append_agent_event(
+        self,
+        run_id: str,
+        event_type: str,
+        *,
+        identity: str,
+        iteration: int = 0,
+        data: Mapping[str, Any] | None = None,
+    ) -> AgentEvent:
+        """Persist one idempotent event and assign its per-run cursor."""
+        if not isinstance(identity, str) or not identity.strip():
+            raise ValueError("AgentEvent identity must be a non-empty string")
+        # Validate the public shape before opening a write transaction.
+        candidate = AgentEvent(
+            type=event_type,
+            run_id=run_id,
+            sequence=1,
+            iteration=iteration,
+            data=dict(data or {}),
+        )
+        event_id = self._agent_event_id(run_id, identity)
+        with self._transaction():
+            if self.get_run(run_id) is None:
+                raise KeyError(run_id)
+            row = self._conn.execute(
+                "SELECT event_id,run_id,sequence,type,iteration,data_json,created_at "
+                "FROM execution_agent_events WHERE run_id=? AND identity=?",
+                (run_id, identity),
+            ).fetchone()
+            if row is not None:
+                existing = self._agent_event_from_row(row)
+                if (
+                    existing.type != candidate.type
+                    or existing.iteration != candidate.iteration
+                ):
+                    raise ExecutionStateError(
+                        f"AgentEvent identity {identity!r} was reused for a "
+                        "different event",
+                    )
+                return existing
+            cursor = self._conn.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM execution_agent_events "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(cursor[0]) + 1
+            created_at = time.time()
+            self._conn.execute(
+                "INSERT INTO execution_agent_events"
+                "(event_id,run_id,identity,sequence,type,iteration,data_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    event_id, run_id, identity, sequence, candidate.type,
+                    candidate.iteration, _mapping_json(candidate.data), created_at,
+                ),
+            )
+        return AgentEvent(
+            event_id=event_id,
+            run_id=run_id,
+            sequence=sequence,
+            type=candidate.type,
+            iteration=candidate.iteration,
+            data=dict(candidate.data),
+            created_at=created_at,
+        )
+
+    def agent_events(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        limit: int | None = None,
+    ) -> tuple[AgentEvent, ...]:
+        """Return persisted events strictly after a per-run cursor."""
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after must be a non-negative int")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValueError("limit must be a positive int or None")
+        if self.get_run(run_id) is None:
+            raise KeyError(run_id)
+        sql = (
+            "SELECT event_id,run_id,sequence,type,iteration,data_json,created_at "
+            "FROM execution_agent_events WHERE run_id=? AND sequence>? "
+            "ORDER BY sequence"
+        )
+        params: tuple[Any, ...] = (run_id, after)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (*params, limit)
+        return tuple(
+            self._agent_event_from_row(row)
+            for row in self._conn.execute(sql, params)
+        )
+
+    def agent_event_cursor(self, run_id: str) -> int:
+        if self.get_run(run_id) is None:
+            raise KeyError(run_id)
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM execution_agent_events "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        return int(row[0])
 
     # -- tasks ---------------------------------------------------------
 
@@ -843,9 +1002,8 @@ class ExecutionStore:
         with self._transaction():
             cursor = self._conn.execute(
                 "UPDATE execution_runs SET lease_expires=?,updated_at=? "
-                "WHERE id=? AND state='running' AND lease_token=? "
-                "AND lease_expires>?",
-                (now + lease_seconds, now, run_id, lease_token, now),
+                "WHERE id=? AND state='running' AND lease_token=?",
+                (now + lease_seconds, now, run_id, lease_token),
             )
             if cursor.rowcount != 1:
                 self._raise_lease(run_id)

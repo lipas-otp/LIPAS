@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -255,22 +256,34 @@ class Workbench:
         *,
         rowset: RowSet | None = None,
         sandbox: str = "auto",
+        database_path: str | Path | None = None,
     ) -> None:
         self.home = Path(home).expanduser().resolve()
         self.home.mkdir(parents=True, exist_ok=True)
-        self.execution_path = self.home / "execution.db"
+        current_runtime_database = self.home / "workspace.db"
+        if database_path is not None:
+            unified = Path(database_path).expanduser().resolve()
+        elif current_runtime_database.is_file():
+            from .workspace_storage import WorkspaceStorage
+            unified = WorkspaceStorage(self.home).require_current()
+        else:
+            unified = None
+        self.execution_path = unified or self.home / "execution.db"
         # Compatibility path for runs created before per-Run Claim sessions.
         self.claims_path = self.home / "claims.db"
         self.runs_path = self.home / "runs"
-        self.product_path = self.home / "workbench.db"
+        self.product_path = unified or self.home / "workbench.db"
         self.command_sandbox = sandbox_from_name(sandbox)
         self.execution = ExecutionStore(self.execution_path, rowset=rowset)
         self._conn = sqlite3.connect(self.product_path)
         try:
             self._init_schema()
         except BaseException:
-            self.execution.close()
-            self._conn.close()
+            for resource in (self.execution, self._conn):
+                try:
+                    resource.close()
+                except BaseException:
+                    pass
             raise
 
     def _init_schema(self) -> None:
@@ -291,13 +304,50 @@ class Workbench:
                 )
 
     def close(self) -> None:
-        self.execution.close()
-        self._conn.close()
+        first_error: BaseException | None = None
+        for resource in (self.execution, self._conn):
+            try:
+                resource.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
-    def attach_rowset(self, rowset: RowSet) -> None:
-        """Attach the Agent evidence tape before executing/resuming a run."""
-        self.execution.close()
-        self.execution = ExecutionStore(self.execution_path, rowset=rowset)
+    def _replace_execution(self, rowset: RowSet, *, run_id: str | None) -> None:
+        replacement = ExecutionStore(
+            self.execution_path, rowset=rowset, audit_run_id=run_id,
+        )
+        previous = self.execution
+        try:
+            previous.close()
+        except BaseException:
+            try:
+                replacement.close()
+            except BaseException:
+                pass
+            raise
+        self.execution = replacement
+
+    def attach_rowset(self, rowset: RowSet, *, run_id: str | None = None) -> None:
+        """Attach evidence before execution, optionally scoped to one Run.
+
+        New product paths always provide ``run_id`` so one Run's isolated
+        evidence cannot receive control events belonging to another. Omitting
+        it retains the legacy all-events mirror for compatibility.
+        """
+        if run_id is None:
+            warnings.warn(
+                "Workbench.attach_rowset(rowset) without run_id mirrors every "
+                "Run and is deprecated; pass the owning run_id",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self._replace_execution(rowset, run_id=run_id)
+
+    def attach_global_rowset(self, rowset: RowSet) -> None:
+        """Restore the composition root's explicit global audit projection."""
+        self._replace_execution(rowset, run_id=None)
 
     def __enter__(self) -> "Workbench":
         return self
@@ -660,6 +710,16 @@ class Workbench:
                 "persisted Run claim session escapes the workbench home",
             )
         return path
+
+    def claim_session_paths(self) -> tuple[tuple[str, Path], ...]:
+        """List registered Run evidence paths without creating missing tapes."""
+        rows = self._conn.execute(
+            "SELECT run_id,claims_path FROM workbench_run_sessions ORDER BY run_id",
+        ).fetchall()
+        return tuple(
+            (str(run_id), self._resolve_claims_path(str(stored)))
+            for run_id, stored in rows
+        )
 
     def list_tasks(self) -> tuple[Task, ...]:
         return self.execution.list_tasks()

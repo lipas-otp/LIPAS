@@ -378,9 +378,12 @@ class SqliteClaimStore(ClaimStore):
             return deepcopy([self._log[i] for i in self._by_tag.get(tag, ())])
         out: list[Claim] = []
         for c in self._log:
-            if tag    is not None and c.tag    != tag:    continue
-            if kind   is not None and c.kind   != kind:   continue
-            if source is not None and c.source != source: continue
+            if tag is not None and c.tag != tag:
+                continue
+            if kind is not None and c.kind != kind:
+                continue
+            if source is not None and c.source != source:
+                continue
             out.append(c)
         return deepcopy(out)
 

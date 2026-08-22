@@ -9,7 +9,9 @@ retry policy but does not force it. Policy decides.
 """
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 
 class ErrorKind(str, Enum):
@@ -44,9 +46,6 @@ _TRANSIENT = frozenset({
 # ============================================================
 # Below: P2.2 additions. Above is frozen (P2.1).
 # ============================================================
-
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     # Avoid circular import: lipas.adapter.__init__ imports ErrorKind
@@ -148,14 +147,18 @@ def classify(reply: Reply) -> ErrorKind:
 def _classify_http(status: int, body: dict[str, Any]) -> ErrorKind:
     if status == 429:
         return ErrorKind.RATE_LIMIT
+    if status == 408:
+        return ErrorKind.TIMEOUT
     if status in (401, 403):
         return ErrorKind.AUTH
     if status == 400:
         # Anthropic surfaces context-length as 400 with a specific
         # error.type. Inspect before falling back to INVALID_REQUEST.
         err = (body.get("error") or {}) if isinstance(body, dict) else {}
-        etype = err.get("type", "")
-        if "context" in etype.lower() or "too long" in str(err.get("message", "")).lower():
+        descriptor = " ".join(str(err.get(key, "")) for key in (
+            "type", "code", "message",
+        )).lower()
+        if "context" in descriptor or "too long" in descriptor:
             return ErrorKind.CONTEXT_LENGTH
         return ErrorKind.INVALID_REQUEST
     if 400 <= status < 500:
@@ -168,17 +171,23 @@ def _classify_http(status: int, body: dict[str, Any]) -> ErrorKind:
 def _classify_provider(provider_err: dict[str, Any]) -> ErrorKind:
     # Anthropic SSE error shape: {"type": "overloaded_error", ...}
     # or {"type": "rate_limit_error", ...}, etc.
-    etype = str(provider_err.get("type", "")).lower()
-    if "rate_limit" in etype:
+    descriptor = " ".join(str(provider_err.get(key, "")) for key in (
+        "type", "code", "message",
+    )).lower()
+    if "rate_limit" in descriptor or "too many requests" in descriptor:
         return ErrorKind.RATE_LIMIT
-    if "overloaded" in etype:
+    if "overloaded" in descriptor or "server_error" in descriptor:
         # Folded into SERVER_ERROR for now (see backlog B-4).
         return ErrorKind.SERVER_ERROR
-    if "authentication" in etype or "permission" in etype:
+    if any(value in descriptor for value in (
+        "authentication", "permission", "unauthorized", "invalid_api_key",
+    )):
         return ErrorKind.AUTH
-    if "invalid_request" in etype:
+    if "context" in descriptor or "too long" in descriptor:
+        return ErrorKind.CONTEXT_LENGTH
+    if "invalid_request" in descriptor or "invalid_parameter" in descriptor:
         return ErrorKind.INVALID_REQUEST
-    if "content_policy" in etype or "content_filter" in etype:
+    if "content_policy" in descriptor or "content_filter" in descriptor:
         return ErrorKind.CONTENT_FILTER
     return ErrorKind.UNKNOWN
 

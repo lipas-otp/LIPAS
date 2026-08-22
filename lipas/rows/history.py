@@ -67,6 +67,9 @@ class HistoryRow:
             # pairing invariant is enforced by lipas.lint, not by
             # this row.
             TAG_GOAL_BLOCKED,
+            # Behaviour-neutral observers record advisory output here. The
+            # recommendation is evidence, never an approval or capability.
+            "observer_recommendation",
             # Team coordination is audit history, not a separate workflow
             # state machine. These tags link mailbox lifecycle to a Team's
             # durable claim session.

@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -27,7 +29,10 @@ from .session import open_session
 from .trace import render_trace, write_jsonl
 from .execution import InterruptState, RunState, RunSuspended
 from .dispatcher import DispatchOutcome, TaskDispatcher
+from .runtime import LIPASRuntime
 from .workbench import TaskReport, Workbench
+from .workspace_storage import WorkspaceStorage
+from .sandbox import sandbox_from_name
 from .gateway import ActionGateway, result_json
 from .integrations import MCPActionServer, OpenClawActionBackend
 from .tools import Tool, ToolRegistry
@@ -35,6 +40,7 @@ from .tools import Tool, ToolRegistry
 __all__ = ["main"]
 
 _DEFAULT_MODEL = "gemma4:12b"
+_DEFAULT_MODEL_CHECK_PROMPT = "Reply with exactly: OK"
 _DEFAULT_INSTRUCTIONS = (
     "You are a concise local LIPAS demo. You have no web, weather, or other "
     "live-data tools unless the user supplied them through an Agent factory. "
@@ -308,6 +314,379 @@ def _workbench_home(value: str | None) -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".lipas"
 
 
+@contextlib.contextmanager
+def _runtime_workbench(
+    home: str | Path,
+    *,
+    sandbox: str = "auto",
+):
+    """Give CLI commands the product view owned by the composition root."""
+    with LIPASRuntime.open(home, sandbox=sandbox) as runtime:
+        yield runtime.workbench
+
+
+def _storage_verification_payload(storage: WorkspaceStorage) -> dict[str, Any]:
+    """Return storage-only health used by migration verification and Doctor."""
+    status = storage.inspect()
+    issues = list(storage.audit()) if status.current else list(status.issues)
+    return {
+        "version": __version__,
+        "storage": status.as_dict(),
+        "issues": [issue.as_dict() for issue in issues],
+        "initialized": status.current,
+        "healthy": status.state in {"current", "uninitialized"} and not any(
+            issue.severity == "error" for issue in issues
+        ),
+    }
+
+
+def _sandbox_diagnostics() -> dict[str, Any]:
+    """Probe the default sandbox instead of inferring support from PATH."""
+    sandbox = sandbox_from_name("auto")
+    discovered = sandbox.name != "unavailable"
+    operational = False
+    error: str | None = None
+    if discovered:
+        try:
+            with tempfile.TemporaryDirectory(prefix="lipas-sandbox-probe-") as root:
+                result = asyncio.run(sandbox.run(
+                    ("/usr/bin/true",),
+                    workspace=Path(root),
+                    environment={},
+                    timeout_s=2.0,
+                ))
+            operational = result.exit_code == 0 and not result.timed_out
+            if not operational:
+                error = (
+                    "sandbox probe timed out"
+                    if result.timed_out
+                    else f"sandbox probe exited with {result.exit_code}"
+                )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    else:
+        error = "no supported OS sandbox was discovered"
+    return {
+        "name": sandbox.name,
+        "discovered": discovered,
+        "operational": operational,
+        "isolated": sandbox.isolated,
+        "network_isolated": sandbox.network_isolated,
+        "error": error,
+    }
+
+
+def _doctor_payload(storage: WorkspaceStorage) -> dict[str, Any]:
+    payload = _storage_verification_payload(storage)
+    storage_healthy = bool(payload.pop("healthy"))
+    payload["storage_healthy"] = storage_healthy
+    payload["sandbox"] = _sandbox_diagnostics()
+    maintenance_active = any(
+        issue["code"] in {
+            "active_migration_lock", "migration_lock_initializing",
+        }
+        for issue in payload["issues"]
+    )
+    payload["ready"] = (
+        storage_healthy
+        and payload["sandbox"]["operational"]
+        and not maintenance_active
+    )
+    payload["healthy"] = payload["ready"]
+    return payload
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    storage = WorkspaceStorage(_workbench_home(args.home))
+    payload = _doctor_payload(storage)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        state = payload["storage"]["state"]
+        print(f"LIPAS {payload['version']}")
+        print(f"workspace: {payload['storage']['home']}")
+        print(f"storage: {state}")
+        print(
+            "sandbox: "
+            f"{payload['sandbox']['name']} "
+            f"({'operational' if payload['sandbox']['operational'] else 'not operational'})"
+        )
+        if payload["sandbox"]["error"]:
+            print(f"sandbox detail: {payload['sandbox']['error']}")
+        for issue in payload["issues"]:
+            print(f"{issue['severity']}: {issue['code']}: {issue['message']}")
+        if state == "migration_required":
+            print("next: lipas migrate plan --home <workspace>")
+        elif state == "uninitialized":
+            print("next: run a task to initialize the workspace")
+        elif payload["ready"]:
+            print("result: healthy")
+        elif payload["storage_healthy"]:
+            print("result: storage healthy, default sandbox not operational")
+    return 0 if payload["ready"] else 1
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    home = _workbench_home(args.home)
+    storage = WorkspaceStorage(home)
+    if args.repair:
+        with LIPASRuntime.open(home, sandbox="local") as runtime:
+            report = runtime.audit(repair=True)
+            payload = {
+                "healthy": report.healthy,
+                "claim_audit": "completed",
+                "storage_issues": [
+                    issue.as_dict() for issue in report.storage_issues
+                ],
+                "claim_issues": [str(issue) for issue in report.claim_issues],
+                "repaired": {
+                    "execution": report.execution_events_repaired,
+                    "operations": report.operation_events_repaired,
+                    "handoffs": report.handoff_events_repaired,
+                },
+            }
+    else:
+        status = storage.inspect()
+        issues = storage.audit() if status.current else status.issues
+        payload = {
+            "healthy": status.current and not any(
+                issue.severity == "error" for issue in issues
+            ),
+            "claim_audit": "not_run",
+            "storage_issues": [issue.as_dict() for issue in issues],
+            "claim_issues": None,
+            "repaired": {"execution": 0, "operations": 0, "handoffs": 0},
+        }
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0 if payload["healthy"] else 1
+
+
+def _cmd_migrate_plan(args: argparse.Namespace) -> int:
+    plan = WorkspaceStorage(_workbench_home(args.home)).plan_migration()
+    payload = plan.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"target: {payload['database_path']}")
+        print(f"required: {'yes' if payload['required'] else 'no'}")
+        print(f"legacy files: {', '.join(path.name for path in plan.legacy_files) or '(none)'}")
+        print(f"rows: {payload['rows']}")
+        for issue in payload["issues"]:
+            print(f"{issue['severity']}: {issue['message']}")
+        if plan.can_apply:
+            print("apply: lipas migrate apply --yes")
+    return 0 if not any(issue.severity == "error" for issue in plan.issues) else 1
+
+
+def _cmd_migrate_apply(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ValueError(
+            "migration is copy-on-write but changes the active layout; "
+            "inspect `lipas migrate plan` and pass --yes",
+        )
+    result = WorkspaceStorage(_workbench_home(args.home)).migrate()
+    print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_migrate_verify(args: argparse.Namespace) -> int:
+    storage = WorkspaceStorage(_workbench_home(args.home))
+    payload = _storage_verification_payload(storage)
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0 if payload["healthy"] and payload["initialized"] else 1
+
+
+def _cmd_migrate_rollback(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ValueError(
+            "rollback stops using all v2-only writes; pass --yes after ensuring "
+            "that restoring the migration-time v1 state is intended",
+        )
+    moved = WorkspaceStorage(_workbench_home(args.home)).rollback()
+    print(f"v2 database preserved at {moved}")
+    print("legacy v1 files are active again; no files were deleted")
+    return 0
+
+
+def _cmd_tour(args: argparse.Namespace) -> int:
+    """Run the authority and recovery path without a model or live write."""
+    if not args.offline:
+        raise ValueError("the offline authority tour is provider-free; pass --offline")
+
+    from .adapter import Done, Reply, ResourceEstimate, Usage
+    from .durable import writes_require_approval
+    from .tools import tool
+
+    class OfflineTourAdapter:
+        name = "offline-tour"
+
+        def __init__(self) -> None:
+            self.replies = [
+                Reply(
+                    content=({
+                        "type": "tool_use", "id": "tour-input",
+                        "name": "ask_operator",
+                        "input": {"question": "Which preview label?"},
+                    },),
+                    usage=Usage(input=1, output=1),
+                    stop_reason="tool_use",
+                    model=self.name,
+                ),
+                Reply(
+                    content=({
+                        "type": "tool_use", "id": "tour-publish",
+                        "name": "publish_preview",
+                        "input": {"label": "approved-offline-preview"},
+                    },),
+                    usage=Usage(input=1, output=1),
+                    stop_reason="tool_use",
+                    model=self.name,
+                ),
+                Reply(
+                    content=({
+                        "type": "text",
+                        "text": "Offline tour completed with separate input and approval.",
+                    },),
+                    usage=Usage(input=1, output=1),
+                    stop_reason="end_turn",
+                    model=self.name,
+                ),
+            ]
+
+        async def estimate_cost(self, request: Any) -> Any:
+            return ResourceEstimate(request.model, 1, 1, Decimal("0"))
+
+        async def stream(self, _request: Any):
+            yield Done(self.replies.pop(0))
+
+    input_body_calls: list[str] = []
+    published: list[str] = []
+
+    @tool(side_effect="pure")
+    def ask_operator(question: str) -> str:
+        """Request missing information from the human operator."""
+        input_body_calls.append(question)
+        return "input body must not execute"
+
+    @tool(side_effect="idempotent_write")
+    async def publish_preview(label: str) -> str:
+        """Publish only an in-memory preview after explicit approval."""
+        published.append(label)
+        return label
+
+    def input_policy(tool_value: Tool, arguments: Mapping[str, Any]):
+        if tool_value.name == "ask_operator":
+            return {"question": arguments["question"]}
+        return None
+
+    async def run_scenario(root_path: Path) -> dict[str, Any]:
+        home = root_path / "state"
+        project = root_path / "project"
+        project.mkdir()
+        with LIPASRuntime.open(home, sandbox="local") as runtime:
+            task, run = runtime.workbench.create_task(
+                "demonstrate authority-separated recovery", project,
+            )
+            agent = runtime.agent_for_run(
+                run.id,
+                adapter=OfflineTourAdapter(),
+                model="offline-tour",
+                tools=[ask_operator, publish_preview],
+            )
+            stages: list[dict[str, Any]] = []
+            try:
+                try:
+                    await runtime.run_durable(
+                        agent,
+                        task.goal,
+                        run_id=run.id,
+                        input_policy=input_policy,
+                        approval_policy=writes_require_approval,
+                    )
+                except RunSuspended as suspended:
+                    if suspended.interrupt.kind != "input":
+                        raise AssertionError("tour must suspend for input first")
+                    stages.append({
+                        "stage": "input_requested",
+                        "interrupt_id": suspended.interrupt.id,
+                    })
+                    runtime.execution.resolve_interrupt(
+                        suspended.interrupt.id,
+                        allow=True,
+                        response={"answer": "offline-preview"},
+                    )
+                else:  # pragma: no cover - deterministic adapter contract
+                    raise AssertionError("tour input did not suspend")
+
+                try:
+                    await runtime.resume_durable(
+                        agent,
+                        run_id=run.id,
+                        input_policy=input_policy,
+                        approval_policy=writes_require_approval,
+                    )
+                except RunSuspended as suspended:
+                    if suspended.interrupt.kind != "approval":
+                        raise AssertionError("tour must request approval second")
+                    stages.append({
+                        "stage": "approval_requested",
+                        "interrupt_id": suspended.interrupt.id,
+                    })
+                    runtime.execution.resolve_interrupt(
+                        suspended.interrupt.id,
+                        allow=True,
+                        response={"approved_by": "offline-tour-operator"},
+                    )
+                else:  # pragma: no cover - deterministic adapter contract
+                    raise AssertionError("tour approval did not suspend")
+
+                result = await runtime.resume_durable(
+                    agent,
+                    run_id=run.id,
+                    input_policy=input_policy,
+                    approval_policy=writes_require_approval,
+                )
+                stages.append({"stage": "run_completed", "text": result.text})
+                artifact = runtime.artifacts.add(
+                    task_id=task.id,
+                    run_id=run.id,
+                    kind="offline_tour",
+                    metadata={"published": list(published)},
+                )
+                report = runtime.workbench.build_report(task.id, result)
+                audit = runtime.audit()
+                events = runtime.execution.agent_events(run.id)
+            finally:
+                agent.close()
+
+        return {
+            "version": __version__,
+            "mode": "offline",
+            "task_id": task.id,
+            "run_id": run.id,
+            "stages": stages,
+            "input_tool_body_executed": bool(input_body_calls),
+            "published": list(published),
+            "artifact_id": artifact.id,
+            "report_status": report.status,
+            "event_types": [event.type for event in events],
+            "audit_healthy": audit.healthy,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="lipas-offline-tour-") as root:
+        payload = asyncio.run(run_scenario(Path(root)))
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print("LIPAS offline authority tour")
+        for stage in payload["stages"]:
+            print(f"- {stage['stage']}")
+        print("- input supplied information but granted no write authority")
+        print("- approval authorized exactly one preview write")
+        print(f"- persistent audit: {'healthy' if payload['audit_healthy'] else 'unhealthy'}")
+    return 0 if payload["audit_healthy"] and not input_body_calls else 1
+
+
 def _workbench_agent(
     args: argparse.Namespace,
     workbench: Workbench,
@@ -344,6 +723,19 @@ def _workbench_agent(
                 "effects can be recovered",
             )
         return agent
+    if args.base_url:
+        credential_options = _compatible_credential_options(args)
+        return Agent.openai_compatible(
+            args.model,
+            base_url=args.base_url,
+            timeout_s=args.timeout,
+            streaming=args.model_streaming,
+            max_tokens_field=args.max_tokens_field,
+            session=claims_path,
+            tools=tools,
+            instructions=_WORKBENCH_INSTRUCTIONS,
+            **credential_options,
+        )
     return Agent.ollama(
         args.model,
         host=args.host,
@@ -382,7 +774,7 @@ async def _execute_task_async(
     agent = _workbench_agent(
         args, workbench, task_id=task_id, run_id=run_id,
     )
-    workbench.attach_rowset(agent.rowset)
+    workbench.attach_rowset(agent.rowset, run_id=run_id)
     try:
         try:
             result = await agent.run_durable(
@@ -431,7 +823,9 @@ def _execute_task(
 
 
 def _cmd_task_start(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home), sandbox=args.sandbox) as workbench:
+    with _runtime_workbench(
+        _workbench_home(args.home), sandbox=args.sandbox,
+    ) as workbench:
         task, run = workbench.create_task(
             args.goal, args.workspace, isolate_changes=True,
         )
@@ -443,7 +837,7 @@ def _cmd_task_start(args: argparse.Namespace) -> int:
 
 def _cmd_task_submit(args: argparse.Namespace) -> int:
     """Persist one Task/Run without tying it to the submitting process."""
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         task, run = workbench.create_task(
             args.goal, args.workspace, isolate_changes=True,
         )
@@ -461,9 +855,15 @@ def _print_dispatch_outcome(outcome: DispatchOutcome) -> None:
 
 def _cmd_task_worker(args: argparse.Namespace) -> int:
     home = _workbench_home(args.home).resolve()
+    execution_path: Path
 
     async def execute(task: Any, discovered: Any) -> None:
-        with Workbench(home, sandbox=args.sandbox) as workbench:
+        # The worker owns one composition root. Concurrent executions open
+        # narrow product views over its database and attach only their own
+        # Run evidence, avoiding multiple writers to the global Claim view.
+        with Workbench(
+            home, sandbox=args.sandbox, database_path=execution_path,
+        ) as workbench:
             run = workbench.execution.get_run(discovered.id)
             if run is None:
                 raise KeyError(discovered.id)
@@ -502,30 +902,32 @@ def _cmd_task_worker(args: argparse.Namespace) -> int:
                     event_id=f"run:{run.id}:dispatch:{run.attempt}:finished",
                 )
 
-    dispatcher = TaskDispatcher(
-        home / "execution.db",
-        execute,
-        max_concurrency=args.max_concurrency,
-        lease_seconds=args.lease_seconds,
-        poll_interval_s=args.poll_interval,
-        retry_delay_s=args.retry_delay,
-        outcome_sink=_print_dispatch_outcome,
-    )
-    if args.once:
-        outcomes = asyncio.run(dispatcher.run_until_idle())
-        return 1 if any(
-            value.status == "worker_error" for value in outcomes
-        ) else 0
-    print(
-        f"worker started: home={home} concurrency={args.max_concurrency}; "
-        "press Ctrl-C to stop",
-    )
-    asyncio.run(dispatcher.serve())
-    return 0
+    with LIPASRuntime.open(home, sandbox=args.sandbox) as runtime:
+        execution_path = runtime.database_path
+        dispatcher = TaskDispatcher(
+            execution_path,
+            execute,
+            max_concurrency=args.max_concurrency,
+            lease_seconds=args.lease_seconds,
+            poll_interval_s=args.poll_interval,
+            retry_delay_s=args.retry_delay,
+            outcome_sink=_print_dispatch_outcome,
+        )
+        if args.once:
+            outcomes = asyncio.run(dispatcher.run_until_idle())
+            return 1 if any(
+                value.status == "worker_error" for value in outcomes
+            ) else 0
+        print(
+            f"worker started: home={home} concurrency={args.max_concurrency}; "
+            "press Ctrl-C to stop",
+        )
+        asyncio.run(dispatcher.serve())
+        return 0
 
 
 def _cmd_task_list(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         print(
             "task_id\ttask_state\trun_state\tdelivery\tattempt\tworkspace\tgoal",
         )
@@ -546,7 +948,7 @@ def _cmd_task_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_show(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         task = workbench.execution.get_task(args.task_id)
         if task is None:
             raise KeyError(args.task_id)
@@ -579,7 +981,7 @@ def _cmd_task_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_approvals(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         items: list[dict[str, Any]] = []
         for approval in workbench.approvals(pending_only=not args.all):
             run = workbench.execution.get_run(approval.run_id)
@@ -612,7 +1014,9 @@ def _cmd_task_approvals(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_resume(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home), sandbox=args.sandbox) as workbench:
+    with _runtime_workbench(
+        _workbench_home(args.home), sandbox=args.sandbox,
+    ) as workbench:
         task = workbench.execution.get_task(args.task_id)
         if task is None:
             raise KeyError(args.task_id)
@@ -632,7 +1036,9 @@ def _cmd_task_resume(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_approve(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home), sandbox=args.sandbox) as workbench:
+    with _runtime_workbench(
+        _workbench_home(args.home), sandbox=args.sandbox,
+    ) as workbench:
         interrupt = workbench.execution.get_interrupt(args.approval_id)
         if interrupt is None:
             raise KeyError(args.approval_id)
@@ -653,7 +1059,7 @@ def _cmd_task_approve(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_deny(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         interrupt = workbench.execution.get_interrupt(args.approval_id)
         if interrupt is None:
             raise KeyError(args.approval_id)
@@ -671,7 +1077,7 @@ def _cmd_task_deny(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_cancel(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         workbench.execution.cancel_task(args.task_id)
         runs = workbench.execution.list_runs(task_id=args.task_id)
         if runs:
@@ -681,7 +1087,7 @@ def _cmd_task_cancel(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_report(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         report = workbench.get_report(args.task_id)
         if report is None:
             report = workbench.build_report(args.task_id).as_dict()
@@ -693,7 +1099,7 @@ def _cmd_task_report(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_diff(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         value = workbench.change_set(args.task_id)
         if value is None:
             raise ValueError(f"task {args.task_id!r} has no staged ChangeSet")
@@ -702,7 +1108,7 @@ def _cmd_task_diff(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_apply(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         paths = workbench.apply_change_set(args.task_id)
     print(
         f"applied task {args.task_id}: "
@@ -712,14 +1118,14 @@ def _cmd_task_apply(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_discard(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         workbench.discard_change_set(args.task_id)
     print(f"discarded staged changes for task {args.task_id}")
     return 0
 
 
 def _cmd_task_events(args: argparse.Namespace) -> int:
-    with Workbench(_workbench_home(args.home)) as workbench:
+    with _runtime_workbench(_workbench_home(args.home)) as workbench:
         for event in workbench.events(args.task_id):
             print(json.dumps({
                 "id": event.id,
@@ -782,20 +1188,210 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 base_delay_s=1.0,
                 max_attempts=args.retries + 1,
             )
-        agent = Agent.ollama(
-            args.model,
-            host=args.host,
-            timeout_s=args.timeout,
-            instructions=args.instructions,
-            session=args.session,
-            harness_kwargs={"retry_policy": retry_policy},
-        )
+        common = {
+            "instructions": args.instructions,
+            "session": args.session,
+            "harness_kwargs": {"retry_policy": retry_policy},
+        }
+        if args.base_url:
+            credential_options = _compatible_credential_options(args)
+            agent = Agent.openai_compatible(
+                args.model,
+                base_url=args.base_url,
+                timeout_s=args.timeout,
+                streaming=args.model_streaming,
+                max_tokens_field=args.max_tokens_field,
+                **common,
+                **credential_options,
+            )
+        else:
+            agent = Agent.ollama(
+                args.model,
+                host=args.host,
+                timeout_s=args.timeout,
+                **common,
+            )
     try:
         with _chat_transport_logs(args.verbose):
             asyncio.run(_chat(agent, once=args.once))
     finally:
         agent.close()
     return 0
+
+
+def _model_check_adapter(args: argparse.Namespace) -> Any:
+    """Construct the diagnostic adapter without exposing its credential."""
+    from .adapter import OpenAICompatibleAdapter
+    credential_options = _compatible_credential_options(args)
+    return OpenAICompatibleAdapter(
+        base_url=args.base_url,
+        timeout_s=args.timeout,
+        streaming=args.model_streaming,
+        include_usage=args.include_usage,
+        max_tokens_field=args.max_tokens_field,
+        **credential_options,
+    )
+
+
+def _reply_text(reply: Any) -> str:
+    text: list[str] = []
+    for block in reply.content:
+        if isinstance(block, Mapping) and block.get("type") == "text":
+            text.append(str(block.get("text", "")))
+        elif getattr(block, "type", None) == "text":
+            text.append(str(getattr(block, "text", "")))
+    return "".join(text)
+
+
+def _cmd_model_check(args: argparse.Namespace) -> int:
+    """Validate endpoint configuration and optionally run one explicit probe."""
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be positive")
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive")
+    if args.prompt is not None and not args.live:
+        raise ValueError("--prompt requires --live")
+    adapter = _model_check_adapter(args)
+    from .models import ModelRegistry
+
+    capabilities = ModelRegistry.default().resolve(adapter.name, args.model)
+    capability_data = capabilities.as_dict()
+    payload: dict[str, Any] = {
+        "version": __version__,
+        "configured": True,
+        "live": bool(args.live),
+        "network_request_sent": False,
+        "endpoint": adapter.url,
+        "provider": adapter.name,
+        "model": args.model,
+        "api_key": {
+            "environment": None if args.no_api_key else args.api_key_env,
+            "required": not args.no_api_key,
+            "present": adapter.api_key is not None,
+            "value_exposed": False,
+        },
+        "request": {
+            "streaming": adapter.streaming,
+            "include_usage": adapter.include_usage,
+            "max_tokens_field": adapter.max_tokens_field,
+            "max_tokens": args.max_tokens,
+        },
+        "capabilities": capability_data,
+        "unknown_capabilities": sorted(
+            name for name in (
+                "tool_calling",
+                "streaming",
+                "structured_output",
+                "vision",
+                "reasoning",
+                "context_tokens",
+                "local",
+            )
+            if capability_data[name] is None
+        ),
+    }
+    status = 0
+    if args.live:
+        from .adapter import Request, complete
+        from .adapter.errors import classify
+
+        reply = asyncio.run(complete(adapter, Request(
+            model=args.model,
+            messages=[{
+                "role": "user",
+                "content": args.prompt or _DEFAULT_MODEL_CHECK_PROMPT,
+            }],
+            max_tokens=args.max_tokens,
+        )))
+        payload["network_request_sent"] = True
+        payload["result"] = {
+            "ok": reply.stop_reason != "error",
+            "model": reply.model,
+            "stop_reason": reply.stop_reason,
+            "usage": asdict(reply.usage),
+            "text": _reply_text(reply),
+            "error_kind": (
+                classify(reply).value if reply.stop_reason == "error" else None
+            ),
+            "error_detail": (
+                dict(reply.error_detail or {})
+                if reply.stop_reason == "error"
+                else None
+            ),
+        }
+        status = 0 if payload["result"]["ok"] else 1
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"endpoint: {payload['endpoint']}")
+        print(f"model: {payload['model']}")
+        if args.no_api_key:
+            print("credential: disabled explicitly")
+        else:
+            print(f"credential: present in {args.api_key_env} (value not displayed)")
+        print(
+            "transport: "
+            f"{'SSE' if adapter.streaming else 'single response'}",
+        )
+        visible_capabilities = {
+            name: value
+            for name, value in payload["capabilities"].items()
+            if name not in {"provider", "model", "metadata"}
+        }
+        print(
+            "capabilities: "
+            + json.dumps(visible_capabilities, ensure_ascii=False, sort_keys=True),
+        )
+        if args.live:
+            result = payload["result"]
+            print(f"live result: {'ok' if result['ok'] else 'failed'}")
+            print(f"provider model: {result['model']}")
+            print(f"stop reason: {result['stop_reason']}")
+            print(
+                "usage: "
+                + json.dumps(result["usage"], ensure_ascii=False, sort_keys=True),
+            )
+            if result["error_kind"]:
+                print(f"error kind: {result['error_kind']}")
+                print(
+                    "error detail: "
+                    + json.dumps(
+                        result["error_detail"], ensure_ascii=False, sort_keys=True,
+                    ),
+                )
+            elif result["text"]:
+                print(
+                    "response text: "
+                    + json.dumps(result["text"], ensure_ascii=False),
+                )
+        else:
+            print("live request: not sent (pass --live to opt in)")
+    return status
+
+
+def _validate_model_endpoint_args(args: argparse.Namespace) -> None:
+    """Reject provider options that would otherwise be silently ignored."""
+    if args.base_url and args.host:
+        raise ValueError("pass either --base-url or --host, not both")
+    if args.factory and args.base_url:
+        raise ValueError("--base-url configures the built-in Agent, not --factory")
+    if args.base_url:
+        return
+    if args.model_streaming:
+        raise ValueError("--model-streaming requires --base-url")
+    if args.max_tokens_field != "max_tokens":
+        raise ValueError("--max-tokens-field requires --base-url")
+    if args.api_key_env != "OPENAI_API_KEY":
+        raise ValueError("--api-key-env requires --base-url")
+    if args.no_api_key:
+        raise ValueError("--no-api-key requires --base-url")
+
+
+def _compatible_credential_options(args: argparse.Namespace) -> dict[str, Any]:
+    """Translate explicit CLI credential policy into adapter arguments."""
+    if args.no_api_key:
+        return {"api_key_env": None, "require_api_key": False}
+    return {"api_key_env": args.api_key_env, "require_api_key": True}
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -842,6 +1438,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_compatible_credentials(command: argparse.ArgumentParser) -> None:
+        credentials = command.add_mutually_exclusive_group()
+        credentials.add_argument(
+            "--api-key-env", default="OPENAI_API_KEY",
+            help="environment variable containing the compatible API key",
+        )
+        credentials.add_argument(
+            "--no-api-key", action="store_true",
+            help="explicitly use a trusted compatible endpoint without auth",
+        )
+
     init = sub.add_parser("init", help="create a minimal ordinary-Python agent")
     init.add_argument("directory")
     init.add_argument("--model", default=os.environ.get("LIPAS_OLLAMA_MODEL", _DEFAULT_MODEL))
@@ -850,15 +1457,80 @@ def _parser() -> argparse.ArgumentParser:
 
     chat = sub.add_parser("chat", help="try an Agent interactively")
     chat.add_argument("--model", default=os.environ.get("LIPAS_OLLAMA_MODEL", _DEFAULT_MODEL))
-    chat.add_argument("--host", help="Ollama host; defaults to OLLAMA_HOST or localhost:11434")
-    chat.add_argument("--timeout", type=float, default=500.0, help="local Ollama response timeout in seconds")
-    chat.add_argument("--retries", type=int, default=0, help="extra local timeout/network retries (default: 0)")
+    chat_endpoint = chat.add_mutually_exclusive_group()
+    chat_endpoint.add_argument(
+        "--host", help="Ollama host; defaults to OLLAMA_HOST or localhost:11434",
+    )
+    chat_endpoint.add_argument(
+        "--base-url",
+        help="OpenAI-compatible API root or full /chat/completions URL",
+    )
+    add_compatible_credentials(chat)
+    chat.add_argument(
+        "--model-streaming",
+        action="store_true",
+        help="use the endpoint's SSE streaming contract",
+    )
+    chat.add_argument(
+        "--max-tokens-field",
+        choices=("max_tokens", "max_completion_tokens"),
+        default="max_tokens",
+    )
+    chat.add_argument(
+        "--timeout", type=float, default=500.0,
+        help="model response timeout in seconds",
+    )
+    chat.add_argument(
+        "--retries", type=int, default=0,
+        help="extra timeout/network retries (default: 0)",
+    )
     chat.add_argument("--verbose", action="store_true", help="show adapter retry diagnostics")
     chat.add_argument("--instructions", default=_DEFAULT_INSTRUCTIONS)
     chat.add_argument("--session", help="optional SQLite claim-session path")
     chat.add_argument("--factory", help="ordinary Python factory: module:callable")
     chat.add_argument("--once", help="send one prompt instead of opening a REPL")
     chat.set_defaults(func=_cmd_chat)
+
+    model = sub.add_parser(
+        "model", help="validate model endpoint configuration and contracts",
+    )
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    model_check = model_sub.add_parser(
+        "check", help="check a compatible endpoint without calling it by default",
+    )
+    model_check.add_argument(
+        "--base-url", required=True,
+        help="OpenAI-compatible API root or full /chat/completions URL",
+    )
+    model_check.add_argument("--model", required=True)
+    add_compatible_credentials(model_check)
+    model_check.add_argument(
+        "--model-streaming", action="store_true",
+        help="validate and probe the SSE streaming route",
+    )
+    model_check.add_argument(
+        "--include-usage", action="store_true",
+        help="request a terminal streaming usage chunk; requires streaming",
+    )
+    model_check.add_argument(
+        "--max-tokens-field",
+        choices=("max_tokens", "max_completion_tokens"),
+        default="max_tokens",
+    )
+    model_check.add_argument("--timeout", type=float, default=30.0)
+    model_check.add_argument("--max-tokens", type=int, default=16)
+    model_check.add_argument(
+        "--prompt",
+        help=(
+            "minimal prompt used only with --live; defaults to a fixed OK probe"
+        ),
+    )
+    model_check.add_argument(
+        "--live", action="store_true",
+        help="send one explicit external request; it may be billable",
+    )
+    model_check.add_argument("--json", action="store_true")
+    model_check.set_defaults(host=None, factory=None, func=_cmd_model_check)
 
     trace = sub.add_parser("trace", help="render a durable claim session")
     trace.add_argument("session")
@@ -868,6 +1540,74 @@ def _parser() -> argparse.ArgumentParser:
     effects = sub.add_parser("effects", help="summarize effect lifecycle in a session")
     effects.add_argument("session")
     effects.set_defaults(func=_cmd_effects)
+
+    doctor = sub.add_parser(
+        "doctor", help="inspect runtime storage and sandbox readiness",
+    )
+    doctor.add_argument(
+        "--home", help="runtime state directory (default: LIPAS_HOME or ~/.lipas)",
+    )
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=_cmd_doctor)
+
+    audit = sub.add_parser(
+        "audit", help="check persistent runtime invariants without changing state",
+    )
+    audit.add_argument(
+        "--home", help="runtime state directory (default: LIPAS_HOME or ~/.lipas)",
+    )
+    audit.add_argument(
+        "--repair", action="store_true",
+        help="explicitly replay recoverable audit outboxes after checking storage",
+    )
+    audit.set_defaults(func=_cmd_audit)
+
+    tour = sub.add_parser(
+        "tour", help="run a provider-free authority and recovery walkthrough",
+    )
+    tour.add_argument(
+        "--offline", action="store_true",
+        help="use the deterministic built-in adapter and a temporary workspace",
+    )
+    tour.add_argument("--json", action="store_true")
+    tour.set_defaults(func=_cmd_tour)
+
+    migrate = sub.add_parser(
+        "migrate", help="plan and apply explicit workspace schema migrations",
+    )
+    migrate_sub = migrate.add_subparsers(dest="migrate_command", required=True)
+
+    def add_migration_home(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--home", help="runtime state directory (default: LIPAS_HOME or ~/.lipas)",
+        )
+
+    migrate_plan = migrate_sub.add_parser(
+        "plan", help="inspect legacy databases without changing them",
+    )
+    add_migration_home(migrate_plan)
+    migrate_plan.add_argument("--json", action="store_true")
+    migrate_plan.set_defaults(func=_cmd_migrate_plan)
+
+    migrate_apply = migrate_sub.add_parser(
+        "apply", help="back up legacy databases and build workspace.db",
+    )
+    add_migration_home(migrate_apply)
+    migrate_apply.add_argument("--yes", action="store_true")
+    migrate_apply.set_defaults(func=_cmd_migrate_apply)
+
+    migrate_verify = migrate_sub.add_parser(
+        "verify", help="verify the current workspace schema and invariants",
+    )
+    add_migration_home(migrate_verify)
+    migrate_verify.set_defaults(func=_cmd_migrate_verify)
+
+    migrate_rollback = migrate_sub.add_parser(
+        "rollback", help="preserve v2 state and reactivate retained v1 files",
+    )
+    add_migration_home(migrate_rollback)
+    migrate_rollback.add_argument("--yes", action="store_true")
+    migrate_rollback.set_defaults(func=_cmd_migrate_rollback)
 
     task = sub.add_parser("task", help="run a durable local workspace task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
@@ -890,7 +1630,23 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--model", default=os.environ.get("LIPAS_OLLAMA_MODEL", _DEFAULT_MODEL),
         )
-        command.add_argument("--host", help="Ollama host")
+        model_endpoint = command.add_mutually_exclusive_group()
+        model_endpoint.add_argument("--host", help="Ollama host")
+        model_endpoint.add_argument(
+            "--base-url",
+            help="OpenAI-compatible API root or full /chat/completions URL",
+        )
+        add_compatible_credentials(command)
+        command.add_argument(
+            "--model-streaming",
+            action="store_true",
+            help="use the endpoint's SSE streaming contract",
+        )
+        command.add_argument(
+            "--max-tokens-field",
+            choices=("max_tokens", "max_completion_tokens"),
+            default="max_tokens",
+        )
         command.add_argument("--timeout", type=float, default=500.0)
         command.add_argument("--phase-timeout", type=float, default=300.0)
         command.add_argument("--lease-seconds", type=float, default=60.0)
@@ -1084,6 +1840,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if hasattr(args, "base_url"):
+            _validate_model_endpoint_args(args)
         return args.func(args)
     except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.error(str(exc))

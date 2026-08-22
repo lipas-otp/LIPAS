@@ -155,7 +155,8 @@ class OperationJournal:
 
     def get(self, key: str) -> Operation | None:
         row = self._conn.execute("SELECT key,kind,request_json,state,result_json,provider_reference,error_json,effect_id FROM operations WHERE key=?", (key,)).fetchone()
-        if row is None: return None
+        if row is None:
+            return None
         return Operation(row[0], row[1], json.loads(row[2]), row[3], json.loads(row[4]) if row[4] else None, row[5], json.loads(row[6]) if row[6] else None, row[7])
 
     def prepare(self, *, key: str, kind: str, request: Mapping[str, Any], effect_id: str | None = None) -> Operation:
@@ -289,7 +290,8 @@ class OperationJournal:
     def execute(self, *, key: str, kind: str, request: Mapping[str, Any], provider: IdempotentProvider[T], provider_reference: Callable[[T], str | None] | None = None, effect_id: str | None = None) -> Operation:
         existed = self.get(key) is not None
         op = self.prepare(key=key, kind=kind, request=request, effect_id=effect_id)
-        if op.state == "succeeded": return op
+        if op.state == "succeeded":
+            return op
         if existed and op.state == "failed":
             raise PendingOperation(f"operation {key!r} is failed after reconciliation; use a new key for an intentional retry")
         if existed and op.state in {"pending", "uncertain"}:
@@ -345,7 +347,8 @@ class OperationJournal:
             self.repair_audit()
             return op
         found, result, reference = lookup(key)
-        if found: return self.settle(key, result=result, provider_reference=reference)
+        if found:
+            return self.settle(key, result=result, provider_reference=reference)
         return self.fail(key, error={"type": "provider_not_found", "message": "reconciliation found no provider operation"})
 
     @staticmethod

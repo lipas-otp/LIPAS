@@ -37,12 +37,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapter import Reply, Request
+from .adapter import Delta, Reply, Request, Thinking, ToolUseDelta
 from .behaviour import (
     AgentState, FinalResult, TerminationReason,
 )
 from .calculus import Claim
 from .harness import LLMHarness
+from .context import (
+    RunCancelled, RunContext, RunDeadlineExceeded, bind_run_context,
+)
+from .events import AgentEventType, EventEmitter
+from .observer import RunObserver, RunSnapshot, observe_run
 from .rows import RowSet
 from .rows.capability import CapabilityRow
 from .rows.effect import EffectRow
@@ -110,6 +115,8 @@ class ReActAgent:
     max_iterations:   int = 10
     max_parallel_tools: int = 4
     supervisor:       Supervisor | None = None
+    observers:         Sequence[RunObserver] = ()
+    honor_observer_recommendations: bool = False
     name:             str = "react"
 
     _tool_descriptors: tuple[Any, ...] | None = field(
@@ -123,11 +130,49 @@ class ReActAgent:
             or self.max_parallel_tools < 1
         ):
             raise ValueError("max_parallel_tools must be a positive integer")
+        if not isinstance(self.honor_observer_recommendations, bool):
+            raise TypeError("honor_observer_recommendations must be bool")
+        self.observers = tuple(self.observers)
 
     # ── public API ─────────────────────────────────────────────
 
-    async def run(self, initial: AgentState) -> FinalResult:
-        """Drive the ReAct loop to termination."""
+    async def run(
+        self,
+        initial: AgentState,
+        *,
+        context: RunContext | None = None,
+        event_emitter: EventEmitter | None = None,
+    ) -> FinalResult:
+        """Drive the canonical loop under one run-wide control context."""
+        if context is None:
+            candidate = initial.metadata.get("run_id")
+            context = RunContext.create(
+                run_id=candidate if isinstance(candidate, str) and candidate else None,
+            )
+        if not isinstance(context, RunContext):
+            raise TypeError("context must be a RunContext or None")
+        if event_emitter is not None and event_emitter.run_id != context.run_id:
+            raise ValueError("EventEmitter and RunContext must share run_id")
+        with bind_run_context(context):
+            try:
+                result = await context.wait(self._run_loop(
+                    initial,
+                    context=context,
+                    event_emitter=event_emitter,
+                ))
+            except (RunCancelled, asyncio.CancelledError):
+                result = self._cancelled_result(initial)
+            except RunDeadlineExceeded as exc:
+                result = self._deadline_result(initial, exc)
+        return self._with_run_metadata(result, context.run_id)
+
+    async def _run_loop(
+        self,
+        initial: AgentState,
+        *,
+        context: RunContext,
+        event_emitter: EventEmitter | None,
+    ) -> FinalResult:
         state = initial
 
         while True:
@@ -136,17 +181,40 @@ class ReActAgent:
                     "react: max_iterations=%d reached, terminating",
                     self.max_iterations,
                 )
-                return FinalResult(
-                    text="",
-                    state=state,
-                    stop_reason=TerminationReason.MAX_ITERATIONS,
-                    metadata={"iterations": state.iteration},
-                )
+                return self._max_iterations_result(state)
 
             # 1. Reason
             request = self._build_request(state)
             caused_by = state.metadata.get("caused_by")
-            reply   = await self.harness.call(request, caused_by=caused_by)
+            await self._emit(
+                event_emitter,
+                AgentEventType.MODEL_STARTED,
+                iteration=state.iteration,
+                data={"model": request.model},
+            )
+            reply = await self.harness.call(
+                request,
+                caused_by=caused_by,
+                stream_sink=(
+                    self._model_event_sink(event_emitter, state.iteration)
+                    if event_emitter is not None else None
+                ),
+            )
+            await self._emit(
+                event_emitter,
+                AgentEventType.MODEL_COMPLETED,
+                iteration=state.iteration,
+                data={
+                    "model": reply.model,
+                    "stop_reason": reply.stop_reason,
+                    "usage": {
+                        "input": reply.usage.input,
+                        "output": reply.usage.output,
+                        "cache_read": reply.usage.cache_read,
+                        "cache_write": reply.usage.cache_write,
+                    },
+                },
+            )
 
             # 2. Error path
             if reply.stop_reason == "error":
@@ -154,56 +222,35 @@ class ReActAgent:
                     "react: harness returned error reply, terminating: %r",
                     reply.error_detail,
                 )
-                result = FinalResult(
-                    text="",
-                    state=state,
-                    stop_reason=TerminationReason.ERROR,
-                    error=reply.error_detail or {"type": "unknown"},
-                    metadata={"iterations": state.iteration},
+                result = self._maybe_supervisor_tick(state) or self._error_result(
+                    state, reply,
                 )
-                return self._maybe_supervisor_tick(state) or result
+                return await self._observe_result(
+                    result, reply, (), (), context, event_emitter,
+                )
 
             # 3. Extract tool calls
             tool_calls = self._extract_tool_calls(reply)
 
             if not tool_calls:
                 if reply.stop_reason == "tool_use":
-                    return FinalResult(
-                        text="",
-                        state=state,
-                        stop_reason=TerminationReason.ERROR,
-                        error={
-                            "type": "malformed_tool_use",
-                            "message": (
-                                "model stopped for tool_use without a valid "
-                                "tool_use block"
-                            ),
-                        },
-                        metadata={"iterations": state.iteration},
+                    return await self._observe_result(
+                        self._malformed_tool_result(state),
+                        reply,
+                        (),
+                        (),
+                        context,
+                        event_emitter,
                     )
-                final_text = self._extract_text(reply)
-                next_state = state.with_messages(
-                    self._message_from_reply(reply)
-                ).next_iteration()
-                self._fold_iteration(
-                    state=next_state, reply=reply,
-                    tool_calls=(), tool_results=(),
+                result = self._terminal_result(state, reply)
+                return await self._observe_result(
+                    result,
+                    reply,
+                    (),
+                    (),
+                    context,
+                    event_emitter,
                 )
-                logger.info(
-                    "react: terminal model stop=%s at iteration %d",
-                    reply.stop_reason, next_state.iteration,
-                )
-                result = FinalResult(
-                    text=final_text,
-                    state=next_state,
-                    stop_reason=(
-                        TerminationReason.MAX_TOKENS
-                        if reply.stop_reason == "max_tokens"
-                        else TerminationReason.NATURAL_STOP
-                    ),
-                    metadata={"iterations": next_state.iteration},
-                )
-                return self._maybe_supervisor_tick(next_state) or result
 
             # 4. Act — independent safe reads may run concurrently. Writes,
             # guarded/replayed calls, and budgeted calls remain serial.
@@ -212,16 +259,12 @@ class ReActAgent:
             while tool_index < len(tool_calls):
                 batch_size = self._parallel_tool_count(tool_calls, tool_index)
                 batch = tool_calls[tool_index:tool_index + batch_size]
-                calls = [
-                    self.tool_harness.call(
-                        tool_name=str(tc["name"]),
-                        arguments=dict(tc.get("input") or {}),
-                        effect_id=f"tool_{uuid.uuid4().hex[:12]}",
-                        tool_use_id=str(tc["id"]),
-                        caused_by=caused_by,
-                    )
-                    for tc in batch
-                ]
+                calls = [self._run_tool_call(
+                    tc,
+                    state.iteration,
+                    caused_by,
+                    event_emitter,
+                ) for tc in batch]
                 batch_results = (
                     await asyncio.gather(*calls)
                     if len(calls) > 1 else [await calls[0]]
@@ -230,14 +273,8 @@ class ReActAgent:
                 tool_index += batch_size
 
             # 5. Observe — append to messages, advance, fold.
-            assistant_msg = self._message_from_reply(reply)
-            results_msg   = self._message_from_tool_results(tool_results)
-            state = state.with_messages(
-                assistant_msg, results_msg,
-            ).next_iteration()
-            self._fold_iteration(
-                state=state, reply=reply,
-                tool_calls=tool_calls, tool_results=tool_results,
+            state = self._advance_after_tools(
+                state, reply, tool_calls, tool_results,
             )
 
             # 6. Supervisor tick (B3). Terminal reply paths above also tick
@@ -246,6 +283,272 @@ class ReActAgent:
             early = self._maybe_supervisor_tick(state)
             if early is not None:
                 return early
+            observer_result = await self._observe(
+                state,
+                phase="after_tools",
+                reply=reply,
+                tool_calls=tool_calls,
+                tool_results=tuple(tool_results),
+                context=context,
+                event_emitter=event_emitter,
+            )
+            if observer_result is not None:
+                return observer_result
+
+    async def _run_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        iteration: int,
+        caused_by: str | None,
+        event_emitter: EventEmitter | None,
+    ) -> Mapping[str, Any]:
+        tool_name = str(tool_call["name"])
+        tool_use_id = str(tool_call["id"])
+        arguments = dict(tool_call.get("input") or {})
+        details: dict[str, Any] = {
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "arguments": arguments,
+        }
+        try:
+            details["side_effect"] = self.tools.get(tool_name).side_effect.value
+        except ToolNotFoundError:
+            pass
+        await self._emit(
+            event_emitter, AgentEventType.TOOL_REQUESTED,
+            iteration=iteration, data=details,
+        )
+        await self._emit(
+            event_emitter, AgentEventType.TOOL_STARTED,
+            iteration=iteration, data=details,
+        )
+        result = await self.tool_harness.call(
+            tool_name=tool_name,
+            arguments=arguments,
+            effect_id=f"tool_{uuid.uuid4().hex[:12]}",
+            tool_use_id=tool_use_id,
+            caused_by=caused_by,
+        )
+        await self._emit(
+            event_emitter, AgentEventType.TOOL_COMPLETED,
+            iteration=iteration,
+            data={
+                **details,
+                "is_error": bool(result.get("is_error")),
+                "content": result.get("content", ""),
+            },
+        )
+        return result
+
+    @staticmethod
+    def _model_event_sink(event_emitter: EventEmitter, iteration: int):
+        async def deliver(event: Any) -> None:
+            if isinstance(event, Delta):
+                await event_emitter.emit(
+                    AgentEventType.MODEL_DELTA,
+                    iteration=iteration,
+                    data={"index": event.index, "text": event.text},
+                )
+            elif isinstance(event, Thinking):
+                await event_emitter.emit(
+                    AgentEventType.MODEL_THINKING,
+                    iteration=iteration,
+                    data={"text": event.text},
+                )
+            elif isinstance(event, ToolUseDelta):
+                await event_emitter.emit(
+                    AgentEventType.MODEL_TOOL_DELTA,
+                    iteration=iteration,
+                    data={"index": event.index, "partial_json": event.partial_json},
+                )
+        return deliver
+
+    @staticmethod
+    async def _emit(
+        event_emitter: EventEmitter | None,
+        event_type: str,
+        *,
+        iteration: int,
+        data: Mapping[str, Any],
+    ) -> None:
+        if event_emitter is not None:
+            await event_emitter.emit(event_type, iteration=iteration, data=data)
+
+    def _max_iterations_result(self, state: AgentState) -> FinalResult:
+        return FinalResult(
+            state=state,
+            stop_reason=TerminationReason.MAX_ITERATIONS,
+            metadata={"iterations": state.iteration},
+        )
+
+    def _cancelled_result(self, state: AgentState) -> FinalResult:
+        return FinalResult(
+            state=state,
+            stop_reason=TerminationReason.CANCELLED,
+            metadata={"iterations": state.iteration},
+        )
+
+    def _deadline_result(
+        self, state: AgentState, exc: RunDeadlineExceeded,
+    ) -> FinalResult:
+        return FinalResult(
+            state=state,
+            stop_reason=TerminationReason.ERROR,
+            error={"type": "deadline_exceeded", "message": str(exc)},
+            metadata={"iterations": state.iteration},
+        )
+
+    def _error_result(self, state: AgentState, reply: Reply) -> FinalResult:
+        return FinalResult(
+            state=state,
+            stop_reason=TerminationReason.ERROR,
+            error=reply.error_detail or {"type": "unknown"},
+            metadata={"iterations": state.iteration},
+        )
+
+    def _malformed_tool_result(self, state: AgentState) -> FinalResult:
+        return FinalResult(
+            state=state,
+            stop_reason=TerminationReason.ERROR,
+            error={
+                "type": "malformed_tool_use",
+                "message": "model stopped for tool_use without a valid tool_use block",
+            },
+            metadata={"iterations": state.iteration},
+        )
+
+    def _terminal_result(
+        self,
+        state: AgentState,
+        reply: Reply,
+        *,
+        claim_id_prefix: str | None = None,
+    ) -> FinalResult:
+        next_state = state.with_messages(
+            self._message_from_reply(reply),
+        ).next_iteration()
+        self._fold_iteration(
+            state=next_state,
+            reply=reply,
+            tool_calls=(),
+            tool_results=(),
+            claim_id_prefix=claim_id_prefix,
+        )
+        result = FinalResult(
+            text=self._extract_text(reply),
+            state=next_state,
+            stop_reason=(
+                TerminationReason.MAX_TOKENS
+                if reply.stop_reason == "max_tokens"
+                else TerminationReason.NATURAL_STOP
+            ),
+            metadata={"iterations": next_state.iteration},
+        )
+        return self._maybe_supervisor_tick(
+            next_state, claim_id_prefix=claim_id_prefix,
+        ) or result
+
+    def _advance_after_tools(
+        self,
+        state: AgentState,
+        reply: Reply,
+        tool_calls: Sequence[Mapping[str, Any]],
+        tool_results: Sequence[Mapping[str, Any]],
+        *,
+        claim_id_prefix: str | None = None,
+    ) -> AgentState:
+        next_state = state.with_messages(
+            self._message_from_reply(reply),
+            self._message_from_tool_results(tool_results),
+        ).next_iteration()
+        self._fold_iteration(
+            state=next_state,
+            reply=reply,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+            claim_id_prefix=claim_id_prefix,
+        )
+        return next_state
+
+    @staticmethod
+    def _with_run_metadata(result: FinalResult, run_id: str) -> FinalResult:
+        from dataclasses import replace
+        return replace(result, metadata={**result.metadata, "run_id": run_id})
+
+    async def _observe_result(
+        self,
+        result: FinalResult,
+        reply: Reply,
+        tool_calls: Sequence[Mapping[str, Any]],
+        tool_results: Sequence[Mapping[str, Any]],
+        context: RunContext,
+        event_emitter: EventEmitter | None,
+    ) -> FinalResult:
+        observed = await self._observe(
+            result.state,
+            phase="terminal",
+            reply=reply,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+            context=context,
+            event_emitter=event_emitter,
+        )
+        return observed or result
+
+    async def _observe(
+        self,
+        state: AgentState,
+        *,
+        phase: str,
+        reply: Reply,
+        tool_calls: Sequence[Mapping[str, Any]],
+        tool_results: Sequence[Mapping[str, Any]],
+        context: RunContext,
+        event_emitter: EventEmitter | None,
+    ) -> FinalResult | None:
+        if not self.observers:
+            return None
+        snapshot = RunSnapshot(
+            state=state,
+            phase=phase,
+            reply={"model": reply.model, "stop_reason": reply.stop_reason},
+            tool_calls=tuple(tool_calls),
+            tool_results=tuple(tool_results),
+        )
+        for index, observer in enumerate(self.observers):
+            recommendation = await observe_run(observer, snapshot, context)
+            if recommendation is None:
+                continue
+            data = recommendation.as_dict()
+            data["observer"] = type(observer).__name__
+            await self._emit(
+                event_emitter,
+                AgentEventType.OBSERVER_RECOMMENDATION,
+                iteration=state.iteration,
+                data=data,
+            )
+            self.rowset.fold(Claim(
+                tag="observer_recommendation",
+                fields={"_history": [data]},
+                source=f"observer.{type(observer).__name__}",
+                claim_id=(
+                    recommendation.identity
+                    or f"observer:{context.run_id}:{state.iteration}:{phase}:{index}"
+                ),
+            ))
+            if self.honor_observer_recommendations and recommendation.kind in {
+                "terminate", "escalate",
+            }:
+                return FinalResult(
+                    state=state,
+                    stop_reason=f"observer_{recommendation.kind}",
+                    metadata={
+                        "iterations": state.iteration,
+                        "observer_reason": recommendation.reason,
+                        "observer_payload": dict(recommendation.payload),
+                    },
+                )
+        return None
 
     def _parallel_tool_count(
         self,

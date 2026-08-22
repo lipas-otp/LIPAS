@@ -529,28 +529,34 @@ class EffectRow:
         intents_by_eid: dict[str, Claim] = {}
         seen_ids: set[str] = set()
         for c in store.filter(tag=TAG_EFFECT_INTENT):
-            if c.claim_id in seen_ids: continue
+            if c.claim_id in seen_ids:
+                continue
             seen_ids.add(c.claim_id)
             eid = c.fields.get(F_EFFECT_ID)
-            if not isinstance(eid, str): continue
+            if not isinstance(eid, str):
+                continue
             intents_by_eid.setdefault(eid, c)
 
         results_by_eid: dict[str, Claim] = {}
         seen_ids = set()
         for c in store.filter(tag=TAG_EFFECT_RESULT):
-            if c.claim_id in seen_ids: continue
+            if c.claim_id in seen_ids:
+                continue
             seen_ids.add(c.claim_id)
             eid = c.fields.get(F_EFFECT_ID)
-            if not isinstance(eid, str): continue
+            if not isinstance(eid, str):
+                continue
             results_by_eid.setdefault(eid, c)
 
         rejections_by_eid: dict[str, Claim] = {}
         seen_ids = set()
         for c in store.filter(tag=TAG_EFFECT_REJECTED):
-            if c.claim_id in seen_ids: continue
+            if c.claim_id in seen_ids:
+                continue
             seen_ids.add(c.claim_id)
             eid = c.fields.get(F_EFFECT_ID)
-            if not isinstance(eid, str): continue
+            if not isinstance(eid, str):
+                continue
             rejections_by_eid.setdefault(eid, c)
 
         compensated_by: dict[str, list[str]] = {}

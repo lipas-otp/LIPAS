@@ -10,13 +10,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
+import json
+import logging
 import math
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Mapping
 
-from .adapter import Reply
+from .adapter import Delta, Reply, Thinking, ToolUseDelta
 from .behaviour import AgentState, FinalResult, TerminationReason
+from .context import RunCancelled, RunContext, RunDeadlineExceeded
+from .events import AgentEventType, EventEmitter, EventSink
 from .execution import (
     Checkpoint,
     ExecutionStateError,
@@ -33,12 +38,16 @@ __all__ = [
     "ApprovalPolicy",
     "DurablePhaseTimeout",
     "DurableReActRunner",
+    "InputPolicy",
     "final_result_from_checkpoint",
     "writes_require_approval",
 ]
 
 
 ApprovalPolicy = Callable[[Tool, Mapping[str, Any]], Mapping[str, Any] | None]
+InputPolicy = Callable[[Tool, Mapping[str, Any]], Mapping[str, Any] | None]
+
+logger = logging.getLogger(__name__)
 
 
 class DurablePhaseTimeout(ExecutionStateError):
@@ -223,9 +232,13 @@ class DurableReActRunner:
     store: ExecutionStore
     run: Run
     approval_policy: ApprovalPolicy | None = None
+    input_policy: InputPolicy | None = None
     lease_seconds: float = 60.0
     heartbeat_interval_s: float | None = None
     phase_timeout_s: float | None = None
+    context: RunContext | None = None
+    event_sink: EventSink | None = None
+    event_cursor: int = 0
 
     def __post_init__(self) -> None:
         if self.run.state is not RunState.RUNNING or not self.run.lease_token:
@@ -245,6 +258,16 @@ class DurableReActRunner:
             self.phase_timeout_s = self._positive_seconds(
                 self.phase_timeout_s, "phase_timeout_s",
             )
+        if self.context is None:
+            self.context = RunContext.create(run_id=self.run.id)
+        elif not isinstance(self.context, RunContext):
+            raise TypeError("context must be a RunContext or None")
+        if self.context.run_id != self.run.id:
+            raise ValueError("durable RunContext.run_id must equal Run.id")
+        current_cursor = self.store.agent_event_cursor(self.run.id)
+        if self.event_cursor < 0:
+            raise ValueError("event_cursor must be non-negative")
+        self.event_cursor = max(self.event_cursor, current_cursor)
 
     @property
     def _token(self) -> str:
@@ -264,9 +287,29 @@ class DurableReActRunner:
         self,
         initial: AgentState | None = None,
     ) -> FinalResult:
+        """Run durably while persisting exceptional failure events."""
+        try:
+            return await self._run_with_heartbeat(initial)
+        except (RunSuspended, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            await self._emit(
+                "run:failed",
+                AgentEventType.RUN_FAILED,
+                data={
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
+
+    async def _run_with_heartbeat(
+        self,
+        initial: AgentState | None = None,
+    ) -> FinalResult:
         """Run with an automatic lease heartbeat around the phase machine."""
-        execution = asyncio.create_task(self._run_to_completion(initial))
         heartbeat = asyncio.create_task(self._heartbeat())
+        execution = asyncio.create_task(self._run_to_completion(initial))
         try:
             done, _ = await asyncio.wait(
                 {execution, heartbeat},
@@ -274,15 +317,40 @@ class DurableReActRunner:
             )
             if execution in done:
                 heartbeat.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                # Execution settlement and the next heartbeat may become
+                # ready in the same loop tick. Once execution is done, its
+                # result (including any lease-fencing failure) is the primary
+                # outcome; a heartbeat observing the now-terminal Run is not
+                # a second failure.
+                with contextlib.suppress(
+                    asyncio.CancelledError, ExecutionStateError,
+                ):
                     await heartbeat
-                return await execution
+                try:
+                    return await execution
+                except RunCancelled as exc:
+                    return await self._finish_controlled(initial, exc)
+                except RunDeadlineExceeded as exc:
+                    return await self._finish_controlled(initial, exc)
 
+            # Settlement changes the Run to terminal immediately before the
+            # execution coroutine returns. A heartbeat scheduled in that tiny
+            # window can lose its lease even though execution succeeded.
+            try:
+                await heartbeat
+            except ExecutionStateError:
+                refreshed = self.store.get_run(self.run.id)
+                if refreshed is not None and refreshed.state in {
+                    RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED,
+                }:
+                    return await execution
+                execution.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await execution
+                raise
             execution.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await execution
-            # The heartbeat only terminates when renewal fails.
-            await heartbeat
             raise AssertionError("lease heartbeat terminated without an error")
         finally:
             for task in (execution, heartbeat):
@@ -295,18 +363,22 @@ class DurableReActRunner:
     async def _heartbeat(self) -> None:
         assert self.heartbeat_interval_s is not None
         while True:
-            await asyncio.sleep(self.heartbeat_interval_s)
             self.run = self.store.renew_lease(
                 self.run.id,
                 self._token,
                 lease_seconds=self.lease_seconds,
             )
+            await asyncio.sleep(self.heartbeat_interval_s)
 
     async def _await_phase(self, awaitable: Any, phase: str) -> Any:
+        assert self.context is not None
+        controlled = self.context.wait(awaitable)
         if self.phase_timeout_s is None:
-            return await awaitable
+            return await controlled
         try:
-            return await asyncio.wait_for(awaitable, timeout=self.phase_timeout_s)
+            return await asyncio.wait_for(controlled, timeout=self.phase_timeout_s)
+        except RunDeadlineExceeded:
+            raise
         except TimeoutError as exc:
             raise DurablePhaseTimeout(phase, self.phase_timeout_s) from exc
 
@@ -314,6 +386,7 @@ class DurableReActRunner:
         self,
         initial: AgentState | None = None,
     ) -> FinalResult:
+        assert self.context is not None
         try:
             checkpoint = self.store.get_checkpoint(self.run.id)
             if checkpoint is None:
@@ -354,6 +427,14 @@ class DurableReActRunner:
             raise
 
         try:
+            await self._emit(
+                "run:started",
+                AgentEventType.RUN_STARTED,
+                data={
+                    "model": self.behaviour.request_template.model,
+                    "tools": [tool.name for tool in self.behaviour.tools],
+                },
+            )
             while True:
                 state_data = payload.get("agent_state")
                 if not isinstance(state_data, Mapping):
@@ -379,40 +460,26 @@ class DurableReActRunner:
                         current_run.cancel_requested
                         and restored.stop_reason != TerminationReason.CANCELLED
                     ):
-                        cancelled = FinalResult(
-                            text="",
-                            state=state,
-                            stop_reason=TerminationReason.CANCELLED,
-                            metadata={"iterations": state.iteration},
-                        )
+                        cancelled = self.behaviour._cancelled_result(state)
                         phase, payload, version = self._checkpoint_terminal(
                             state, cancelled, version,
                         )
                         continue
                     try:
+                        await self._emit_terminal(restored)
                         return self._settle(restored)
                     except ExecutionStateError:
                         refreshed = self.store.get_run(self.run.id)
                         if refreshed is None or not refreshed.cancel_requested:
                             raise
-                        cancelled = FinalResult(
-                            text="",
-                            state=state,
-                            stop_reason=TerminationReason.CANCELLED,
-                            metadata={"iterations": state.iteration},
-                        )
+                        cancelled = self.behaviour._cancelled_result(state)
                         phase, payload, version = self._checkpoint_terminal(
                             state, cancelled, version,
                         )
                         continue
 
                 if current_run.cancel_requested:
-                    cancelled = FinalResult(
-                        text="",
-                        state=state,
-                        stop_reason=TerminationReason.CANCELLED,
-                        metadata={"iterations": state.iteration},
-                    )
+                    cancelled = self.behaviour._cancelled_result(state)
                     phase, payload, version = self._checkpoint_terminal(
                         state, cancelled, version,
                     )
@@ -420,12 +487,7 @@ class DurableReActRunner:
 
                 if phase == _PHASE_READY:
                     if state.iteration >= self.behaviour.max_iterations:
-                        result = FinalResult(
-                            text="",
-                            state=state,
-                            stop_reason=TerminationReason.MAX_ITERATIONS,
-                            metadata={"iterations": state.iteration},
-                        )
+                        result = self.behaviour._max_iterations_result(state)
                         phase, payload, version = self._checkpoint_terminal(
                             state, result, version,
                         )
@@ -448,11 +510,33 @@ class DurableReActRunner:
                     if not isinstance(effect_id_value, str):
                         raise TypeError("before_llm checkpoint has no llm_effect_id")
                     request = self.behaviour._build_request(state)
+                    await self._emit(
+                        f"model:{state.iteration}:started",
+                        AgentEventType.MODEL_STARTED,
+                        iteration=state.iteration,
+                        data={"model": request.model},
+                    )
                     reply = await self._await_phase(self.behaviour.harness.call(
                         request,
                         caused_by=self.run.id,
                         effect_id=effect_id_value,
+                        stream_sink=self._model_event_sink(state.iteration),
                     ), "model")
+                    await self._emit(
+                        f"model:{state.iteration}:completed",
+                        AgentEventType.MODEL_COMPLETED,
+                        iteration=state.iteration,
+                        data={
+                            "model": reply.model,
+                            "stop_reason": reply.stop_reason,
+                            "usage": {
+                                "input": reply.usage.input,
+                                "output": reply.usage.output,
+                                "cache_read": reply.usage.cache_read,
+                                "cache_write": reply.usage.cache_write,
+                            },
+                        },
+                    )
                     tool_calls = self.behaviour._extract_tool_calls(reply)
                     payload = self._payload(
                         state,
@@ -482,14 +566,16 @@ class DurableReActRunner:
                 )
 
                 if reply.stop_reason == "error":
-                    result = FinalResult(
-                        text="",
-                        state=state,
-                        stop_reason=TerminationReason.ERROR,
-                        error=reply.error_detail or {"type": "unknown"},
-                        metadata={"iterations": state.iteration},
-                    )
+                    result = self.behaviour._error_result(state, reply)
                     result = self._supervisor_result(state) or result
+                    result = await self.behaviour._observe_result(
+                        result,
+                        reply,
+                        (),
+                        (),
+                        self.context,
+                        self._observer_emitter("terminal", state.iteration),
+                    )
                     phase, payload, version = self._checkpoint_terminal(
                         state, result, version,
                     )
@@ -497,49 +583,36 @@ class DurableReActRunner:
 
                 if not tool_calls:
                     if reply.stop_reason == "tool_use":
-                        result = FinalResult(
-                            text="",
-                            state=state,
-                            stop_reason=TerminationReason.ERROR,
-                            error={
-                                "type": "malformed_tool_use",
-                                "message": (
-                                    "model stopped for tool_use without a valid "
-                                    "tool_use block"
-                                ),
-                            },
-                            metadata={"iterations": state.iteration},
+                        result = self.behaviour._malformed_tool_result(state)
+                        result = await self.behaviour._observe_result(
+                            result,
+                            reply,
+                            (),
+                            (),
+                            self.context,
+                            self._observer_emitter("terminal", state.iteration),
                         )
                         phase, payload, version = self._checkpoint_terminal(
                             state, result, version,
                         )
                         continue
-                    next_state = state.with_messages(
-                        self.behaviour._message_from_reply(reply),
-                    ).next_iteration()
-                    self.behaviour._fold_iteration(
-                        state=next_state,
-                        reply=reply,
-                        tool_calls=(),
-                        tool_results=(),
+                    result = self.behaviour._terminal_result(
+                        state,
+                        reply,
                         claim_id_prefix=self._iteration_claim_prefix(state.iteration),
                     )
-                    result = FinalResult(
-                        text=self.behaviour._extract_text(reply),
-                        state=next_state,
-                        stop_reason=(
-                            TerminationReason.MAX_TOKENS
-                            if reply.stop_reason == "max_tokens"
-                            else TerminationReason.NATURAL_STOP
+                    result = await self.behaviour._observe_result(
+                        result,
+                        reply,
+                        (),
+                        (),
+                        self.context,
+                        self._observer_emitter(
+                            "terminal", result.state.iteration,
                         ),
-                        metadata={"iterations": next_state.iteration},
                     )
-                    result = self._supervisor_result(
-                        next_state,
-                        iteration=state.iteration,
-                    ) or result
                     phase, payload, version = self._checkpoint_terminal(
-                        next_state, result, version,
+                        result.state, result, version,
                     )
                     continue
 
@@ -553,6 +626,112 @@ class DurableReActRunner:
                     batch_size = self.behaviour._parallel_tool_count(
                         tool_calls, next_index,
                     )
+                    input_request: Mapping[str, Any] | None = None
+                    input_id = payload.get("input_interrupt_id")
+                    if input_id is not None:
+                        if not isinstance(input_id, str):
+                            raise TypeError("input_interrupt_id must be a string")
+                        interrupt = self.store.get_interrupt(input_id)
+                        if interrupt is None:
+                            raise ExecutionStateError(
+                                f"checkpoint references missing interrupt {input_id!r}",
+                            )
+                        if interrupt.kind != "input":
+                            raise ExecutionStateError(
+                                f"interrupt {input_id!r} is {interrupt.kind!r}, not input",
+                            )
+                        if interrupt.state is not InterruptState.ALLOWED:
+                            raise ExecutionStateError(
+                                f"interrupt {input_id!r} is {interrupt.state.value}, "
+                                "not allowed",
+                            )
+                        current_call = tool_calls[next_index]
+                        details = self._tool_event_details(current_call)
+                        await self._emit(
+                            f"tool:{state.iteration}:{next_index}:started",
+                            AgentEventType.TOOL_STARTED,
+                            iteration=state.iteration,
+                            data=details,
+                        )
+                        input_result = {
+                            "type": "tool_result",
+                            "tool_use_id": str(current_call["id"]),
+                            "content": self._input_response_text(interrupt.response),
+                        }
+                        tool_results.append(input_result)
+                        await self._emit(
+                            f"tool:{state.iteration}:{next_index}:completed",
+                            AgentEventType.TOOL_COMPLETED,
+                            iteration=state.iteration,
+                            data={
+                                **details,
+                                "is_error": False,
+                                "content": input_result["content"],
+                                "input_boundary": True,
+                            },
+                        )
+                        payload = self._payload(
+                            state,
+                            llm_effect_id=payload.get("llm_effect_id"),
+                            reply=reply,
+                            tool_calls=tool_calls,
+                            tool_results=tool_results,
+                            next_tool_index=next_index + 1,
+                        )
+                        checkpoint = self.store.save_checkpoint(
+                            self.run.id,
+                            self._token,
+                            expected_version=version,
+                            phase=_PHASE_AFTER_TOOL,
+                            state=payload,
+                        )
+                        version, phase = checkpoint.version, checkpoint.phase
+                        continue
+
+                    if self.input_policy is not None:
+                        for offset in range(batch_size):
+                            candidate = tool_calls[next_index + offset]
+                            try:
+                                tool = self.behaviour.tools.get(
+                                    str(candidate["name"]),
+                                )
+                            except ToolNotFoundError:
+                                break
+                            decision = self.input_policy(
+                                tool, dict(candidate.get("input") or {}),
+                            )
+                            if decision is None:
+                                continue
+                            if offset == 0:
+                                input_request = decision
+                                batch_size = 1
+                            else:
+                                batch_size = offset
+                            break
+                    if input_request is not None:
+                        await self._emit_tool_requested(
+                            state.iteration,
+                            next_index,
+                            tool_calls[next_index],
+                        )
+                        input_id = self._input_interrupt_id(
+                            state.iteration, next_index,
+                        )
+                        interrupt = self.store.suspend(
+                            self.run.id,
+                            self._token,
+                            expected_version=version,
+                            phase=phase,
+                            checkpoint_state={
+                                **payload,
+                                "input_interrupt_id": input_id,
+                            },
+                            kind="input",
+                            request=input_request,
+                            interrupt_id=input_id,
+                        )
+                        raise RunSuspended(interrupt)
+
                     approval_request: Mapping[str, Any] | None = None
                     approval_id = payload.get("approval_interrupt_id")
                     if approval_id is not None:
@@ -596,6 +775,11 @@ class DurableReActRunner:
                                 batch_size = offset
                             break
                     if approval_request is not None:
+                        await self._emit_tool_requested(
+                            state.iteration,
+                            next_index,
+                            tool_calls[next_index],
+                        )
                         approval_id = self._approval_interrupt_id(
                             state.iteration, next_index,
                         )
@@ -623,14 +807,10 @@ class DurableReActRunner:
                     # are restored on the blocks sent back to the model.
                     batch = tool_calls[next_index:next_index + batch_size]
                     calls = [
-                        self.behaviour.tool_harness.call(
-                            tool_name=str(tool_call["name"]),
-                            arguments=dict(tool_call.get("input") or {}),
-                            effect_id=self._tool_effect_id(
-                                state.iteration, next_index + offset,
-                            ),
-                            tool_use_id=str(tool_call["id"]),
-                            caused_by=self.run.id,
+                        self._run_tool_call(
+                            tool_call,
+                            state.iteration,
+                            next_index + offset,
                         )
                         for offset, tool_call in enumerate(batch)
                     ]
@@ -666,15 +846,11 @@ class DurableReActRunner:
                     version, phase = checkpoint.version, checkpoint.phase
                     continue
 
-                next_state = state.with_messages(
-                    self.behaviour._message_from_reply(reply),
-                    self.behaviour._message_from_tool_results(tool_results),
-                ).next_iteration()
-                self.behaviour._fold_iteration(
-                    state=next_state,
-                    reply=reply,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
+                next_state = self.behaviour._advance_after_tools(
+                    state,
+                    reply,
+                    tool_calls,
+                    tool_results,
                     claim_id_prefix=self._iteration_claim_prefix(state.iteration),
                 )
                 early = self._supervisor_result(
@@ -686,6 +862,22 @@ class DurableReActRunner:
                         next_state, early, version,
                     )
                     continue
+                observer_result = await self.behaviour._observe(
+                    next_state,
+                    phase="after_tools",
+                    reply=reply,
+                    tool_calls=tool_calls,
+                    tool_results=tool_results,
+                    context=self.context,
+                    event_emitter=self._observer_emitter(
+                        "after_tools", next_state.iteration,
+                    ),
+                )
+                if observer_result is not None:
+                    phase, payload, version = self._checkpoint_terminal(
+                        next_state, observer_result, version,
+                    )
+                    continue
                 payload = self._payload(next_state)
                 checkpoint = self.store.save_checkpoint(
                     self.run.id,
@@ -695,11 +887,193 @@ class DurableReActRunner:
                     state=payload,
                 )
                 version, phase = checkpoint.version, checkpoint.phase
-        except RunSuspended:
+        except (RunSuspended, RunCancelled, RunDeadlineExceeded):
             raise
         except Exception as exc:
             self._fail_run(exc)
             raise
+
+    async def _emit(
+        self,
+        identity: str,
+        event_type: str,
+        *,
+        iteration: int = 0,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        event = self.store.append_agent_event(
+            self.run.id,
+            event_type,
+            identity=identity,
+            iteration=iteration,
+            data=data,
+        )
+        if event.sequence <= self.event_cursor:
+            return
+        self.event_cursor = event.sequence
+        if self.event_sink is None:
+            return
+        try:
+            delivered = self.event_sink(event)
+            if inspect.isawaitable(delivered):
+                await delivered
+        except Exception:
+            # Persistence is authoritative. A UI reconnects with its cursor.
+            logger.exception("durable AgentEvent sink failed; continuing")
+            self.event_sink = None
+
+    def _model_event_sink(self, iteration: int):
+        stream_index = 0
+
+        async def deliver(event: Any) -> None:
+            nonlocal stream_index
+            event_type: str | None = None
+            data: Mapping[str, Any] | None = None
+            if isinstance(event, Delta):
+                event_type = AgentEventType.MODEL_DELTA
+                data = {"index": event.index, "text": event.text}
+            elif isinstance(event, Thinking):
+                event_type = AgentEventType.MODEL_THINKING
+                data = {"text": event.text}
+            elif isinstance(event, ToolUseDelta):
+                event_type = AgentEventType.MODEL_TOOL_DELTA
+                data = {"index": event.index, "partial_json": event.partial_json}
+            if event_type is not None:
+                await self._emit(
+                    f"model:{iteration}:stream:{stream_index}",
+                    event_type,
+                    iteration=iteration,
+                    data=data,
+                )
+                stream_index += 1
+
+        return deliver
+
+    def _observer_emitter(self, phase: str, iteration: int) -> EventEmitter:
+        delivered = 0
+
+        async def persist(event) -> None:
+            nonlocal delivered
+            await self._emit(
+                f"observer:{phase}:{iteration}:{delivered}",
+                event.type,
+                iteration=event.iteration,
+                data=event.data,
+            )
+            delivered += 1
+
+        return EventEmitter(self.run.id, persist)
+
+    def _tool_event_details(
+        self, tool_call: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        tool_name = str(tool_call["name"])
+        details: dict[str, Any] = {
+            "tool_use_id": str(tool_call["id"]),
+            "tool_name": tool_name,
+            "arguments": dict(tool_call.get("input") or {}),
+        }
+        try:
+            details["side_effect"] = self.behaviour.tools.get(
+                tool_name,
+            ).side_effect.value
+        except ToolNotFoundError:
+            pass
+        return details
+
+    async def _emit_tool_requested(
+        self,
+        iteration: int,
+        tool_index: int,
+        tool_call: Mapping[str, Any],
+    ) -> None:
+        await self._emit(
+            f"tool:{iteration}:{tool_index}:requested",
+            AgentEventType.TOOL_REQUESTED,
+            iteration=iteration,
+            data=self._tool_event_details(tool_call),
+        )
+
+    async def _run_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        iteration: int,
+        tool_index: int,
+    ) -> Mapping[str, Any]:
+        details = self._tool_event_details(tool_call)
+        await self._emit_tool_requested(iteration, tool_index, tool_call)
+        await self._emit(
+            f"tool:{iteration}:{tool_index}:started",
+            AgentEventType.TOOL_STARTED,
+            iteration=iteration,
+            data=details,
+        )
+        result = await self.behaviour.tool_harness.call(
+            tool_name=str(tool_call["name"]),
+            arguments=dict(tool_call.get("input") or {}),
+            effect_id=self._tool_effect_id(iteration, tool_index),
+            tool_use_id=str(tool_call["id"]),
+            caused_by=self.run.id,
+        )
+        await self._emit(
+            f"tool:{iteration}:{tool_index}:completed",
+            AgentEventType.TOOL_COMPLETED,
+            iteration=iteration,
+            data={
+                **details,
+                "is_error": bool(result.get("is_error")),
+                "content": result.get("content", ""),
+            },
+        )
+        return result
+
+    async def _emit_terminal(self, result: FinalResult) -> None:
+        if result.stop_reason == TerminationReason.CANCELLED:
+            event_type = AgentEventType.RUN_CANCELLED
+            identity = "run:cancelled"
+        else:
+            # A logical error is still a completed Agent protocol result.
+            # RUN_FAILED is reserved for exceptions that escaped the contract.
+            event_type = AgentEventType.RUN_COMPLETED
+            identity = "run:completed"
+        await self._emit(
+            identity,
+            event_type,
+            iteration=result.state.iteration,
+            data={
+                "text": result.text,
+                "stop_reason": result.stop_reason,
+                "error": dict(result.error) if result.error else None,
+                "metadata": dict(result.metadata),
+            },
+        )
+
+    async def _finish_controlled(
+        self,
+        initial: AgentState | None,
+        exc: RunCancelled | RunDeadlineExceeded,
+    ) -> FinalResult:
+        checkpoint = self.store.get_checkpoint(self.run.id)
+        if checkpoint is not None:
+            raw_state = checkpoint.state.get("agent_state")
+            state = (
+                _agent_state_from_payload(raw_state)
+                if isinstance(raw_state, Mapping) else initial or AgentState()
+            )
+            version = checkpoint.version
+        else:
+            state = initial or AgentState()
+            version = 0
+        if isinstance(exc, RunCancelled):
+            current = self.store.get_run(self.run.id)
+            if current is not None and not current.cancel_requested:
+                self.store.request_cancel(self.run.id)
+            result = self.behaviour._cancelled_result(state)
+        else:
+            result = self.behaviour._deadline_result(state, exc)
+        self._checkpoint_terminal(state, result, version)
+        await self._emit_terminal(result)
+        return self._settle(result)
 
     def _fail_run(self, exc: Exception) -> None:
         with contextlib.suppress(Exception):
@@ -808,6 +1182,18 @@ class DurableReActRunner:
             f"{self.run.id}:approval:{iteration}:{tool_index}".encode("utf-8"),
         ).hexdigest()[:20]
         return f"approval_{digest}"
+
+    def _input_interrupt_id(self, iteration: int, tool_index: int) -> str:
+        digest = hashlib.sha256(
+            f"{self.run.id}:input:{iteration}:{tool_index}".encode("utf-8"),
+        ).hexdigest()[:20]
+        return f"input_{digest}"
+
+    @staticmethod
+    def _input_response_text(response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        return json.dumps(response, ensure_ascii=False, sort_keys=True)
 
     @staticmethod
     def _positive_seconds(value: float, name: str) -> float:

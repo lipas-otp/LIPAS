@@ -30,7 +30,8 @@ __all__ = [
 ]
 
 
-class MailboxLeaseError(RuntimeError): pass
+class MailboxLeaseError(RuntimeError):
+    pass
 
 
 class MailboxSchemaVersionMismatch(RuntimeError):
@@ -311,7 +312,8 @@ class Mailbox:
                     TAG_AGENT_MAIL_RELEASED,
                     {"message_id": message_id, "attempt": row[0]},
                 )
-        if not cur.rowcount: raise MailboxLeaseError("message is not owned by this lease")
+        if not cur.rowcount:
+            raise MailboxLeaseError("message is not owned by this lease")
         self.repair_audit()
 
     @staticmethod
@@ -434,13 +436,16 @@ class AgentOrchestrator:
         self._agents: dict[str, AgentHandler] = {}
 
     def register(self, name: str, handler: AgentHandler) -> None:
-        if not name or name in self._agents: raise ValueError(f"invalid or duplicate agent name {name!r}")
+        if not name or name in self._agents:
+            raise ValueError(f"invalid or duplicate agent name {name!r}")
         self._agents[name] = handler
 
     async def handoff(self, *, sender: str, recipient: str, payload: Mapping[str, Any], message_id: str | None = None) -> Any:
-        if recipient not in self._agents: raise KeyError(f"unknown agent {recipient!r}")
+        if recipient not in self._agents:
+            raise KeyError(f"unknown agent {recipient!r}")
         sent = self.mailbox.send(sender=sender, recipient=recipient, payload=payload, message_id=message_id)
-        if sent.status == "acknowledged": raise MailboxLeaseError(f"message {sent.id!r} was already acknowledged")
+        if sent.status == "acknowledged":
+            raise MailboxLeaseError(f"message {sent.id!r} was already acknowledged")
         messages = self.mailbox.claim(
             recipient,
             limit=1,
@@ -448,7 +453,10 @@ class AgentOrchestrator:
             message_id=sent.id,
         )
         message = next((m for m in messages if m.id == sent.id), None)
-        if message is None: raise MailboxLeaseError(f"message {sent.id!r} is currently leased by another member")
+        if message is None:
+            raise MailboxLeaseError(
+                f"message {sent.id!r} is currently leased by another member"
+            )
         try:
             result = await self._agents[recipient](message)
         except BaseException:

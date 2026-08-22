@@ -54,8 +54,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Literal, Mapping, Optional
 
-TAG_REPLAY_DECISION = "replay_decision"
-
 from .calculus import Claim
 from .exceptions import LipasError
 from .rows.effect import (
@@ -70,6 +68,8 @@ from .rows.effect import (
 )
 from .tools import SideEffectClass, Tool
 
+
+TAG_REPLAY_DECISION = "replay_decision"
 
 logger = logging.getLogger(__name__)
 

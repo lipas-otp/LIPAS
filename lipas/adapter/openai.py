@@ -248,8 +248,10 @@ class OpenAIResponsesAdapter:
 
     @staticmethod
     def _http_detail(exc: httpx.HTTPStatusError) -> dict[str, Any]:
-        try: raw: Any = exc.response.json()
-        except Exception: raw = exc.response.text
+        try:
+            raw: Any = exc.response.json()
+        except Exception:
+            raw = exc.response.text
         return {
             "type": "http_error",
             "status_code": exc.response.status_code,

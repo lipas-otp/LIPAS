@@ -204,6 +204,7 @@ class LLMHarness:
         caused_by: str | None = None,
         effect_id: str | None = None,
         _replay_call_id: str | None = None,
+        stream_sink: Callable[[StreamEvent], Awaitable[None] | None] | None = None,
     ) -> Reply:
         """Execute one LLM call.
 
@@ -252,7 +253,10 @@ class LLMHarness:
 
         # 4. Drive the adapter.
         outcome: RetryOutcome = await call_with_retry(
-            self.adapter, request, policy_table=self.retry_policy,
+            self.adapter,
+            request,
+            policy_table=self.retry_policy,
+            on_event=stream_sink,
         )
         reply = outcome.reply
 
@@ -339,9 +343,12 @@ class LLMHarness:
         effect_id = f"call_{uuid.uuid4().hex[:12]}"
         target = LLMTarget(request=deepcopy(request))
         cache: list[ResourceEstimate] = []
+
         async def estimate() -> ResourceEstimate:
-            if not cache: cache.append(await self.adapter.estimate_cost(request))
+            if not cache:
+                cache.append(await self.adapter.estimate_cost(request))
             return cache[0]
+
         stream_rejection: BudgetRejection | GuardRejection | None = (
             await self._preflight_budget(request, estimate)
         )

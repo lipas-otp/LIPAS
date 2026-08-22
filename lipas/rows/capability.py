@@ -147,8 +147,10 @@ class CapabilityRow:
         seen: set[str] = set()
         total: float = 0.0
         for c in store.filter(tag=TAG_RESOURCE_SPENT):
-            if c.fields.get(F_BUCKET) != bucket: continue
-            if c.claim_id in seen:               continue
+            if c.fields.get(F_BUCKET) != bucket:
+                continue
+            if c.claim_id in seen:
+                continue
             seen.add(c.claim_id)
             total += float(c.fields.get(F_AMOUNT, 0))
         return total
@@ -158,8 +160,10 @@ class CapabilityRow:
         seen: set[str] = set()
         total: float = 0.0
         for c in store.filter(tag=TAG_BUDGET_OVERRUN):
-            if c.fields.get(F_BUCKET) != bucket: continue
-            if c.claim_id in seen:               continue
+            if c.fields.get(F_BUCKET) != bucket:
+                continue
+            if c.claim_id in seen:
+                continue
             seen.add(c.claim_id)
             total += float(c.fields.get(F_AMOUNT, 0))
         return total

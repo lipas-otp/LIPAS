@@ -5,9 +5,13 @@ Adapters translate Request <-> provider native format and emit a
 provider-neutral StreamEvent sequence terminating in exactly one Done.
 """
 from __future__ import annotations
+import inspect
+from collections.abc import Awaitable, Callable
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .types import Done, Reply, Request, ResourceEstimate, StreamEvent
+
+StreamSink = Callable[[StreamEvent], Awaitable[None] | None]
 
 
 @runtime_checkable
@@ -73,7 +77,12 @@ class StreamProtocolError(RuntimeError):
     callers don't silently get incomplete results."""
 
 
-async def complete(adapter: LLMAdapter, request: Request) -> Reply:
+async def complete(
+    adapter: LLMAdapter,
+    request: Request,
+    *,
+    on_event: StreamSink | None = None,
+) -> Reply:
     """Consume an adapter stream and return the assembled Reply.
 
     Per the LLMAdapter error contract, this function does NOT raise
@@ -85,6 +94,10 @@ async def complete(adapter: LLMAdapter, request: Request) -> Reply:
     stream = adapter.stream(request)
     try:
         async for event in stream:
+            if on_event is not None:
+                delivered = on_event(event)
+                if inspect.isawaitable(delivered):
+                    await delivered
             if isinstance(event, Done):
                 return event.reply
     finally:

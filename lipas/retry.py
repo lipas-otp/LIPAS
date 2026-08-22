@@ -25,19 +25,20 @@ P2.4 amendment:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
-from lipas.adapter import Reply, Request, Usage
+from lipas.adapter import Done, Reply, Request, Usage
 from lipas.adapter.errors import (
     DEFAULT_POLICY,
     ErrorKind,
     RetryPolicy,
     classify,
 )
-from lipas.adapter.protocol import LLMAdapter, complete
+from lipas.adapter.protocol import LLMAdapter, StreamSink, complete
 
 __all__ = ["call_with_retry", "RetryOutcome"]
 
@@ -109,6 +110,7 @@ async def call_with_retry(
     policy_table: Mapping[ErrorKind, RetryPolicy] = DEFAULT_POLICY,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
+    on_event: StreamSink | None = None,
 ) -> RetryOutcome:
     """Execute a request with classified-error retries.
 
@@ -154,7 +156,22 @@ async def call_with_retry(
     total_usage = Usage()
 
     while True:
-        reply = await complete(adapter, request)
+        visible_event = False
+
+        async def deliver(event):
+            nonlocal visible_event
+            if not isinstance(event, Done):
+                visible_event = True
+            if on_event is not None:
+                delivered = on_event(event)
+                if inspect.isawaitable(delivered):
+                    await delivered
+
+        reply = await (
+            complete(adapter, request)
+            if on_event is None
+            else complete(adapter, request, on_event=deliver)
+        )
         total_usage = total_usage + reply.usage
 
         if reply.stop_reason != "error":
@@ -168,7 +185,11 @@ async def call_with_retry(
         policy = policy_table[kind]
         attempts_made = attempt + 1
 
-        if not policy.should_retry or attempts_made >= policy.max_attempts:
+        if (
+            visible_event
+            or not policy.should_retry
+            or attempts_made >= policy.max_attempts
+        ):
             logger.info(
                 "retry: terminal kind=%s attempts=%d/%d retryable=%s",
                 kind.name, attempts_made, policy.max_attempts,

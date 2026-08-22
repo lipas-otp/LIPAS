@@ -13,6 +13,7 @@ from .types import (
 if TYPE_CHECKING:
     from .anthropic import AnthropicAdapter
     from .ollama import OllamaAdapter
+    from .openai_compatible import OpenAICompatibleAdapter
     from .openai import OpenAIResponsesAdapter
 
 __all__ = [
@@ -50,6 +51,7 @@ __all__ = [
     # Provider adapters are lazy so ``import lipas`` needs no provider extra.
     "OllamaAdapter",
     "AnthropicAdapter",
+    "OpenAICompatibleAdapter",
     "OpenAIResponsesAdapter",
 ]
 
@@ -62,6 +64,9 @@ def __getattr__(name: str):
     if name == "AnthropicAdapter":
         from .anthropic import AnthropicAdapter
         return AnthropicAdapter
+    if name == "OpenAICompatibleAdapter":
+        from .openai_compatible import OpenAICompatibleAdapter
+        return OpenAICompatibleAdapter
     if name == "OpenAIResponsesAdapter":
         from .openai import OpenAIResponsesAdapter
         return OpenAIResponsesAdapter
