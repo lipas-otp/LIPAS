@@ -520,6 +520,65 @@ class ToolHarness:
         # ── 8. Synthesize tool_result ───────────────────────
         return self._tool_result(result_id, _stringify(output), is_error=False)
 
+    def reconcile_orphan(
+        self,
+        effect_id: str,
+        *,
+        output: Any = None,
+        error: Mapping[str, Any] | None = None,
+        wall_seconds: float = 0.0,
+    ) -> dict:
+        """Close an intent-only tool Effect after an operator/provider check.
+
+        A cancelled synchronous thread cannot be force-killed safely.  The
+        caller may therefore inspect the real world (or the provider's
+        idempotency lookup) and explicitly record the observed outcome.  This
+        is deliberately separate from ``call`` so a retry can never turn an
+        orphan into a second live submission.
+        """
+        if not isinstance(effect_id, str) or not effect_id:
+            raise ValueError("effect_id must be a non-empty string")
+        if (
+            isinstance(wall_seconds, bool)
+            or not isinstance(wall_seconds, (int, float))
+            or wall_seconds < 0
+        ):
+            raise ValueError("wall_seconds must be a non-negative number")
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
+        )
+        if effect_row is None:
+            raise OrphanedEffectError(f"tool effect {effect_id!r} is not recorded")
+        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
+        if node is None or node.intent is None:
+            raise OrphanedEffectError(f"tool effect {effect_id!r} has no intent")
+        if node.result is not None or node.rejection is not None:
+            return self._tool_result(
+                effect_id,
+                "already reconciled",
+                is_error=node.result is not None
+                and node.result.fields.get(F_STATUS) != "ok",
+            )
+        tool_name = node.intent.fields.get(F_TOOL_NAME)
+        arguments = node.intent.fields.get(F_ARGUMENTS, {})
+        if not isinstance(tool_name, str) or not isinstance(arguments, Mapping):
+            raise OrphanedEffectError(f"tool effect {effect_id!r} has invalid intent")
+        tool = self.tools.get(tool_name)
+        estimate, rejection = self._estimate_dict(tool, arguments)
+        if rejection is not None or estimate is None:
+            raise OrphanedEffectError(
+                f"tool effect {effect_id!r} cannot be reconciled: invalid estimate",
+            )
+        spend = self._compute_spend(estimate, float(wall_seconds))
+        status = "error" if error is not None else "ok"
+        self._fold_result(effect_id, tool, output, status, dict(error) if error else None, spend=spend)
+        self._fold_spend(effect_id, spend)
+        return self._tool_result(
+            effect_id,
+            _stringify(output) if error is None else str(error.get("message", "error")),
+            is_error=error is not None,
+        )
+
     def _restore_consumed_replay_effect_ids(self) -> None:
         """Recover source-tape consumption when a target tape is reopened."""
         for claim in self.rowset.store.filter(tag=TAG_REPLAY_DECISION):

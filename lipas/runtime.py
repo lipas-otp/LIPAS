@@ -1,7 +1,6 @@
 """Composition root for the LIPAS execution and product surfaces."""
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -142,10 +141,6 @@ class LIPASRuntime:
             self.handoffs = Mailbox(self.database_path, rowset=self.claims)
             self.sessions = SQLiteSessionStore(self.database_path)
             self.artifacts = ArtifactRepository(self.workbench)
-            # Workbench owns one mutable evidence attachment. Serialize the
-            # convenience durable entry points so concurrent callers cannot
-            # close one another's ExecutionStore mid-Run.
-            self._durable_lock = asyncio.Lock()
             if initializing:
                 self._workspace_lease.make_shared()
         except BaseException:
@@ -162,12 +157,7 @@ class LIPASRuntime:
 
     @property
     def execution(self):
-        """The current authoritative store owned by the Workbench.
-
-        Workbench may reattach its audit projection to a Run-local evidence
-        tape. Keeping this as a property prevents callers retaining the closed
-        pre-attachment store.
-        """
+        """The stable authoritative control store owned by the Workbench."""
         return self.workbench.execution
 
     @classmethod
@@ -198,6 +188,41 @@ class LIPASRuntime:
             **kwargs,
         )
 
+    def coordinator(self, **kwargs: Any):
+        """Build a multi-Agent coordinator over this Runtime's authority.
+
+        The returned object borrows ``execution`` and therefore never closes
+        the Runtime's store. Member registration remains application-owned
+        configuration; handoff Task/Run facts are persisted by the Runtime.
+        """
+        self._ensure_open()
+        reserved = {"execution", "workspace", "_owns_execution"} & kwargs.keys()
+        if reserved:
+            names = ", ".join(sorted(reserved))
+            raise ValueError(f"LIPASRuntime.coordinator owns: {names}")
+        from .coordination import AgentCoordinator
+        return AgentCoordinator(self.execution, workspace=self.home, **kwargs)
+
+    def operator(self, **kwargs: Any):
+        """Build the dependency-free local Web operator over this Runtime.
+
+        The returned operator borrows the Runtime's execution connection and
+        never owns or closes it.  Pass ``coordinator=runtime.coordinator()``
+        when aggregate coordination events should be exposed as well.
+        """
+        self._ensure_open()
+        from .operator import LocalWebOperator
+        reserved = {"execution", "workbench"} & kwargs.keys()
+        if reserved:
+            names = ", ".join(sorted(reserved))
+            raise ValueError(f"LIPASRuntime.operator owns: {names}")
+        return LocalWebOperator(
+            self.execution,
+            workbench=self.workbench,
+            operations=self.operations,
+            **kwargs,
+        )
+
     async def run_durable(
         self,
         agent: Any,
@@ -209,10 +234,9 @@ class LIPASRuntime:
         """Run without making the application pass this runtime's store."""
         if "execution_store" in kwargs:
             raise ValueError("LIPASRuntime owns execution_store")
-        async with self._durable_lock:
-            return await self._invoke_durable(
-                agent, prompt=prompt, run_id=run_id, resume=False, kwargs=kwargs,
-            )
+        return await self._invoke_durable(
+            agent, prompt=prompt, run_id=run_id, resume=False, kwargs=kwargs,
+        )
 
     async def _invoke_durable(
         self,
@@ -226,32 +250,22 @@ class LIPASRuntime:
         rowset = getattr(agent, "rowset", None)
         if rowset is None:
             raise TypeError("runtime durable execution requires an Agent rowset")
-        self.workbench.attach_rowset(rowset, run_id=run_id)
-        try:
+        # Each Run owns its evidence attachment. The Workbench's global
+        # ExecutionStore remains stable, so concurrent durable calls cannot
+        # close or redirect one another's audit sink.
+        with self.workbench.execution_scope(rowset, run_id=run_id) as execution:
             if resume:
-                result = await agent.resume_durable(
-                    execution_store=self.execution,
+                return await agent.resume_durable(
+                    execution_store=execution,
                     run_id=run_id,
                     **kwargs,
                 )
-            else:
-                result = await agent.run_durable(
-                    prompt,
-                    execution_store=self.execution,
-                    run_id=run_id,
-                    **kwargs,
-                )
-        except BaseException:
-            try:
-                self.workbench.attach_global_rowset(self.claims)
-            except BaseException:
-                # Preserve RunSuspended, cancellation, and execution failures.
-                # The caller can still close the runtime to release resources.
-                pass
-            raise
-        else:
-            self.workbench.attach_global_rowset(self.claims)
-            return result
+            return await agent.run_durable(
+                prompt,
+                execution_store=execution,
+                run_id=run_id,
+                **kwargs,
+            )
 
     async def resume_durable(
         self,
@@ -262,10 +276,9 @@ class LIPASRuntime:
     ):
         if "execution_store" in kwargs:
             raise ValueError("LIPASRuntime owns execution_store")
-        async with self._durable_lock:
-            return await self._invoke_durable(
-                agent, prompt=None, run_id=run_id, resume=True, kwargs=kwargs,
-            )
+        return await self._invoke_durable(
+            agent, prompt=None, run_id=run_id, resume=True, kwargs=kwargs,
+        )
 
     def audit(self, *, repair: bool = False) -> RuntimeAuditReport:
         """Lint evidence and optionally repair recoverable audit outboxes."""
@@ -282,6 +295,10 @@ class LIPASRuntime:
             operation_events_repaired=operation_repaired,
             handoff_events_repaired=handoff_repaired,
         )
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("LIPASRuntime is closed")
 
     def _claim_audit(
         self, *, repair: bool,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -55,6 +56,7 @@ class TaskDispatcher:
     _retry_after: dict[str, float] = field(
         default_factory=dict, init=False, repr=False,
     )
+    _store: ExecutionStore | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -80,43 +82,45 @@ class TaskDispatcher:
         A worker/setup error is reported once rather than creating a tight
         retry loop. A later invocation can retry that still-pending Run.
         """
-        outcomes: list[DispatchOutcome] = []
-        attempted: set[str] = set()
-        while True:
-            candidates = [
-                run for run in self._claimable_runs()
-                if run.id not in attempted
-            ]
-            if not candidates:
-                return tuple(outcomes)
-            batch = candidates[:self.max_concurrency]
-            attempted.update(run.id for run in batch)
-            completed = await asyncio.gather(*(
-                self._execute(run) for run in batch
-            ))
-            outcomes.extend(completed)
-            for outcome in completed:
-                self._emit(outcome)
+        with self._store_scope():
+            outcomes: list[DispatchOutcome] = []
+            attempted: set[str] = set()
+            while True:
+                candidates = [
+                    run for run in self._claimable_runs()
+                    if run.id not in attempted
+                ]
+                if not candidates:
+                    return tuple(outcomes)
+                batch = candidates[:self.max_concurrency]
+                attempted.update(run.id for run in batch)
+                completed = await asyncio.gather(*(
+                    self._execute(run) for run in batch
+                ))
+                outcomes.extend(completed)
+                for outcome in completed:
+                    self._emit(outcome)
 
     async def serve(self, stop: asyncio.Event | None = None) -> None:
         """Continuously dispatch work until cancelled or ``stop`` is set."""
         stop = stop or asyncio.Event()
-        try:
-            while not stop.is_set():
-                self._reap_finished()
-                self._fill_slots()
-                await self._wait_for_progress(stop)
-        finally:
-            for task in self._active.values():
-                task.cancel()
-            if self._active:
-                await asyncio.gather(
-                    *self._active.values(), return_exceptions=True,
-                )
-            self._active.clear()
+        with self._store_scope():
+            try:
+                while not stop.is_set():
+                    self._reap_finished()
+                    self._fill_slots()
+                    await self._wait_for_progress(stop)
+            finally:
+                for task in self._active.values():
+                    task.cancel()
+                if self._active:
+                    await asyncio.gather(
+                        *self._active.values(), return_exceptions=True,
+                    )
+                self._active.clear()
 
     def _claimable_runs(self) -> tuple[Run, ...]:
-        with ExecutionStore(self.execution_path) as store:
+        with self._store_call() as store:
             return store.list_claimable_runs()
 
     def _fill_slots(self) -> None:
@@ -166,7 +170,7 @@ class TaskDispatcher:
 
     async def _execute(self, discovered: Run) -> DispatchOutcome:
         try:
-            with ExecutionStore(self.execution_path) as store:
+            with self._store_call() as store:
                 task = store.get_task(discovered.task_id)
                 claimed = store.claim_run(
                     discovered.id, lease_seconds=self.lease_seconds,
@@ -193,7 +197,7 @@ class TaskDispatcher:
                 type(exc).__name__,
             )
 
-        with ExecutionStore(self.execution_path) as store:
+        with self._store_call() as store:
             current = store.get_run(discovered.id)
         if current is None:
             return DispatchOutcome(
@@ -212,6 +216,27 @@ class TaskDispatcher:
     def _emit(self, outcome: DispatchOutcome) -> None:
         if self.outcome_sink is not None:
             self.outcome_sink(outcome)
+
+    @contextlib.contextmanager
+    def _store_scope(self):
+        """Keep one connection for a complete dispatcher invocation."""
+        if self._store is not None:
+            raise RuntimeError("TaskDispatcher is already running")
+        with ExecutionStore(self.execution_path) as store:
+            self._store = store
+            try:
+                yield
+            finally:
+                self._store = None
+
+    @contextlib.contextmanager
+    def _store_call(self):
+        """Reuse the invocation store, with a safe fallback for private calls."""
+        if self._store is not None:
+            yield self._store
+            return
+        with ExecutionStore(self.execution_path) as store:
+            yield store
 
     @staticmethod
     def _positive_seconds(value: float, name: str) -> float:

@@ -61,6 +61,7 @@ __all__ = [
     # Shared field-name constants — re-exported by lipas.rows.effect
     # for convenience; canonical home is here.
     "F_EFFECT_ID",
+    "F_PROVIDER_REQUEST_ID",
     "F_KIND",
     "F_COMPENSATES",
     "F_CAUSED_BY",
@@ -165,6 +166,7 @@ TAG_EFFECT_REJECTED = "call_rejected"
 #
 # Shared (intent / result / rejected) ─────────────────────────────────
 F_EFFECT_ID    = "call_id"          # historical; opaque str
+F_PROVIDER_REQUEST_ID = "provider_request_id"
 F_KIND         = "kind"             # value: EffectKind member's str
 F_COMPENSATES  = "compensates"      # str | absent
 # Causal parent outside the effect graph (for example, a Team mailbox id).

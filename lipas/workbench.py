@@ -7,21 +7,20 @@ runtime Effect tape for model/tool audit history.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import difflib
 import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import tempfile
 import time
 import uuid
-import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .behaviour import FinalResult
 from .execution import ExecutionStore, Interrupt, Run, Task
@@ -29,6 +28,7 @@ from .rows import RowSet
 from .tools import SideEffectClass, Tool, tool
 from .security import SecretDetected, SecretPolicy
 from .sandbox import CommandSandbox, sandbox_from_name
+from .sqlite_storage import connect_sqlite
 
 __all__ = [
     "Approval",
@@ -275,7 +275,7 @@ class Workbench:
         self.product_path = unified or self.home / "workbench.db"
         self.command_sandbox = sandbox_from_name(sandbox)
         self.execution = ExecutionStore(self.execution_path, rowset=rowset)
-        self._conn = sqlite3.connect(self.product_path)
+        self._conn = connect_sqlite(self.product_path)
         try:
             self._init_schema()
         except BaseException:
@@ -314,40 +314,29 @@ class Workbench:
         if first_error is not None:
             raise first_error
 
-    def _replace_execution(self, rowset: RowSet, *, run_id: str | None) -> None:
-        replacement = ExecutionStore(
-            self.execution_path, rowset=rowset, audit_run_id=run_id,
-        )
-        previous = self.execution
-        try:
-            previous.close()
-        except BaseException:
-            try:
-                replacement.close()
-            except BaseException:
-                pass
-            raise
-        self.execution = replacement
+    @contextlib.contextmanager
+    def execution_scope(
+        self,
+        rowset: RowSet,
+        *,
+        run_id: str,
+    ) -> Iterator[ExecutionStore]:
+        """Open one Run-scoped control connection and evidence projection.
 
-    def attach_rowset(self, rowset: RowSet, *, run_id: str | None = None) -> None:
-        """Attach evidence before execution, optionally scoped to one Run.
-
-        New product paths always provide ``run_id`` so one Run's isolated
-        evidence cannot receive control events belonging to another. Omitting
-        it retains the legacy all-events mirror for compatibility.
+        The Workbench's authoritative ``execution`` handle is never replaced.
+        Concurrent runs therefore cannot close or redirect one another's
+        control connection, and this temporary connection has one clear owner.
         """
-        if run_id is None:
-            warnings.warn(
-                "Workbench.attach_rowset(rowset) without run_id mirrors every "
-                "Run and is deprecated; pass the owning run_id",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        self._replace_execution(rowset, run_id=run_id)
-
-    def attach_global_rowset(self, rowset: RowSet) -> None:
-        """Restore the composition root's explicit global audit projection."""
-        self._replace_execution(rowset, run_id=None)
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        if self.execution.get_run(run_id) is None:
+            raise KeyError(run_id)
+        with ExecutionStore(
+            self.execution_path,
+            rowset=rowset,
+            audit_run_id=run_id,
+        ) as execution:
+            yield execution
 
     def __enter__(self) -> "Workbench":
         return self
@@ -417,18 +406,28 @@ class Workbench:
                 if _snapshot_file_contains_secret(source_path, relative):
                     excluded_secret_files += 1
                     continue
-                total_bytes += size
-                if (
-                    len(baseline) >= _CHANGESET_MAX_FILES
-                    or total_bytes > _CHANGESET_MAX_BYTES
-                ):
+                if len(baseline) >= _CHANGESET_MAX_FILES:
                     raise WorkspacePolicyError(
                         "workspace snapshot exceeds the ChangeSet file/size limit",
                     )
                 destination = stage / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, destination)
-                baseline[relative] = _file_sha256(source_path)
+                copied_size = destination.stat().st_size
+                total_bytes += copied_size
+                if (
+                    copied_size > _CHANGESET_MAX_FILE_BYTES
+                    or total_bytes > _CHANGESET_MAX_BYTES
+                ):
+                    raise WorkspacePolicyError(
+                        "workspace changed while its bounded snapshot was copied",
+                    )
+                staged_hash = _file_sha256(destination)
+                if _file_sha256(source_path) != staged_hash:
+                    raise WorkspacePolicyError(
+                        f"workspace file changed during snapshot: {relative}",
+                    )
+                baseline[relative] = staged_hash
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
@@ -477,8 +476,16 @@ class Workbench:
         if not stage.is_relative_to(self.runs_path):
             raise WorkspacePolicyError("persisted ChangeSet stage escapes workbench home")
         baseline = json.loads(row[4])
-        if not isinstance(baseline, dict):
-            raise TypeError("ChangeSet baseline must be a mapping")
+        if (
+            not isinstance(baseline, dict)
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for key, value in baseline.items()
+            )
+        ):
+            raise TypeError("ChangeSet baseline must map paths to SHA-256 strings")
         return ChangeSet(
             task_id=row[0], run_id=row[1], source_root=str(source),
             stage_root=str(stage), baseline=baseline, state=row[5],
@@ -583,20 +590,29 @@ class Workbench:
         for relative in paths:
             target = _contained_change_path(source, relative)
             desired = stage_manifest.get(relative)
-            if _optional_file_sha256(target) == desired:
+            current = _optional_file_sha256(target)
+            if current == desired:
                 continue
+            if current != value.baseline.get(relative):
+                raise WorkspacePolicyError(
+                    f"workspace drifted while applying ChangeSet path: {relative}",
+                )
             if desired is None:
                 target.unlink(missing_ok=True)
                 continue
             staged = _contained_change_path(stage, relative)
             data = staged.read_bytes()
+            if hashlib.sha256(data).hexdigest() != desired:
+                raise WorkspacePolicyError(
+                    f"staged file changed while applying ChangeSet path: {relative}",
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
                 temporary = Path(handle.name)
                 handle.write(data)
             try:
+                temporary.chmod(staged.stat().st_mode & 0o777)
                 os.replace(temporary, target)
-                target.chmod(staged.stat().st_mode & 0o777)
             finally:
                 temporary.unlink(missing_ok=True)
         now = time.time()
@@ -672,7 +688,7 @@ class Workbench:
         A checkpoint created before this mapping existed is bound to the
         legacy shared ``claims.db`` store_id, so it must continue there. New
         Runs receive separate sessions and can execute concurrently without
-        sharing a single-writer Claim sequence or budget projection.
+        sharing one hot Claim sequence or budget projection.
         """
         run = self.execution.get_run(run_id)
         if run is None:
@@ -790,6 +806,7 @@ class Workbench:
         data: Mapping[str, Any],
         event_id: str | None = None,
     ) -> RunEvent:
+        self._require_task_run(task_id, run_id)
         event = RunEvent(
             id=event_id or f"event_{uuid.uuid4().hex}",
             task_id=task_id,
@@ -804,7 +821,10 @@ class Workbench:
                 "(id,task_id,run_id,kind,data_json,created_at) VALUES(?,?,?,?,?,?)",
                 (
                     event.id, event.task_id, event.run_id, event.kind,
-                    json.dumps(dict(event.data), sort_keys=True), event.created_at,
+                    json.dumps(
+                        dict(event.data), sort_keys=True, allow_nan=False,
+                    ),
+                    event.created_at,
                 ),
             )
         row = self._conn.execute(
@@ -813,10 +833,20 @@ class Workbench:
             (event.id,),
         ).fetchone()
         assert row is not None
-        return RunEvent(
+        stored = RunEvent(
             id=row[0], task_id=row[1], run_id=row[2], kind=row[3],
             data=json.loads(row[4]), created_at=row[5],
         )
+        if (
+            stored.task_id != event.task_id
+            or stored.run_id != event.run_id
+            or stored.kind != event.kind
+            or dict(stored.data) != dict(event.data)
+        ):
+            raise WorkspacePolicyError(
+                f"workbench event id was reused with different data: {event.id}",
+            )
+        return stored
 
     def events(self, task_id: str) -> tuple[RunEvent, ...]:
         return tuple(
@@ -841,6 +871,7 @@ class Workbench:
         sha256: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> Artifact:
+        self._require_task_run(task_id, run_id)
         artifact = Artifact(
             id=f"artifact_{uuid.uuid4().hex}",
             task_id=task_id,
@@ -893,6 +924,7 @@ class Workbench:
         task = self.execution.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
+        self._require_task_run(task_id, run_id)
         change_set = self.change_set(task_id)
         workspace_root = Path(
             change_set.stage_root if change_set is not None else task.workspace,
@@ -914,6 +946,17 @@ class Workbench:
             ),
         )
         return capabilities.tools()
+
+    def _require_task_run(self, task_id: str, run_id: str) -> Run:
+        """Reject cross-Task evidence before it can poison product reports."""
+        run = self.execution.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run.task_id != task_id:
+            raise WorkspacePolicyError(
+                f"run {run_id!r} does not belong to task {task_id!r}",
+            )
+        return run
 
     def approval_policy(
         self, task_id: str,

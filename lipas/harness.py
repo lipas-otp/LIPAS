@@ -49,7 +49,7 @@ import uuid
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Callable, Awaitable, AsyncIterator
+from typing import Any, Callable, Awaitable, AsyncIterator
 
 from lipas.adapter import Reply, Request, ResourceEstimate, UnknownModelError, Usage
 from lipas.adapter.errors import (
@@ -75,6 +75,7 @@ from lipas.rows.effect import (
     EffectRow,
     F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DETAIL, F_EFFECT_ID, F_ERROR,
     F_KIND, F_MODEL, F_REASON, F_REPLY, F_REQUEST, F_STATUS, F_TOTAL_USAGE,
+    F_PROVIDER_REQUEST_ID,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
 
@@ -217,6 +218,8 @@ class LLMHarness:
         if effect_id is not None and _replay_call_id is not None:
             raise ValueError("pass effect_id or _replay_call_id, not both")
         effect_id = effect_id or _replay_call_id or f"call_{uuid.uuid4().hex[:12]}"
+        if request.request_id is None:
+            request = replace(request, request_id=effect_id)
         recovered = self._recover_existing(effect_id, request)
         if recovered is not None:
             return recovered
@@ -257,6 +260,9 @@ class LLMHarness:
             request,
             policy_table=self.retry_policy,
             on_event=stream_sink,
+            on_attempt=lambda attempt, reply, kind: self._fold_attempt(
+                effect_id, request, attempt, reply, kind,
+            ),
         )
         reply = outcome.reply
 
@@ -272,6 +278,92 @@ class LLMHarness:
             )
 
         return reply
+
+    def reconcile_orphan(
+        self,
+        effect_id: str,
+        *,
+        reply: Reply | None = None,
+        error: Mapping[str, Any] | None = None,
+        attempts: int = 1,
+        total_usage: Usage | None = None,
+    ) -> Reply:
+        """Close an intent-only model Effect after provider reconciliation.
+
+        A timeout or process interruption cannot establish whether a model
+        provider billed or completed a request.  Recovery code must therefore
+        supply either the provider's observed :class:`Reply` or an explicit
+        error observation; this method records that terminal fact without
+        issuing another model request.
+        """
+        if not isinstance(effect_id, str) or not effect_id.strip():
+            raise ValueError("effect_id must be a non-empty string")
+        if reply is not None and not isinstance(reply, Reply):
+            raise TypeError("reply must be Reply or None")
+        if error is not None and not isinstance(error, Mapping):
+            raise TypeError("error must be a mapping or None")
+        if reply is not None and error is not None:
+            raise ValueError("pass reply or error, not both")
+        if (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or attempts < 1
+        ):
+            raise ValueError("attempts must be a positive int")
+        if total_usage is not None and not isinstance(total_usage, Usage):
+            raise TypeError("total_usage must be Usage or None")
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
+        )
+        if effect_row is None:
+            raise OrphanedEffectError(f"LLM effect {effect_id!r} is not recorded")
+        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
+        if node is None or node.intent is None:
+            raise OrphanedEffectError(f"LLM effect {effect_id!r} has no intent")
+        if node.kind is not EffectKind.LLM_CALL:
+            raise ValueError(f"effect id {effect_id!r} belongs to a non-LLM effect")
+        if node.result is not None:
+            recorded = node.result.fields.get(F_REPLY)
+            if not isinstance(recorded, Reply):
+                raise TypeError(f"recorded LLM effect {effect_id!r} has no Reply")
+            return deepcopy(recorded)
+        if node.rejection is not None:
+            raise OrphanedEffectError(
+                f"LLM effect {effect_id!r} is already a rejection, not an orphan",
+            )
+        model = node.intent.fields.get(F_MODEL)
+        if not isinstance(model, str) or not model:
+            raise OrphanedEffectError(
+                f"LLM effect {effect_id!r} has no model identity",
+            )
+        if reply is None:
+            reply = Reply(
+                content=(),
+                usage=Usage(),
+                stop_reason="error",
+                model=model,
+                error_detail={
+                    "type": "reconciled_external_outcome",
+                    **dict(error or {}),
+                },
+            )
+        if reply.model != model:
+            raise ValueError(
+                f"reconciled reply model {reply.model!r} does not match {model!r}",
+            )
+        outcome = RetryOutcome(
+            reply=reply,
+            attempts=attempts,
+            total_usage=total_usage or reply.usage,
+        )
+        self._fold_result(effect_id, outcome)
+        if reply.stop_reason != "error" or outcome.billed_usage.total:
+            self._fold_spend(
+                effect_id,
+                replace(reply, usage=outcome.billed_usage),
+                pricing_model=model,
+            )
+        return deepcopy(reply)
 
     def _recover_existing(self, effect_id: str, request: Request) -> Reply | None:
         """Return an already-recorded terminal call without live submission."""
@@ -451,6 +543,7 @@ class LLMHarness:
             F_EFFECT_ID: effect_id,
             F_KIND:      EffectKind.LLM_CALL.value,
             F_MODEL:     getattr(request, "model", None),
+            F_PROVIDER_REQUEST_ID: request.request_id or effect_id,
             # Request is frozen only at the top level; provider-shaped message
             # mappings can still be mutable. The tape records submission-time
             # data, not later caller mutation.
@@ -464,6 +557,31 @@ class LLMHarness:
             tag=TAG_EFFECT_INTENT,
             fields=intent_fields,
             source="harness.call",
+        ))
+
+    def _fold_attempt(
+        self,
+        effect_id: str,
+        request: Request,
+        attempt: int,
+        reply: Reply,
+        kind: ErrorKind | None,
+    ) -> None:
+        """Persist each provider attempt, including usage on failed retries."""
+        self.rowset.fold(Claim(
+            tag="llm_attempt",
+            fields={
+                F_EFFECT_ID: effect_id,
+                F_KIND: EffectKind.LLM_CALL.value,
+                F_PROVIDER_REQUEST_ID: request.request_id or effect_id,
+                "attempt": attempt,
+                "status": "error" if reply.stop_reason == "error" else "ok",
+                "error_kind": None if kind is None else kind.value,
+                "usage": reply.usage,
+                "billed": bool(reply.usage.total),
+            },
+            source="harness.retry",
+            claim_id=f"{effect_id}:attempt:{attempt}",
         ))
 
     def _fold_result(self, effect_id: str, outcome: RetryOutcome) -> None:

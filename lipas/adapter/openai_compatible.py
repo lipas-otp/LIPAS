@@ -168,10 +168,10 @@ class OpenAICompatibleAdapter:
         try:
             body = self._build_body(request)
             if not self.streaming:
-                payload = await self._post_json(body)
+                payload = await self._post_json(body, request_id=request.request_id)
                 yield Done(self._reply_from_payload(request, payload))
                 return
-            async for payload in self._post_sse(body):
+            async for payload in self._post_sse(body, request_id=request.request_id):
                 for event in accumulator.consume(payload):
                     yield event
             yield Done(accumulator.finish())
@@ -417,12 +417,14 @@ class OpenAICompatibleAdapter:
             },
         }
 
-    async def _post_json(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def _post_json(
+        self, body: Mapping[str, Any], *, request_id: str | None = None,
+    ) -> Mapping[str, Any]:
         if self._client is not None:
             response = await self._client.post(
                 self.url,
                 json=body,
-                headers=self._request_headers(streaming=False),
+                headers=self._request_headers(streaming=False, request_id=request_id),
                 timeout=self.timeout_s,
             )
         else:
@@ -430,7 +432,7 @@ class OpenAICompatibleAdapter:
                 response = await client.post(
                     self.url,
                     json=body,
-                    headers=self._request_headers(streaming=False),
+                    headers=self._request_headers(streaming=False, request_id=request_id),
                 )
         response.raise_for_status()
         payload = response.json()
@@ -441,13 +443,15 @@ class OpenAICompatibleAdapter:
     async def _post_sse(
         self,
         body: Mapping[str, Any],
+        *,
+        request_id: str | None = None,
     ) -> AsyncIterator[Mapping[str, Any]]:
         if self._client is not None:
             async with self._client.stream(
                 "POST",
                 self.url,
                 json=body,
-                headers=self._request_headers(streaming=True),
+                headers=self._request_headers(streaming=True, request_id=request_id),
                 timeout=self.timeout_s,
             ) as response:
                 response.raise_for_status()
@@ -459,7 +463,7 @@ class OpenAICompatibleAdapter:
                 "POST",
                 self.url,
                 json=body,
-                headers=self._request_headers(streaming=True),
+                headers=self._request_headers(streaming=True, request_id=request_id),
             ) as response:
                 response.raise_for_status()
                 async for payload in self._sse_payloads(response):
@@ -718,7 +722,9 @@ class OpenAICompatibleAdapter:
             raise ValueError(f"{field} must be a non-negative integer")
         return value
 
-    def _request_headers(self, *, streaming: bool) -> dict[str, str]:
+    def _request_headers(
+        self, *, streaming: bool, request_id: str | None = None,
+    ) -> dict[str, str]:
         headers = {
             "Accept": "text/event-stream" if streaming else "application/json",
             "Content-Type": "application/json",
@@ -726,6 +732,15 @@ class OpenAICompatibleAdapter:
         }
         if self.api_key is not None:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if request_id:
+            # These are deliberately standard, harmless correlation headers.
+            # Providers that implement idempotent Chat Completions can use
+            # Idempotency-Key; all others still receive X-Request-ID.
+            for key in tuple(headers):
+                if key.lower() in {"idempotency-key", "x-request-id"}:
+                    del headers[key]
+            headers["Idempotency-Key"] = request_id
+            headers["X-Request-ID"] = request_id
         return headers
 
     def _error_reply(

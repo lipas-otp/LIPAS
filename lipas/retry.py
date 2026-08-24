@@ -42,6 +42,8 @@ from lipas.adapter.protocol import LLMAdapter, StreamSink, complete
 
 __all__ = ["call_with_retry", "RetryOutcome"]
 
+AttemptSink = Callable[[int, Reply, ErrorKind | None], Awaitable[None] | None]
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,6 +113,7 @@ async def call_with_retry(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
     on_event: StreamSink | None = None,
+    on_attempt: AttemptSink | None = None,
 ) -> RetryOutcome:
     """Execute a request with classified-error retries.
 
@@ -174,6 +177,12 @@ async def call_with_retry(
         )
         total_usage = total_usage + reply.usage
 
+        attempt_kind = classify(reply) if reply.stop_reason == "error" else None
+        if on_attempt is not None:
+            delivered = on_attempt(attempt + 1, reply, attempt_kind)
+            if inspect.isawaitable(delivered):
+                await delivered
+
         if reply.stop_reason != "error":
             return RetryOutcome(
                 reply=reply,
@@ -181,7 +190,8 @@ async def call_with_retry(
                 total_usage=total_usage,
             )
 
-        kind = classify(reply)
+        kind = attempt_kind
+        assert kind is not None
         policy = policy_table[kind]
         attempts_made = attempt + 1
 

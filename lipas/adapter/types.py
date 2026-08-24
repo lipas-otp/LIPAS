@@ -129,6 +129,11 @@ class Request:
     temperature: float | None = None
     stop_sequences: Sequence[str] = ()
     extra: Mapping[str, Any] = field(default_factory=dict)
+    # Stable caller/provider correlation identity.  The harness populates it
+    # from the Effect id when a request enters the live boundary.  Adapters
+    # may forward it as an idempotency/request header, while providers that do
+    # not support such headers can still expose it in their audit trail.
+    request_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -147,6 +152,10 @@ class Request:
                 )
             if not math.isfinite(self.temperature):
                 raise ValueError(f"temperature must be finite, got {self.temperature}")
+        if self.request_id is not None and (
+            not isinstance(self.request_id, str) or not self.request_id.strip()
+        ):
+            raise ValueError("request_id must be a non-empty string or None")
 
         messages: list[Mapping[str, Any]] = []
         for message in self.messages:

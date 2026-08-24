@@ -1,16 +1,24 @@
-"""Experimental compatibility adapters outside LIPAS's core product API.
+"""Capability clients and experimental compatibility adapters.
 
-These adapters carry no stability commitment. LIPAS prioritizes its own local
-task-agent experience; use this package only for a concrete interoperability
-need.
+``MCPClient``/``MCPHttpClient`` are first-party transport boundaries. The
+LangGraph, AutoGen, OpenClaw, and MCP server bridges remain compatibility
+surfaces and do not create a second execution authority.
 """
 from .langgraph import LangGraphActionNode, LangGraphToolAdapter
-from .mcp import MCPActionServer
+from .langgraph import LangGraphHandoffNode
+from .mcp import MCPActionServer, MCPClient, MCPClientError, MCPHttpClient
 from .openclaw import OpenClawActionBackend
+from .autogen import AutoGenHandoffHandler, AutoGenToolAdapter
 
 __all__ = [
     "LangGraphActionNode",
+    "LangGraphHandoffNode",
     "LangGraphToolAdapter",
+    "AutoGenHandoffHandler",
+    "AutoGenToolAdapter",
     "MCPActionServer",
+    "MCPClient",
+    "MCPClientError",
+    "MCPHttpClient",
     "OpenClawActionBackend",
 ]

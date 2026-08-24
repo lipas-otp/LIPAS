@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import time
 from dataclasses import dataclass
@@ -212,16 +213,33 @@ async def _run_process(
         stderr=asyncio.subprocess.PIPE,
     )
     timed_out = False
+    communication = asyncio.create_task(process.communicate())
     try:
+        # Shield the pipe reader from wait_for cancellation.  Under transient
+        # process-scheduling pressure a tiny child may finish at the timeout
+        # boundary; cancelling communicate there loses already-buffered
+        # stdout/stderr and turns a successful command into a false timeout.
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout_s,
+            asyncio.shield(communication), timeout=timeout_s,
         )
         exit_code = process.returncode
     except TimeoutError:
         timed_out = True
-        process.kill()
-        stdout, stderr = await process.communicate()
-        exit_code = None
+        if process.returncode is None:
+            process.kill()
+        stdout, stderr = await communication
+        # A process that crossed the timeout boundary while already exiting is
+        # still reported with its real exit code; callers can inspect
+        # ``timed_out`` separately.  If it had to be killed, returncode is the
+        # platform's negative signal code and the public exit code remains
+        # visibly unknown.
+        exit_code = process.returncode if process.returncode == 0 else None
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await communication
+        raise
     return CommandResult(
         argv=tuple(reported_argv or argv),
         exit_code=exit_code,

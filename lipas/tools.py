@@ -49,9 +49,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 
 import asyncio
+import contextvars
 import inspect
 import logging
+import os
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -61,6 +65,47 @@ from typing import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# One lazily-created process executor prevents every ``asyncio.run`` from
+# owning and synchronously tearing down a default executor. Admission is
+# bounded separately because ThreadPoolExecutor's internal queue is not.
+# Context is copied per invocation so RunContext remains visible in workers.
+_SYNC_TOOL_MAX_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+_SYNC_TOOL_MAX_PENDING = _SYNC_TOOL_MAX_WORKERS * 2
+_SYNC_TOOL_EXECUTOR: ThreadPoolExecutor | None = None
+_SYNC_TOOL_EXECUTOR_PID: int | None = None
+_SYNC_TOOL_GATE = threading.BoundedSemaphore(_SYNC_TOOL_MAX_PENDING)
+_SYNC_TOOL_LOCK = threading.Lock()
+
+
+def _reset_sync_tool_executor_after_fork() -> None:
+    """Discard parent-thread state in a forked child without joining it."""
+    global _SYNC_TOOL_EXECUTOR, _SYNC_TOOL_EXECUTOR_PID
+    global _SYNC_TOOL_GATE, _SYNC_TOOL_LOCK
+    _SYNC_TOOL_EXECUTOR = None
+    _SYNC_TOOL_EXECUTOR_PID = None
+    _SYNC_TOOL_GATE = threading.BoundedSemaphore(_SYNC_TOOL_MAX_PENDING)
+    _SYNC_TOOL_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_sync_tool_executor_after_fork)
+
+
+def _sync_tool_runtime() -> tuple[ThreadPoolExecutor, threading.BoundedSemaphore]:
+    """Return executor and admission gate owned by the current process."""
+    global _SYNC_TOOL_EXECUTOR, _SYNC_TOOL_EXECUTOR_PID, _SYNC_TOOL_GATE
+    pid = os.getpid()
+    with _SYNC_TOOL_LOCK:
+        if _SYNC_TOOL_EXECUTOR is None or _SYNC_TOOL_EXECUTOR_PID != pid:
+            _SYNC_TOOL_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_SYNC_TOOL_MAX_WORKERS,
+                thread_name_prefix="lipas-tool",
+            )
+            _SYNC_TOOL_EXECUTOR_PID = pid
+            _SYNC_TOOL_GATE = threading.BoundedSemaphore(_SYNC_TOOL_MAX_PENDING)
+        return _SYNC_TOOL_EXECUTOR, _SYNC_TOOL_GATE
 
 
 # ---------------------------------------------------------------------------
@@ -257,9 +302,32 @@ class Tool:
         bound.apply_defaults()
         if asyncio.iscoroutinefunction(self._handler):
             return await self._handler(*bound.args, **bound.kwargs)
-        return await asyncio.to_thread(
-            self._handler, *bound.args, **bound.kwargs,
-        )
+        context = contextvars.copy_context()
+        executor, gate = _sync_tool_runtime()
+        # A blocking semaphore acquire here would freeze the event loop under
+        # load. Polling keeps cancellation responsive across unrelated loops.
+        while not gate.acquire(blocking=False):
+            await asyncio.sleep(0.005)
+        try:
+            submitted = executor.submit(
+                context.run,
+                lambda: self._handler(*bound.args, **bound.kwargs),
+            )
+        except BaseException:
+            gate.release()
+            raise
+        submitted.add_done_callback(lambda _future: gate.release())
+        try:
+            # Polling is deliberate. One process-level executor serves Agents
+            # created under many short-lived event loops (CLI/tests/notebooks);
+            # a timer-based handoff does not retain or callback into a loop
+            # after that loop has closed.
+            while not submitted.done():
+                await asyncio.sleep(0.005)
+            return submitted.result()
+        except asyncio.CancelledError:
+            submitted.cancel()
+            raise
 
 
 # ---------------------------------------------------------------------------

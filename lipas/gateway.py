@@ -8,6 +8,7 @@ returns the previously recorded terminal result on safe redelivery.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -117,6 +118,7 @@ class ActionGateway:
         self.default_timeout_s = self._timeout(default_timeout_s)
         self.secret_policy = secret_policy or SecretPolicy()
         self._lock = asyncio.Lock()
+        self._inflight: dict[str, asyncio.Task[Any]] = {}
 
     def specs(self) -> tuple[ActionSpec, ...]:
         return tuple(
@@ -183,34 +185,51 @@ class ActionGateway:
             )
 
         deadline = self.default_timeout_s if timeout_s is None else self._timeout(timeout_s)
+        # Protect only task admission. Never hold the gateway-wide lock while
+        # a tool is running: unrelated requests must be able to progress in
+        # parallel, while the per-effect task still deduplicates redelivery.
         async with self._lock:
-            call = self.harness.call(
-                tool_name=tool_name,
-                arguments=arguments,
-                effect_id=effect_id,
-                tool_use_id=effect_id,
-                caused_by=caused_by or request_id,
-            )
-            try:
-                tool_result = (
-                    await call if deadline is None
-                    else await asyncio.wait_for(call, timeout=deadline)
-                )
-            except TimeoutError:
-                return ActionResult(
-                    request_id=request_id,
-                    effect_id=effect_id,
+            task = self._inflight.get(effect_id)
+            if task is None:
+                task = asyncio.create_task(self.harness.call(
                     tool_name=tool_name,
-                    status="uncertain",
-                    content=(
-                        f"action exceeded {deadline:g}s; its intent remains "
-                        "orphaned and must not be retried blindly"
-                    ),
-                    detail={"timeout_s": deadline, "orphan": True},
-                )
-            return self._result_from_effect(
-                request_id, effect_id, tool_name, tool_result,
+                    arguments=arguments,
+                    effect_id=effect_id,
+                    tool_use_id=effect_id,
+                    caused_by=caused_by or request_id,
+                ))
+                self._inflight[effect_id] = task
+
+                def _forget(done: asyncio.Task[Any]) -> None:
+                    if self._inflight.get(effect_id) is done:
+                        self._inflight.pop(effect_id, None)
+                    # A harness failure is represented by the orphaned intent;
+                    # consuming the exception prevents an unhandled-task log.
+                    if not done.cancelled():
+                        with contextlib.suppress(BaseException):
+                            done.exception()
+
+                task.add_done_callback(_forget)
+        try:
+            tool_result = (
+                await task if deadline is None
+                else await asyncio.wait_for(asyncio.shield(task), timeout=deadline)
             )
+        except TimeoutError:
+            return ActionResult(
+                request_id=request_id,
+                effect_id=effect_id,
+                tool_name=tool_name,
+                status="uncertain",
+                content=(
+                    f"action exceeded {deadline:g}s; its intent remains "
+                    "uncertain while the isolated call converges"
+                ),
+                detail={"timeout_s": deadline, "orphan": True},
+            )
+        return self._result_from_effect(
+            request_id, effect_id, tool_name, tool_result,
+        )
 
     def call_sync(self, *args: Any, **kwargs: Any) -> ActionResult:
         try:
@@ -218,6 +237,39 @@ class ActionGateway:
         except RuntimeError:
             return asyncio.run(self.call(*args, **kwargs))
         raise RuntimeError("call_sync cannot run inside an active event loop")
+
+    def reconcile_orphan(
+        self,
+        request_id: str,
+        *,
+        output: Any = None,
+        error: Mapping[str, Any] | None = None,
+        wall_seconds: float = 0.0,
+    ) -> ActionResult:
+        """Record an operator/provider observation for a timed-out action."""
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id must be a non-empty string")
+        effect_id = self.effect_id(request_id)
+        result = self.harness.reconcile_orphan(
+            effect_id,
+            output=output,
+            error=error,
+            wall_seconds=wall_seconds,
+        )
+        tool = self.tools.get(
+            next(
+                node.intent.fields["tool_name"]
+                for node in self._effect_nodes()
+                if node.effect_id == effect_id and node.intent is not None
+            )
+        )
+        return self._result_from_effect(request_id, effect_id, tool.name, result)
+
+    def _effect_nodes(self):
+        effect_row = next(
+            value for value in self.rowset.rows if isinstance(value, EffectRow)
+        )
+        return effect_row.project(self.rowset.store).nodes.values()
 
     def close(self) -> None:
         close = getattr(self.rowset.store, "close", None)

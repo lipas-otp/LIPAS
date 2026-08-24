@@ -8,12 +8,18 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from .calculus import Claim
 from .rows import RowSet
-from .serialization.store_sqlite import ensure_sqlite_parent
+from .sqlite_storage import (
+    DEFAULT_AUDIT_REPAIR_BATCH_SIZE,
+    connect_sqlite,
+    ensure_sqlite_parent,
+    immediate_transaction,
+)
 
 TAG_AGENT_HANDOFF = "agent_handoff"
 TAG_AGENT_MAIL_CLAIM = "agent_mail_claim"
@@ -59,15 +65,16 @@ class Mailbox:
     def __init__(self, path: str | Path = ":memory:", *, rowset: RowSet | None = None) -> None:
         ensure_sqlite_parent(path)
         self._path = path
-        self._conn = sqlite3.connect(path)
+        self._conn = connect_sqlite(path)
         self.rowset = rowset
         self._closed = False
         self._audit_cursor = 0
+        self._mirrored_payloads: set[tuple[str, str]] | None = None
         try:
             self._init_schema()
-            with self._conn:
-                self._seed_legacy_audit_events()
-            self.repair_audit()
+            with immediate_transaction(self._conn):
+                self._seed_legacy_audit_events_once()
+            self._repair_audit_batch()
         except BaseException:
             self._conn.close()
             self._closed = True
@@ -77,7 +84,7 @@ class Mailbox:
         had_schema = self._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailbox'",
         ).fetchone() is not None
-        with self._conn:
+        with immediate_transaction(self._conn):
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS mailbox_meta "
                 "(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
@@ -86,7 +93,7 @@ class Mailbox:
             "SELECT value FROM mailbox_meta WHERE key='schema_version'",
         ).fetchone()
         if row is None:
-            with self._conn:
+            with immediate_transaction(self._conn):
                 self._conn.executemany(
                     "INSERT INTO mailbox_meta(key,value) VALUES(?,?)",
                     (
@@ -108,7 +115,7 @@ class Mailbox:
                     f"this LIPAS release supports {MAILBOX_SCHEMA_VERSION}. "
                     "No automatic migration is available.",
                 )
-        with self._conn:
+        with immediate_transaction(self._conn):
             self._conn.execute("""CREATE TABLE IF NOT EXISTS mailbox (
                 id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
                 payload TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','leased','acknowledged')),
@@ -153,7 +160,7 @@ class Mailbox:
         mid = message_id or f"msg_{uuid.uuid4().hex}"
         encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
         try:
-            with self._conn:
+            with immediate_transaction(self._conn):
                 self._conn.execute("INSERT INTO mailbox(id,sender,recipient,payload,status,created_at) VALUES(?,?,?,?,'pending',?)", (mid, sender, recipient, encoded, time.time()))
                 self._record_audit_event(
                     f"handoff:{mid}",
@@ -172,9 +179,9 @@ class Mailbox:
                 raise ValueError(
                     "message id was reused for a different handoff",
                 ) from None
-            self.repair_audit()
+            self._repair_audit_batch()
             return existing
-        self.repair_audit()
+        self._repair_audit_batch()
         return self.get(mid)  # type: ignore[return-value]
 
     def recover_expired(self, *, now: float | None = None) -> int:
@@ -189,7 +196,7 @@ class Mailbox:
         else:
             now = float(now)
         recovered = 0
-        with self._conn:
+        with immediate_transaction(self._conn):
             rows = self._conn.execute(
                 "SELECT id,recipient,attempts FROM mailbox "
                 "WHERE status='leased' AND lease_expires<=? ORDER BY id",
@@ -213,7 +220,7 @@ class Mailbox:
                             "attempt": attempt,
                         },
                     )
-        self.repair_audit()
+        self._repair_audit_batch()
         return recovered
 
     def claim(
@@ -253,7 +260,7 @@ class Mailbox:
         for (mid,) in rows:
             token, expiry = uuid.uuid4().hex, time.time() + lease_seconds
             message: MailboxMessage | None = None
-            with self._conn:
+            with immediate_transaction(self._conn):
                 cur = self._conn.execute("UPDATE mailbox SET status='leased',attempts=attempts+1,lease_token=?,lease_expires=? WHERE id=? AND status='pending'", (token, expiry, mid))
                 if cur.rowcount:
                     message = self.get(mid)
@@ -269,12 +276,12 @@ class Mailbox:
                     )
             if message is not None:
                 claimed.append(message)
-        self.repair_audit()
+        self._repair_audit_batch()
         return tuple(claimed)
 
     def acknowledge(self, message_id: str, *, lease_token: str) -> None:
         now = time.time()
-        with self._conn:
+        with immediate_transaction(self._conn):
             cur = self._conn.execute(
                 "UPDATE mailbox SET status='acknowledged',acknowledged_at=?,"
                 "lease_token=NULL,lease_expires=NULL WHERE id=? AND status='leased' "
@@ -289,11 +296,11 @@ class Mailbox:
                 )
         if not cur.rowcount:
             raise MailboxLeaseError("message is not owned by an active lease")
-        self.repair_audit()
+        self._repair_audit_batch()
 
     def release(self, message_id: str, *, lease_token: str) -> None:
         now = time.time()
-        with self._conn:
+        with immediate_transaction(self._conn):
             row = self._conn.execute(
                 "SELECT attempts FROM mailbox WHERE id=? AND status='leased' "
                 "AND lease_token=? AND lease_expires>?",
@@ -314,7 +321,7 @@ class Mailbox:
                 )
         if not cur.rowcount:
             raise MailboxLeaseError("message is not owned by this lease")
-        self.repair_audit()
+        self._repair_audit_batch()
 
     @staticmethod
     def _audit_claim_id(identity: str) -> str:
@@ -375,29 +382,64 @@ class Mailbox:
                     {"message_id": mid},
                 )
 
-    def repair_audit(self) -> int:
+    def _seed_legacy_audit_events_once(self) -> None:
+        """Pay legacy reconstruction cost once, not on every mailbox open."""
+        row = self._conn.execute(
+            "SELECT value FROM mailbox_meta WHERE key='audit_seed_version'",
+        ).fetchone()
+        if row is not None and row[0] == "1":
+            return
+        self._seed_legacy_audit_events()
+        self._conn.execute(
+            "INSERT INTO mailbox_meta(key,value) VALUES('audit_seed_version','1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+
+    def _repair_audit_batch(self) -> int:
+        """Keep a normal transition independent of historical backlog size."""
+        return self.repair_audit(limit=DEFAULT_AUDIT_REPAIR_BATCH_SIZE)
+
+    def repair_audit(self, *, limit: int | None = None) -> int:
         """Idempotently mirror durable mailbox events into the Claim tape."""
         if self.rowset is None:
             return 0
-        events = self._conn.execute(
+        if (
+            limit is not None
+            and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1)
+        ):
+            raise ValueError("limit must be a positive int or None")
+        sql = (
             "SELECT rowid,claim_id,tag,fields_json "
-            "FROM mailbox_audit_events WHERE rowid>? ORDER BY rowid",
-            (self._audit_cursor,),
-        ).fetchall()
-        if not events:
+            "FROM mailbox_audit_events WHERE rowid>? ORDER BY rowid"
+        )
+        params: tuple[int, ...] = (self._audit_cursor,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (limit,)
+        event_cursor = self._conn.execute(sql, params)
+        first_event = event_cursor.fetchone()
+        if first_event is None:
             return 0
-        existing = list(self.rowset.store)
-        known = {claim.claim_id for claim in existing}
-        mirrored_payloads = {
-            (
-                claim.tag,
-                json.dumps(
-                    claim.fields, sort_keys=True, separators=(",", ":"),
-                ),
-            )
-            for claim in existing
-            if claim.source == "orchestration.mailbox"
-        }
+        events = chain((first_event,), event_cursor)
+        claim_store = self.rowset.store
+        contains = getattr(claim_store, "contains_claim_id", None)
+        known = (
+            None
+            if callable(contains)
+            else {claim.claim_id for claim in claim_store}
+        )
+        if self._mirrored_payloads is None:
+            existing = claim_store.filter(source="orchestration.mailbox")
+            self._mirrored_payloads = {
+                (
+                    claim.tag,
+                    json.dumps(
+                        claim.fields, sort_keys=True, separators=(",", ":"),
+                    ),
+                )
+                for claim in existing
+            }
+        mirrored_payloads = self._mirrored_payloads
         repaired = 0
         for rowid, claim_id, tag, fields_json in events:
             claim = Claim(
@@ -407,13 +449,19 @@ class Mailbox:
                 claim_id=claim_id,
             )
             signature = (tag, fields_json)
-            if claim_id not in known and signature in mirrored_payloads:
+            if callable(contains):
+                was_known = bool(contains(claim_id))
+            else:
+                assert known is not None
+                was_known = claim_id in known
+            if not was_known and signature in mirrored_payloads:
                 self._audit_cursor = rowid
                 continue
             self.rowset.fold(claim)
-            if claim_id not in known:
+            if not was_known:
                 repaired += 1
-                known.add(claim_id)
+                if known is not None:
+                    known.add(claim_id)
                 mirrored_payloads.add(signature)
             self._audit_cursor = rowid
         return repaired

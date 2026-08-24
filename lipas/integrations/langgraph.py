@@ -5,9 +5,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
+from ..coordination import AgentCoordinator, HandoffEnvelope
 from ..gateway import ActionGateway
 
-__all__ = ["LangGraphActionNode", "LangGraphToolAdapter"]
+__all__ = [
+    "LangGraphActionNode",
+    "LangGraphHandoffNode",
+    "LangGraphToolAdapter",
+]
 
 
 @dataclass
@@ -142,6 +147,71 @@ class LangGraphToolAdapter:
             description=self.description,
             args_schema=self.input_schema,
         )
+
+
+@dataclass
+class LangGraphHandoffNode:
+    """Bridge a LangGraph state node to one durable LIPAS handoff.
+
+    LangGraph retries must provide a stable ``handoff_id`` (normally a
+    checkpoint id) through state or ``configurable``. The adapter never creates
+    a random id because doing so would turn graph replay into a new side effect.
+    """
+
+    coordinator: AgentCoordinator
+    recipient: str
+    input_key: str = "input"
+    output_key: str = "output"
+    sender: str = "langgraph"
+    coordination_id_key: str = "coordination_id"
+
+    async def __call__(
+        self,
+        state: Mapping[str, Any],
+        config: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(state, Mapping):
+            raise TypeError("LangGraph state must be a mapping")
+        config = config or {}
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            configurable = {}
+        coordination_id = (
+            state.get(self.coordination_id_key)
+            or configurable.get("thread_id")
+            or configurable.get("run_id")
+        )
+        handoff_id = (
+            state.get("_lipas_handoff_id")
+            or configurable.get("checkpoint_id")
+            or configurable.get("run_id")
+        )
+        if not isinstance(coordination_id, str) or not coordination_id.strip():
+            raise ValueError(
+                "LangGraph handoff requires a stable coordination_id/thread_id",
+            )
+        if not isinstance(handoff_id, str) or not handoff_id.strip():
+            raise ValueError(
+                "LangGraph handoff requires a stable checkpoint_id or handoff id",
+            )
+        envelope = HandoffEnvelope.create(
+            coordination_id=coordination_id,
+            sender=self.sender,
+            recipient=self.recipient,
+            payload=state.get(self.input_key),
+            handoff_id=handoff_id,
+            metadata={
+                "framework": "langgraph",
+                "thread_id": str(configurable.get("thread_id", coordination_id)),
+            },
+        )
+        outcome = await self.coordinator.dispatch(envelope)
+        return {
+            self.output_key: outcome.value,
+            "_lipas_run_id": outcome.run_id,
+            "_lipas_handoff_id": envelope.id,
+            "_lipas_replayed": outcome.replayed,
+        }
 
 
 def _thread_id(config: Mapping[str, Any] | None) -> str | None:

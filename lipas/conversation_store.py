@@ -13,6 +13,7 @@ from typing import Any, Iterator, Protocol, runtime_checkable
 
 from .behaviour import AgentState
 from .serialization import decode, encode, make_default_codec_registry
+from .sqlite_storage import connect_sqlite, immediate_transaction
 
 __all__ = [
     "SessionConflictError",
@@ -81,18 +82,11 @@ class SQLiteSessionStore:
     def __init__(self, path: str | Path = ":memory:") -> None:
         if not isinstance(path, (str, Path)):
             raise TypeError("SQLiteSessionStore path must be a string or Path")
-        is_uri = isinstance(path, str) and path.startswith("file:")
-        if path != ":memory:" and not is_uri:
-            Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(path), check_same_thread=False, timeout=5.0, uri=is_uri,
+        self._conn = connect_sqlite(
+            path, check_same_thread=False, row_factory=sqlite3.Row,
         )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout = 5000")
-        if path != ":memory:" and not is_uri:
-            self._conn.execute("PRAGMA journal_mode = WAL")
         self._closed = False
         try:
             self._init_schema()
@@ -201,14 +195,8 @@ class SQLiteSessionStore:
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         self._ensure_open()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with immediate_transaction(self._conn):
             yield
-        except BaseException:
-            self._conn.rollback()
-            raise
-        else:
-            self._conn.commit()
 
     @staticmethod
     def _snapshot(row: sqlite3.Row) -> SessionSnapshot:

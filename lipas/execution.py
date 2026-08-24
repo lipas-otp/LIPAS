@@ -24,6 +24,7 @@ import math
 import sqlite3
 import time
 import uuid
+from itertools import chain
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -34,6 +35,11 @@ from .events import AgentEvent
 from .rows import RowSet
 from .serialization.store_sqlite import ensure_sqlite_parent
 from .serialization.codec import decode, encode, make_default_codec_registry
+from .sqlite_storage import (
+    DEFAULT_AUDIT_REPAIR_BATCH_SIZE,
+    connect_sqlite,
+    immediate_transaction,
+)
 
 __all__ = [
     "Checkpoint",
@@ -62,7 +68,9 @@ __all__ = [
     "TAG_EXECUTION_CANCEL_REQUESTED",
     "TAG_EXECUTION_RUN_COMPLETED",
     "TAG_EXECUTION_RUN_FAILED",
+    "TAG_EXECUTION_RUN_REOPENED",
     "TAG_EXECUTION_RUN_CANCELLED",
+    "TAG_COORDINATION_BUDGET_RESERVED",
 ]
 
 
@@ -80,7 +88,9 @@ TAG_EXECUTION_INTERRUPT_RESOLVED = "execution_interrupt_resolved"
 TAG_EXECUTION_CANCEL_REQUESTED = "execution_cancel_requested"
 TAG_EXECUTION_RUN_COMPLETED = "execution_run_completed"
 TAG_EXECUTION_RUN_FAILED = "execution_run_failed"
+TAG_EXECUTION_RUN_REOPENED = "execution_run_reopened"
 TAG_EXECUTION_RUN_CANCELLED = "execution_run_cancelled"
+TAG_COORDINATION_BUDGET_RESERVED = "coordination_budget_reserved"
 
 
 class TaskState(str, Enum):
@@ -212,6 +222,8 @@ CREATE TABLE IF NOT EXISTS execution_runs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_one_active_run
 ON execution_runs(task_id)
 WHERE state IN ('pending','running','waiting');
+CREATE INDEX IF NOT EXISTS idx_execution_claimable_runs
+ON execution_runs(state, lease_expires, created_at, id);
 
 CREATE TABLE IF NOT EXISTS execution_checkpoints (
     run_id      TEXT NOT NULL REFERENCES execution_runs(id),
@@ -243,6 +255,8 @@ CREATE TABLE IF NOT EXISTS execution_audit_events (
     fields_json  TEXT NOT NULL,
     created_at   REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_execution_audit_run
+ON execution_audit_events(json_extract(fields_json, '$.run_id'));
 
 CREATE TABLE IF NOT EXISTS execution_agent_events (
     event_id    TEXT PRIMARY KEY,
@@ -258,6 +272,23 @@ CREATE TABLE IF NOT EXISTS execution_agent_events (
 );
 CREATE INDEX IF NOT EXISTS idx_execution_agent_events_run
 ON execution_agent_events(run_id, sequence);
+
+CREATE TABLE IF NOT EXISTS execution_coordination_budgets (
+    scope       TEXT PRIMARY KEY,
+    limits_json TEXT NOT NULL,
+    spent_json  TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_coordination_admissions (
+    scope       TEXT NOT NULL,
+    handoff_id  TEXT NOT NULL,
+    estimate_json TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY(scope, handoff_id)
+);
+CREATE INDEX IF NOT EXISTS idx_coordination_admissions_scope
+ON execution_coordination_admissions(scope, created_at, handoff_id);
 """
 
 
@@ -283,6 +314,32 @@ def _from_json(value: str) -> Any:
 
 def _mapping_json(value: Mapping[str, Any]) -> str:
     return _json(dict(value))
+
+
+def _non_empty_text(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _budget_mapping(value: Any, name: str) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    normalized: dict[str, float] = {}
+    for bucket, amount in value.items():
+        if not isinstance(bucket, str) or not bucket.strip():
+            raise ValueError(f"{name} bucket names must be non-empty strings")
+        if (
+            isinstance(amount, bool)
+            or not isinstance(amount, (int, float))
+            or not math.isfinite(float(amount))
+            or amount < 0
+        ):
+            raise ValueError(
+                f"{name} value for {bucket!r} must be finite and non-negative",
+            )
+        normalized[bucket] = float(amount)
+    return normalized
 
 
 def _positive_duration(value: float, name: str) -> float:
@@ -334,8 +391,7 @@ class ExecutionStore:
             raise ValueError("audit_run_id must be a non-empty string or None")
         ensure_sqlite_parent(path)
         self._path = path
-        self._conn = sqlite3.connect(path, timeout=5.0)
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn = connect_sqlite(path)
         self.rowset = rowset
         self.audit_run_id = audit_run_id
         self._audit_cursor = 0
@@ -343,8 +399,8 @@ class ExecutionStore:
         try:
             self._init_schema()
             with self._transaction():
-                self._seed_legacy_audit_events()
-            self.repair_audit()
+                self._seed_legacy_audit_events_once()
+            self._repair_audit_batch()
         except BaseException:
             self._conn.close()
             self._closed = True
@@ -368,28 +424,41 @@ class ExecutionStore:
             # Databases created by the pre-release durable slice had the same
             # v1 tables but no metadata. Adopt them once instead of making
             # development checkpoints unreadable.
+            # Two independent workers may open a fresh database at the same
+            # time.  ``SELECT`` followed by a plain ``INSERT`` is a race: the
+            # loser observes the empty table before the winner commits and
+            # then raises a misleading UNIQUE constraint error.  Each key is
+            # an idempotent piece of bootstrap metadata, so INSERT OR IGNORE
+            # is the correct recovery boundary; the schema version is checked
+            # again below after the competing transaction has settled.
             with self._conn:
                 self._conn.executemany(
-                    "INSERT INTO execution_meta(key,value) VALUES(?,?)",
+                    "INSERT OR IGNORE INTO execution_meta(key,value) VALUES(?,?)",
                     (
                         ("schema_version", str(EXECUTION_SCHEMA_VERSION)),
                         ("created_at", repr(time.time())),
                         ("adopted_legacy_schema", "1" if had_execution_schema else "0"),
                     ),
                 )
-        else:
-            try:
-                existing = int(row[0])
-            except (TypeError, ValueError) as exc:
-                raise ExecutionSchemaVersionMismatch(
-                    f"execution schema version is not an int: {row[0]!r}",
-                ) from exc
-            if existing != EXECUTION_SCHEMA_VERSION:
-                raise ExecutionSchemaVersionMismatch(
-                    f"execution store at {self._path!r} is schema version "
-                    f"{existing}; this LIPAS release supports "
-                    f"{EXECUTION_SCHEMA_VERSION}. No automatic migration is available.",
-                )
+        # Always validate the committed value, including the value that won a
+        # concurrent bootstrap race.  This keeps a database stamped by a
+        # newer release fail closed rather than being silently adopted.
+        row = self._conn.execute(
+            "SELECT value FROM execution_meta WHERE key='schema_version'",
+        ).fetchone()
+        assert row is not None
+        try:
+            existing = int(row[0])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ExecutionSchemaVersionMismatch(
+                f"execution schema version is not an int: {row[0]!r}",
+            ) from exc
+        if existing != EXECUTION_SCHEMA_VERSION:
+            raise ExecutionSchemaVersionMismatch(
+                f"execution store at {self._path!r} is schema version "
+                f"{existing}; this LIPAS release supports "
+                f"{EXECUTION_SCHEMA_VERSION}. No automatic migration is available.",
+            )
         with self._conn:
             self._conn.executescript(_SCHEMA)
 
@@ -412,14 +481,8 @@ class ExecutionStore:
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with immediate_transaction(self._conn):
             yield
-        except BaseException:
-            self._conn.rollback()
-            raise
-        else:
-            self._conn.commit()
 
     # -- Claim audit mirror -------------------------------------------
 
@@ -437,13 +500,24 @@ class ExecutionStore:
         created_at: float,
     ) -> None:
         """Append one Claim-shaped event in the execution transaction."""
+        claim_id = self._audit_claim_id(identity)
+        fields_json = _mapping_json(fields)
+        existing = self._conn.execute(
+            "SELECT tag,fields_json FROM execution_audit_events WHERE claim_id=?",
+            (claim_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != tag or existing[1] != fields_json:
+                raise ExecutionStateError(
+                    f"execution audit identity {identity!r} was reused with "
+                    "different data",
+                )
+            return
         self._conn.execute(
             "INSERT OR IGNORE INTO execution_audit_events"
             "(claim_id,tag,fields_json,created_at) VALUES(?,?,?,?)",
             (
-                self._audit_claim_id(identity),
-                tag,
-                _mapping_json(fields),
+                claim_id, tag, fields_json,
                 created_at,
             ),
         )
@@ -477,6 +551,7 @@ class ExecutionStore:
                     if state == TaskState.COMPLETED.value
                     else TAG_EXECUTION_TASK_CANCELLED
                 )
+
                 self._record_audit_event(
                     f"task:{task_id}:state:{state}",
                     tag,
@@ -580,7 +655,24 @@ class ExecutionStore:
                     created_at=resolved_at if resolved_at is not None else created_at,
                 )
 
-    def repair_audit(self) -> int:
+    def _seed_legacy_audit_events_once(self) -> None:
+        """Pay legacy reconstruction cost once, not on every store open."""
+        row = self._conn.execute(
+            "SELECT value FROM execution_meta WHERE key='audit_seed_version'",
+        ).fetchone()
+        if row is not None and row[0] == "1":
+            return
+        self._seed_legacy_audit_events()
+        self._conn.execute(
+            "INSERT INTO execution_meta(key,value) VALUES('audit_seed_version','1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+
+    def _repair_audit_batch(self) -> int:
+        """Keep transition latency independent of an old outbox backlog."""
+        return self.repair_audit(limit=DEFAULT_AUDIT_REPAIR_BATCH_SIZE)
+
+    def repair_audit(self, *, limit: int | None = None) -> int:
         """Idempotently mirror committed execution events into a Claim tape.
 
         The execution database remains authoritative for control state. The
@@ -589,34 +681,66 @@ class ExecutionStore:
         """
         if self.rowset is None:
             return 0
-        events = self._conn.execute(
-            "SELECT rowid,claim_id,tag,fields_json FROM execution_audit_events "
-            "WHERE rowid>? ORDER BY rowid",
-            (self._audit_cursor,),
-        ).fetchall()
-        if not events:
+        if (
+            limit is not None
+            and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1)
+        ):
+            raise ValueError("limit must be a positive int or None")
+        limit_sql = "" if limit is None else " LIMIT ?"
+        if self.audit_run_id is None:
+            event_cursor = self._conn.execute(
+                "SELECT rowid,claim_id,tag,fields_json "
+                "FROM execution_audit_events WHERE rowid>? ORDER BY rowid"
+                + limit_sql,
+                ((self._audit_cursor,) if limit is None else
+                 (self._audit_cursor, limit)),
+            )
+        else:
+            event_cursor = self._conn.execute(
+                "SELECT rowid,claim_id,tag,fields_json "
+                "FROM execution_audit_events WHERE rowid>? "
+                "AND json_extract(fields_json, '$.run_id')=? ORDER BY rowid"
+                + limit_sql,
+                ((self._audit_cursor, self.audit_run_id) if limit is None else
+                 (self._audit_cursor, self.audit_run_id, limit)),
+            )
+        first_event = event_cursor.fetchone()
+        if first_event is None:
+            if self.audit_run_id is not None:
+                row = self._conn.execute(
+                    "SELECT MAX(rowid) FROM execution_audit_events",
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    self._audit_cursor = max(self._audit_cursor, int(row[0]))
             return 0
-        known = {claim.claim_id for claim in self.rowset.store}
+        events = chain((first_event,), event_cursor)
+        claim_store = self.rowset.store
+        contains = getattr(claim_store, "contains_claim_id", None)
+        known = (
+            None
+            if callable(contains)
+            else {claim.claim_id for claim in claim_store}
+        )
         repaired = 0
         for rowid, claim_id, tag, fields_json in events:
             fields = _from_json(fields_json)
             if not isinstance(fields, Mapping):
                 raise TypeError(f"execution audit {claim_id!r} fields are not a mapping")
-            if (
-                self.audit_run_id is not None
-                and fields.get("run_id") != self.audit_run_id
-            ):
-                self._audit_cursor = rowid
-                continue
+            if callable(contains):
+                was_known = bool(contains(claim_id))
+            else:
+                assert known is not None
+                was_known = claim_id in known
             self.rowset.fold(Claim(
                 tag=tag,
                 fields=dict(fields),
                 source="execution.store",
                 claim_id=claim_id,
             ))
-            if claim_id not in known:
+            if not was_known:
                 repaired += 1
-                known.add(claim_id)
+                if known is not None:
+                    known.add(claim_id)
             self._audit_cursor = rowid
         return repaired
 
@@ -679,6 +803,7 @@ class ExecutionStore:
                 if (
                     existing.type != candidate.type
                     or existing.iteration != candidate.iteration
+                    or dict(existing.data) != dict(candidate.data)
                 ):
                     raise ExecutionStateError(
                         f"AgentEvent identity {identity!r} was reused for a "
@@ -741,6 +866,19 @@ class ExecutionStore:
             for row in self._conn.execute(sql, params)
         )
 
+    def get_agent_event(self, run_id: str, identity: str) -> AgentEvent | None:
+        """Return one persisted event by its idempotency identity."""
+        if not isinstance(identity, str) or not identity.strip():
+            raise ValueError("AgentEvent identity must be a non-empty string")
+        if self.get_run(run_id) is None:
+            raise KeyError(run_id)
+        row = self._conn.execute(
+            "SELECT event_id,run_id,sequence,type,iteration,data_json,created_at "
+            "FROM execution_agent_events WHERE run_id=? AND identity=?",
+            (run_id, identity),
+        ).fetchone()
+        return None if row is None else self._agent_event_from_row(row)
+
     def agent_event_cursor(self, run_id: str) -> int:
         if self.get_run(run_id) is None:
             raise KeyError(run_id)
@@ -750,6 +888,143 @@ class ExecutionStore:
             (run_id,),
         ).fetchone()
         return int(row[0])
+
+    # -- shared coordination budget ----------------------------------
+
+    def configure_coordination_budget(
+        self,
+        scope: str,
+        limits: Mapping[str, float],
+        *,
+        now: float | None = None,
+    ) -> Mapping[str, float]:
+        """Create or verify one durable shared-budget contract.
+
+        Configuration is idempotent but intentionally immutable: two workers
+        using one scope must agree on limits before either can reserve spend.
+        """
+        normalized = _budget_mapping(limits, "budget limits")
+        scope = _non_empty_text(scope, "budget scope")
+        now = _timestamp(now)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT limits_json,spent_json FROM execution_coordination_budgets "
+                "WHERE scope=?",
+                (scope,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO execution_coordination_budgets"
+                    "(scope,limits_json,spent_json,updated_at) VALUES(?,?,?,?)",
+                    (scope, _mapping_json(normalized), _mapping_json({}), now),
+                )
+            else:
+                existing = _from_json(row[0])
+                if existing != normalized:
+                    raise ExecutionStateError(
+                        f"coordination budget scope {scope!r} has different limits",
+                    )
+        return dict(normalized)
+
+    def reserve_coordination_budget(
+        self,
+        scope: str,
+        handoff_id: str,
+        estimate: Mapping[str, float],
+        *,
+        now: float | None = None,
+    ) -> Mapping[str, float]:
+        """Atomically admit one stable handoff reservation.
+
+        A repeated ``(scope, handoff_id)`` with the same estimate is a no-op;
+        a different estimate fails closed. Reservations are conservative and
+        are not refunded after a failed member invocation.
+        """
+        scope = _non_empty_text(scope, "budget scope")
+        handoff_id = _non_empty_text(handoff_id, "handoff id")
+        normalized = _budget_mapping(estimate, "budget estimate")
+        now = _timestamp(now)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT limits_json,spent_json FROM execution_coordination_budgets "
+                "WHERE scope=?",
+                (scope,),
+            ).fetchone()
+            if row is None:
+                raise ExecutionStateError(
+                    f"coordination budget scope {scope!r} is not configured",
+                )
+            prior = self._conn.execute(
+                "SELECT estimate_json FROM execution_coordination_admissions "
+                "WHERE scope=? AND handoff_id=?",
+                (scope, handoff_id),
+            ).fetchone()
+            if prior is not None:
+                existing = _from_json(prior[0])
+                if existing != normalized:
+                    raise ExecutionStateError(
+                        f"budget handoff {handoff_id!r} changed its estimate",
+                    )
+                return dict(normalized)
+            limits = _budget_mapping(_from_json(row[0]), "stored budget limits")
+            spent = _budget_mapping(_from_json(row[1]), "stored budget spend")
+            for bucket, amount in normalized.items():
+                if bucket not in limits:
+                    raise ExecutionStateError(
+                        f"budget estimate uses undeclared bucket {bucket!r}",
+                    )
+                current = spent.get(bucket, 0.0)
+                if current + amount > limits[bucket]:
+                    raise ExecutionStateError(
+                        f"coordination budget exhausted for {bucket!r}: "
+                        f"{current}+{amount} > {limits[bucket]}",
+                    )
+                spent[bucket] = current + amount
+            self._conn.execute(
+                "INSERT INTO execution_coordination_admissions"
+                "(scope,handoff_id,estimate_json,created_at) VALUES(?,?,?,?)",
+                (scope, handoff_id, _mapping_json(normalized), now),
+            )
+            self._conn.execute(
+                "UPDATE execution_coordination_budgets SET spent_json=?,updated_at=? "
+                "WHERE scope=?",
+                (_mapping_json(spent), now, scope),
+            )
+            self._record_audit_event(
+                f"coordination-budget:{scope}:{handoff_id}",
+                TAG_COORDINATION_BUDGET_RESERVED,
+                {
+                    "scope": scope,
+                    "handoff_id": handoff_id,
+                    "estimate": dict(normalized),
+                },
+                created_at=now,
+            )
+        self._repair_audit_batch()
+        return dict(normalized)
+
+    def coordination_budget_snapshot(self, scope: str) -> Mapping[str, Any]:
+        """Return limits, reserved spend, and remaining shared budget."""
+        scope = _non_empty_text(scope, "budget scope")
+        row = self._conn.execute(
+            "SELECT limits_json,spent_json,updated_at "
+            "FROM execution_coordination_budgets WHERE scope=?",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(scope)
+        limits = _budget_mapping(_from_json(row[0]), "stored budget limits")
+        spent = _budget_mapping(_from_json(row[1]), "stored budget spend")
+        return {
+            "scope": scope,
+            "limits": dict(limits),
+            "spent": {bucket: spent.get(bucket, 0.0) for bucket in limits},
+            "remaining": {
+                bucket: limits[bucket] - spent.get(bucket, 0.0)
+                for bucket in limits
+            },
+            "updated_at": float(row[2]),
+        }
 
     # -- tasks ---------------------------------------------------------
 
@@ -791,7 +1066,7 @@ class ExecutionStore:
             raise ExecutionStateError(f"task id already exists: {task_id}") from exc
         task = self.get_task(task_id)
         assert task is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return task
 
     def get_task(self, task_id: str) -> Task | None:
@@ -858,7 +1133,7 @@ class ExecutionStore:
             ) from exc
         run = self.get_run(run_id)
         assert run is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return run
 
     def get_run(self, run_id: str) -> Run | None:
@@ -986,7 +1261,7 @@ class ExecutionStore:
             )
         run = self.get_run(run_id)
         assert run is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return run
 
     def renew_lease(
@@ -1022,7 +1297,7 @@ class ExecutionStore:
             )
         run = self.get_run(run_id)
         assert run is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return run
 
     def _require_lease(
@@ -1099,7 +1374,7 @@ class ExecutionStore:
             )
         checkpoint = self.get_checkpoint(run_id, version=version)
         assert checkpoint is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return checkpoint
 
     def get_checkpoint(
@@ -1200,7 +1475,7 @@ class ExecutionStore:
             ) from exc
         interrupt = self.get_interrupt(interrupt_id)
         assert interrupt is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return interrupt
 
     def get_interrupt(self, interrupt_id: str) -> Interrupt | None:
@@ -1273,7 +1548,7 @@ class ExecutionStore:
             raise KeyError(interrupt_id)
         if existing.state is not InterruptState.PENDING:
             if existing.state is target and existing.response == response:
-                self.repair_audit()
+                self._repair_audit_batch()
                 return existing
             raise ExecutionStateError(
                 f"interrupt {interrupt_id!r} was already {existing.state.value}",
@@ -1331,7 +1606,7 @@ class ExecutionStore:
                 )
         resolved = self.get_interrupt(interrupt_id)
         assert resolved is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return resolved
 
     # -- terminal transitions and cancellation ------------------------
@@ -1384,7 +1659,7 @@ class ExecutionStore:
             )
         completed = self.get_run(run_id)
         assert completed is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return completed
 
     def fail_run(
@@ -1423,8 +1698,75 @@ class ExecutionStore:
             )
         failed = self.get_run(run_id)
         assert failed is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return failed
+
+    def reopen_uncertain(
+        self,
+        run_id: str,
+        *,
+        evidence: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> Run:
+        """Return an uncertain run to pending after recorded reconciliation.
+
+        Reopening is a control transition, not proof that a provider or
+        Effect succeeded.  Callers that expose this transition (notably the
+        operator API) must attach a human/provider observation so the audit
+        trail cannot look like an unexplained terminal reset.
+        """
+        if not isinstance(evidence, Mapping):
+            raise ValueError("reopen evidence must be a mapping")
+        observation = evidence.get("observation")
+        if not isinstance(observation, str) or not observation.strip():
+            raise ValueError("reopen evidence requires a non-empty observation")
+        evidence_payload = dict(evidence)
+        # Fail before mutating state if an operator supplied a value that
+        # cannot survive the durable JSON audit boundary.
+        try:
+            _mapping_json(evidence_payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("reopen evidence must be JSON-serializable") from exc
+        now = _timestamp(now)
+        current = self.get_run(run_id)
+        if current is None:
+            raise KeyError(run_id)
+        if current.state is not RunState.FAILED or not (
+            isinstance(current.error, Mapping)
+            and current.error.get("recovery_required") is True
+        ):
+            raise ExecutionStateError(
+                f"run {run_id!r} is not an explicitly uncertain recoverable run",
+            )
+        with self._transaction():
+            cursor = self._conn.execute(
+                "UPDATE execution_runs SET state='pending',error_json=NULL,"
+                "cancel_requested=0,updated_at=? WHERE id=? AND state='failed'",
+                (now, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ExecutionStateError(f"run {run_id!r} changed during reconciliation")
+            self._conn.execute(
+                "UPDATE execution_tasks SET state='open',updated_at=? "
+                "WHERE id=? AND state='completed'",
+                (now, current.task_id),
+            )
+            self._record_audit_event(
+                f"run:{run_id}:reopened:{current.attempt}",
+                TAG_EXECUTION_RUN_REOPENED,
+                {
+                    "run_id": run_id,
+                    "task_id": current.task_id,
+                    "state": RunState.PENDING.value,
+                    "reason": "operator_reconciled_uncertain",
+                    "evidence": evidence_payload,
+                },
+                created_at=now,
+            )
+        reopened = self.get_run(run_id)
+        assert reopened is not None
+        self._repair_audit_batch()
+        return reopened
 
     def request_cancel(self, run_id: str, *, now: float | None = None) -> Run:
         """Request cooperative cancellation or cancel an unowned run now."""
@@ -1433,7 +1775,7 @@ class ExecutionStore:
         if current is None:
             raise KeyError(run_id)
         if current.state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
-            self.repair_audit()
+            self._repair_audit_batch()
             return current
         with self._transaction():
             run = self.get_run(run_id)
@@ -1501,7 +1843,7 @@ class ExecutionStore:
                     )
         cancelled = self.get_run(run_id)
         assert cancelled is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return cancelled
 
     def finish_cancelled(
@@ -1540,7 +1882,7 @@ class ExecutionStore:
             )
         cancelled = self.get_run(run_id)
         assert cancelled is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return cancelled
 
     def cancel_task(self, task_id: str, *, now: float | None = None) -> Task:
@@ -1550,7 +1892,7 @@ class ExecutionStore:
         if current is None:
             raise KeyError(task_id)
         if current.state is TaskState.CANCELLED:
-            self.repair_audit()
+            self._repair_audit_batch()
             return current
         if current.state is TaskState.COMPLETED:
             raise ExecutionStateError(
@@ -1645,5 +1987,5 @@ class ExecutionStore:
             )
         cancelled_task = self.get_task(task_id)
         assert cancelled_task is not None
-        self.repair_audit()
+        self._repair_audit_batch()
         return cancelled_task

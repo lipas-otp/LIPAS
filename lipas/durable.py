@@ -32,15 +32,20 @@ from .execution import (
     RunSuspended,
 )
 from .react import ReActAgent
+from .rows.effect import EffectRow, F_CAUSED_BY
 from .tools import SideEffectClass, Tool, ToolNotFoundError
 
 __all__ = [
     "ApprovalPolicy",
     "DurablePhaseTimeout",
+    "DurableRecoveryRequired",
     "DurableReActRunner",
     "InputPolicy",
     "final_result_from_checkpoint",
     "writes_require_approval",
+    "CheckpointMigrationError",
+    "migrate_checkpoint_payload",
+    "register_checkpoint_migration",
 ]
 
 
@@ -57,6 +62,10 @@ class DurablePhaseTimeout(ExecutionStateError):
         self.phase = phase
         self.timeout_s = timeout_s
         super().__init__(f"durable {phase} phase exceeded {timeout_s:g}s")
+
+
+class DurableRecoveryRequired(ExecutionStateError):
+    """Control interruption raced an effect whose external outcome is unknown."""
 
 
 def writes_require_approval(
@@ -90,6 +99,84 @@ _PHASES = {
     _PHASE_AFTER_TOOL,
     _PHASE_TERMINAL,
 }
+
+
+class CheckpointMigrationError(ExecutionStateError):
+    """A durable checkpoint cannot be upgraded safely."""
+
+
+_CHECKPOINT_MIGRATIONS: dict[tuple[int, int], Callable[[Mapping[str, Any]], Mapping[str, Any]]] = {}
+
+
+def register_checkpoint_migration(
+    from_version: int,
+    to_version: int,
+    migration: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+) -> None:
+    """Register one deterministic checkpoint payload migration step."""
+    if (
+        isinstance(from_version, bool) or isinstance(to_version, bool)
+        or not isinstance(from_version, int) or not isinstance(to_version, int)
+        or from_version < 0 or to_version != from_version + 1
+    ):
+        raise ValueError("checkpoint migrations must advance one integer version")
+    if not callable(migration):
+        raise TypeError("migration must be callable")
+    key = (from_version, to_version)
+    if key in _CHECKPOINT_MIGRATIONS:
+        raise ValueError(f"checkpoint migration {from_version}->{to_version} is already registered")
+    _CHECKPOINT_MIGRATIONS[key] = migration
+
+
+def migrate_checkpoint_payload(
+    payload: Mapping[str, Any],
+    *,
+    target_version: int = _CHECKPOINT_SCHEMA,
+) -> dict[str, Any]:
+    """Upgrade a checkpoint without guessing about unknown future schemas."""
+    if not isinstance(payload, Mapping):
+        raise TypeError("checkpoint payload must be a mapping")
+    if (
+        isinstance(target_version, bool)
+        or not isinstance(target_version, int)
+        or target_version < 0
+    ):
+        raise ValueError("target_version must be a non-negative int")
+    raw_version = payload.get("schema_version", 0)
+    if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 0:
+        raise CheckpointMigrationError(f"invalid checkpoint schema version {raw_version!r}")
+    if target_version < raw_version:
+        raise CheckpointMigrationError(
+            f"checkpoint schema {raw_version} is newer than target {target_version}",
+        )
+    current = dict(payload)
+    while raw_version < target_version:
+        migration = _CHECKPOINT_MIGRATIONS.get((raw_version, raw_version + 1))
+        if migration is None:
+            raise CheckpointMigrationError(
+                f"no checkpoint migration {raw_version}->{raw_version + 1}",
+            )
+        try:
+            migrated = migration(current)
+        except Exception as exc:
+            raise CheckpointMigrationError(
+                f"checkpoint migration {raw_version}->{raw_version + 1} failed",
+            ) from exc
+        if not isinstance(migrated, Mapping):
+            raise CheckpointMigrationError("checkpoint migration must return a mapping")
+        current = dict(migrated)
+        raw_version += 1
+        current["schema_version"] = raw_version
+    return current
+
+
+def _migrate_checkpoint_0_to_1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    # Early durable development checkpoints omitted the envelope marker.  No
+    # semantic state is changed; the marker makes the boundary explicit.
+    return {**dict(payload), "schema_version": 1}
+
+
+register_checkpoint_migration(0, 1, _migrate_checkpoint_0_to_1)
 
 
 def _agent_state_payload(state: AgentState) -> dict[str, Any]:
@@ -156,7 +243,13 @@ def final_result_from_checkpoint(
         raise ExecutionStateError(
             f"run {checkpoint.run_id!r} has no terminal checkpoint",
         )
-    final_data = checkpoint.state.get("final_result")
+    # Terminal restoration is also a recovery boundary.  Do not let this
+    # convenience API bypass the same schema gate used by the live runner;
+    # otherwise a future/unknown checkpoint could be presented as a completed
+    # result merely because it contains a ``final_result`` field.
+    payload = migrate_checkpoint_payload(checkpoint.state)
+    DurableReActRunner._validate_payload(checkpoint.phase, payload)
+    final_data = payload.get("final_result")
     if not isinstance(final_data, Mapping):
         raise TypeError("terminal checkpoint has no final_result mapping")
     result = _final_from_payload(final_data)
@@ -195,7 +288,9 @@ def settled_result_from_run(
             _CLAIM_STORE_ID_KEY: claim_store_id,
         })
     else:
-        state_payload = checkpoint.state.get("agent_state")
+        payload = migrate_checkpoint_payload(checkpoint.state)
+        DurableReActRunner._validate_payload(checkpoint.phase, payload)
+        state_payload = payload.get("agent_state")
         if not isinstance(state_payload, Mapping):
             raise TypeError("terminal run checkpoint has no agent_state mapping")
         state = _agent_state_from_payload(state_payload)
@@ -420,7 +515,7 @@ class DurableReActRunner:
 
             version = checkpoint.version
             phase = checkpoint.phase
-            payload = dict(checkpoint.state)
+            payload = migrate_checkpoint_payload(checkpoint.state)
             self._validate_payload(phase, payload)
         except Exception as exc:
             self._fail_run(exc)
@@ -1053,6 +1148,13 @@ class DurableReActRunner:
         initial: AgentState | None,
         exc: RunCancelled | RunDeadlineExceeded,
     ) -> FinalResult:
+        if self._has_unsettled_effect():
+            recovery = DurableRecoveryRequired(
+                f"run {self.run.id!r} was {type(exc).__name__} while an "
+                "effect had no terminal outcome; reconcile before reopening",
+            )
+            self._fail_run(recovery, recovery_required=True)
+            raise recovery
         checkpoint = self.store.get_checkpoint(self.run.id)
         if checkpoint is not None:
             raw_state = checkpoint.state.get("agent_state")
@@ -1075,13 +1177,43 @@ class DurableReActRunner:
         await self._emit_terminal(result)
         return self._settle(result)
 
-    def _fail_run(self, exc: Exception) -> None:
+    def _fail_run(
+        self,
+        exc: Exception,
+        *,
+        recovery_required: bool | None = None,
+    ) -> None:
         with contextlib.suppress(Exception):
+            if recovery_required is None:
+                recovery_required = isinstance(
+                    exc, (DurablePhaseTimeout, DurableRecoveryRequired),
+                )
             self.store.fail_run(
                 self.run.id,
                 self._token,
-                error={"type": type(exc).__name__, "message": str(exc)},
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "recovery_required": recovery_required,
+                    "reconcile_before_resume": recovery_required,
+                },
             )
+
+    def _has_unsettled_effect(self) -> bool:
+        """Detect an intent for this Run that has no terminal Effect claim."""
+        effect_row = next(
+            (row for row in self.behaviour.rowset.rows if isinstance(row, EffectRow)),
+            None,
+        )
+        if effect_row is None:
+            return False
+        view = effect_row.project(self.behaviour.rowset.store)
+        return any(
+            node.intent is not None
+            and node.intent.fields.get(F_CAUSED_BY) == self.run.id
+            and not node.is_terminal
+            for node in view.nodes.values()
+        )
 
     def _checkpoint_terminal(
         self,

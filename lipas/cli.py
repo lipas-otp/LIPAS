@@ -35,6 +35,13 @@ from .workspace_storage import WorkspaceStorage
 from .sandbox import sandbox_from_name
 from .gateway import ActionGateway, result_json
 from .integrations import MCPActionServer, OpenClawActionBackend
+from .skills import SkillRegistry, builtin_skills, load_builtin_skill
+from .scenarios import (
+    ScenarioMode,
+    ScenarioRegistry,
+    builtin_scenarios,
+    load_builtin_scenario,
+)
 from .tools import Tool, ToolRegistry
 
 __all__ = ["main"]
@@ -46,6 +53,19 @@ _DEFAULT_INSTRUCTIONS = (
     "live-data tools unless the user supplied them through an Agent factory. "
     "Say that limitation plainly instead of implying that you can fetch data."
 )
+
+
+def _configured_scenarios(args: argparse.Namespace) -> ScenarioRegistry:
+    """Select only explicitly requested business recipes."""
+    return ScenarioRegistry.from_names(getattr(args, "scenario", ()) or ())
+
+
+def _configured_skills(args: argparse.Namespace) -> SkillRegistry:
+    """Compose only the business knowledge explicitly selected by the user."""
+    return _configured_scenarios(args).skill_registry(
+        builtin_names=getattr(args, "skill", ()) or (),
+        paths=getattr(args, "skill_path", ()) or (),
+    )
 
 
 def _prompt_session() -> Any | None:
@@ -190,14 +210,35 @@ def _cmd_effects(args: argparse.Namespace) -> int:
     return 0
 
 
-def _factory(spec: str) -> Agent:
-    module_name, separator, attribute = spec.partition(":")
-    if not separator or not module_name or not attribute:
-        raise ValueError("factory must use module:callable, e.g. agent:build_agent")
-    factory: Callable[[], Any] = getattr(_import_local_module(module_name), attribute)
-    agent = factory()
+def _factory(
+    spec: str,
+    *,
+    skills: SkillRegistry | None = None,
+    scenarios: ScenarioRegistry | None = None,
+) -> Agent:
+    factory = _factory_callable(spec)
+    parameters = inspect.signature(factory).parameters
+    accepts_kwargs = any(
+        value.kind is inspect.Parameter.VAR_KEYWORD
+        for value in parameters.values()
+    )
+    kwargs: dict[str, Any] = {}
+    if skills is not None and skills.skills:
+        if "skills" not in parameters and not accepts_kwargs:
+            raise ValueError(
+                "selected --scenario/--skill/--skill-path values require a chat "
+                "factory that accepts skills= or **kwargs",
+            )
+        kwargs["skills"] = skills
+    if scenarios is not None and scenarios.scenarios and (
+        "scenarios" in parameters or accepts_kwargs
+    ):
+        kwargs["scenarios"] = scenarios
+    agent = factory(**kwargs)
     if not isinstance(agent, Agent):
         raise TypeError(f"factory {spec!r} returned {type(agent).__name__}, expected Agent")
+    if scenarios is not None and scenarios.scenarios:
+        scenarios.require_compatible(agent.tool_harness.tools)
     return agent
 
 
@@ -699,6 +740,8 @@ def _workbench_agent(
         raise KeyError(task_id)
     tools = workbench.workspace_tools(task_id, run_id)
     claims_path = workbench.claims_path_for_run(run_id)
+    scenarios = _configured_scenarios(args)
+    skills = _configured_skills(args)
     if args.factory:
         factory = _factory_callable(args.factory)
         parameters = inspect.signature(factory).parameters
@@ -707,7 +750,22 @@ def _workbench_agent(
             "session_path": claims_path,
             "workspace": Path(task.workspace),
         }
-        if any(value.kind is inspect.Parameter.VAR_KEYWORD for value in parameters.values()):
+        accepts_kwargs = any(
+            value.kind is inspect.Parameter.VAR_KEYWORD
+            for value in parameters.values()
+        )
+        if skills.skills:
+            if "skills" not in parameters and not accepts_kwargs:
+                raise ValueError(
+                    "selected --skill/--skill-path values require a task factory "
+                    "that accepts skills= or **kwargs",
+                )
+            kwargs["skills"] = skills
+        if scenarios.scenarios and (
+            "scenarios" in parameters or accepts_kwargs
+        ):
+            kwargs["scenarios"] = scenarios
+        if accepts_kwargs:
             selected = kwargs
         else:
             selected = {key: value for key, value in kwargs.items() if key in parameters}
@@ -722,7 +780,13 @@ def _workbench_agent(
                 "a task factory must use the supplied session_path so durable "
                 "effects can be recovered",
             )
+        try:
+            scenarios.require_compatible(agent.tool_harness.tools)
+        except BaseException:
+            agent.close()
+            raise
         return agent
+    scenarios.require_compatible(tools)
     if args.base_url:
         credential_options = _compatible_credential_options(args)
         return Agent.openai_compatible(
@@ -733,6 +797,7 @@ def _workbench_agent(
             max_tokens_field=args.max_tokens_field,
             session=claims_path,
             tools=tools,
+            skills=skills,
             instructions=_WORKBENCH_INSTRUCTIONS,
             **credential_options,
         )
@@ -742,6 +807,7 @@ def _workbench_agent(
         timeout_s=args.timeout,
         session=claims_path,
         tools=tools,
+        skills=skills,
         instructions=_WORKBENCH_INSTRUCTIONS,
     )
 
@@ -774,26 +840,28 @@ async def _execute_task_async(
     agent = _workbench_agent(
         args, workbench, task_id=task_id, run_id=run_id,
     )
-    workbench.attach_rowset(agent.rowset, run_id=run_id)
     try:
-        try:
-            result = await agent.run_durable(
-                prompt,
-                execution_store=workbench.execution,
-                run_id=run_id,
-                lease_seconds=args.lease_seconds,
-                phase_timeout_s=args.phase_timeout,
-                approval_policy=workbench.approval_policy(task_id),
-                _claimed_run=claimed_run,
-            )
-        except RunSuspended as suspended:
-            workbench.record_approval_required(suspended.interrupt)
-            workbench.record_run_state(run_id)
-            request = json.dumps(dict(suspended.interrupt.request), ensure_ascii=False)
-            print(f"task {task_id} is waiting for approval {suspended.interrupt.id}")
-            print(f"request: {request}")
-            print(f"resume with: lipas task approve {suspended.interrupt.id}")
-            return 0
+        with workbench.execution_scope(agent.rowset, run_id=run_id) as execution:
+            try:
+                result = await agent.run_durable(
+                    prompt,
+                    execution_store=execution,
+                    run_id=run_id,
+                    lease_seconds=args.lease_seconds,
+                    phase_timeout_s=args.phase_timeout,
+                    approval_policy=workbench.approval_policy(task_id),
+                    _claimed_run=claimed_run,
+                )
+            except RunSuspended as suspended:
+                workbench.record_approval_required(suspended.interrupt)
+                workbench.record_run_state(run_id)
+                request = json.dumps(
+                    dict(suspended.interrupt.request), ensure_ascii=False,
+                )
+                print(f"task {task_id} is waiting for approval {suspended.interrupt.id}")
+                print(f"request: {request}")
+                print(f"resume with: lipas task approve {suspended.interrupt.id}")
+                return 0
         workbench.record_run_state(run_id)
         report = workbench.build_report(task_id, result)
         _print_task_report(report)
@@ -1178,9 +1246,16 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         raise ValueError("--timeout must be positive")
     if args.retries < 0:
         raise ValueError("--retries must be zero or greater")
+    scenarios = _configured_scenarios(args)
+    skills = _configured_skills(args)
     if args.factory:
-        agent = _factory(args.factory)
+        agent = (
+            _factory(args.factory, skills=skills, scenarios=scenarios)
+            if skills.skills or scenarios.scenarios
+            else _factory(args.factory)
+        )
     else:
+        scenarios.require_compatible(())
         retry_policy = dict(DEFAULT_POLICY)
         for kind in (ErrorKind.TIMEOUT, ErrorKind.NETWORK):
             retry_policy[kind] = RetryPolicy(
@@ -1191,6 +1266,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         common = {
             "instructions": args.instructions,
             "session": args.session,
+            "skills": skills,
             "harness_kwargs": {"retry_policy": retry_policy},
         }
         if args.base_url:
@@ -1217,6 +1293,124 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     finally:
         agent.close()
     return 0
+
+
+def _cmd_skill_list(args: argparse.Namespace) -> int:
+    values = [
+        {
+            "name": skill.name,
+            "description": skill.description,
+            "category": skill.metadata.get("category"),
+            "authority": skill.metadata.get("authority", "instructions-only"),
+        }
+        for skill in builtin_skills()
+    ]
+    if args.json:
+        print(json.dumps(values, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for value in values:
+            print(
+                f"{value['name']}\t{value['category'] or 'general'}\t"
+                f"{value['description']}",
+            )
+    return 0
+
+
+def _cmd_skill_show(args: argparse.Namespace) -> int:
+    skill = load_builtin_skill(args.name)
+    payload = {
+        "name": skill.name,
+        "description": skill.description,
+        "instructions": skill.instructions,
+        "metadata": dict(skill.metadata),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{skill.name} — {skill.description}\n")
+        print(skill.instructions)
+    return 0
+
+
+def _cmd_scenario_list(args: argparse.Namespace) -> int:
+    scenarios = builtin_scenarios()
+    if args.category:
+        scenarios = tuple(
+            value for value in scenarios if value.category == args.category
+        )
+    values = [
+        {
+            "name": value.name,
+            "title": value.title,
+            "description": value.description,
+            "category": value.category,
+            "mode": value.mode.value,
+            "skills": list(value.skill_names),
+            "capability_count": len(value.capabilities),
+        }
+        for value in scenarios
+    ]
+    if args.json:
+        print(json.dumps(values, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for value in values:
+            print(
+                f"{value['name']}\t{value['mode']}\t{value['category']}\t"
+                f"{value['description']}",
+            )
+    return 0
+
+
+def _cmd_scenario_show(args: argparse.Namespace) -> int:
+    scenario = load_builtin_scenario(args.name)
+    payload = scenario.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{scenario.name} — {scenario.title}")
+        print(scenario.description)
+        print(f"mode: {scenario.mode.value}")
+        print(f"skills: {', '.join(scenario.skill_names)}")
+        print("lifecycle: " + " -> ".join(scenario.lifecycle))
+        if scenario.capabilities:
+            print("capabilities:")
+            for value in scenario.capabilities:
+                print(
+                    f"- {value.name} ({value.side_effect.value}, "
+                    f"approval={value.approval}) — {value.purpose}",
+                )
+        if scenario.host_requirements:
+            print("host requirements:")
+            for host_requirement in scenario.host_requirements:
+                print(f"- {host_requirement}")
+    return 0
+
+
+def _cmd_scenario_check(args: argparse.Namespace) -> int:
+    scenario = load_builtin_scenario(args.name)
+    tools = _tool_factory(args.factory) if args.factory else ToolRegistry()
+    assessment = scenario.assess(tools)
+    payload = assessment.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"scenario: {scenario.name}")
+        print(f"tool contract: {'compatible' if assessment.compatible else 'incomplete'}")
+        if assessment.missing_tools:
+            print(f"missing: {', '.join(assessment.missing_tools)}")
+        for value in assessment.mismatches:
+            print(
+                f"mismatch: {value.name} expected {value.expected.value}, "
+                f"got {value.actual.value}",
+            )
+        for schema_issue in assessment.schema_mismatches:
+            print(
+                f"schema mismatch: {schema_issue.name} missing "
+                f"{', '.join(schema_issue.missing_parameters)}",
+            )
+        if scenario.mode is ScenarioMode.CONNECTOR:
+            print("connector host policy still requires independent review")
+    return 0 if assessment.compatible else 1
 
 
 def _model_check_adapter(args: argparse.Namespace) -> Any:
@@ -1449,6 +1643,20 @@ def _parser() -> argparse.ArgumentParser:
             help="explicitly use a trusted compatible endpoint without auth",
         )
 
+    def add_skill_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--scenario", action="append", default=[], metavar="NAME",
+            help="select one packaged business Scenario; repeat to compose",
+        )
+        command.add_argument(
+            "--skill", action="append", default=[], metavar="NAME",
+            help="select one packaged business Skill; repeat to compose",
+        )
+        command.add_argument(
+            "--skill-path", action="append", default=[], metavar="PATH",
+            help="load a portable SKILL.md file or directory; repeat to compose",
+        )
+
     init = sub.add_parser("init", help="create a minimal ordinary-Python agent")
     init.add_argument("directory")
     init.add_argument("--model", default=os.environ.get("LIPAS_OLLAMA_MODEL", _DEFAULT_MODEL))
@@ -1488,8 +1696,50 @@ def _parser() -> argparse.ArgumentParser:
     chat.add_argument("--instructions", default=_DEFAULT_INSTRUCTIONS)
     chat.add_argument("--session", help="optional SQLite claim-session path")
     chat.add_argument("--factory", help="ordinary Python factory: module:callable")
+    add_skill_options(chat)
     chat.add_argument("--once", help="send one prompt instead of opening a REPL")
     chat.set_defaults(func=_cmd_chat)
+
+    skill = sub.add_parser(
+        "skill", help="inspect packaged instruction-only business Skills",
+    )
+    skill_sub = skill.add_subparsers(dest="skill_command", required=True)
+    skill_list = skill_sub.add_parser("list", help="list packaged Skills")
+    skill_list.add_argument("--json", action="store_true")
+    skill_list.set_defaults(func=_cmd_skill_list)
+    skill_show = skill_sub.add_parser("show", help="show one packaged Skill")
+    skill_show.add_argument("name")
+    skill_show.add_argument("--json", action="store_true")
+    skill_show.set_defaults(func=_cmd_skill_show)
+
+    scenario = sub.add_parser(
+        "scenario", help="inspect and validate composable business Scenarios",
+    )
+    scenario_sub = scenario.add_subparsers(
+        dest="scenario_command", required=True,
+    )
+    scenario_list = scenario_sub.add_parser(
+        "list", help="list packaged business Scenarios",
+    )
+    scenario_list.add_argument("--category")
+    scenario_list.add_argument("--json", action="store_true")
+    scenario_list.set_defaults(func=_cmd_scenario_list)
+    scenario_show = scenario_sub.add_parser(
+        "show", help="show a Scenario lifecycle and capability contract",
+    )
+    scenario_show.add_argument("name")
+    scenario_show.add_argument("--json", action="store_true")
+    scenario_show.set_defaults(func=_cmd_scenario_show)
+    scenario_check = scenario_sub.add_parser(
+        "check", help="check a Scenario against a supplied Tool factory",
+    )
+    scenario_check.add_argument("name")
+    scenario_check.add_argument(
+        "--factory",
+        help="module:callable returning Tool, ToolRegistry, or iterable of Tool",
+    )
+    scenario_check.add_argument("--json", action="store_true")
+    scenario_check.set_defaults(func=_cmd_scenario_check)
 
     model = sub.add_parser(
         "model", help="validate model endpoint configuration and contracts",
@@ -1624,7 +1874,7 @@ def _parser() -> argparse.ArgumentParser:
             "--factory",
             help=(
                 "Python factory module:callable; accepted keyword arguments are "
-                "tools, session_path, and workspace"
+                "tools, session_path, workspace, selected skills, and scenarios"
             ),
         )
         command.add_argument(
@@ -1650,6 +1900,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--timeout", type=float, default=500.0)
         command.add_argument("--phase-timeout", type=float, default=300.0)
         command.add_argument("--lease-seconds", type=float, default=60.0)
+        add_skill_options(command)
         command.add_argument(
             "--sandbox",
             choices=("auto", "bwrap", "local"),

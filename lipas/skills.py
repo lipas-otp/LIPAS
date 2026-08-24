@@ -21,12 +21,18 @@ small interoperable subset.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, Mapping
 
 __all__ = [
     "Skill", "SkillError", "SkillRegistry", "load_skill", "discover_skills",
+    "builtin_skills", "load_builtin_skill",
 ]
+
+
+_BUILTIN_SKILLS_ROOT = Path(__file__).with_name("builtin_skills")
 
 
 class SkillError(ValueError):
@@ -86,6 +92,31 @@ class Skill:
     metadata: Mapping[str, str] = field(default_factory=dict)
     front_matter: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise SkillError("Skill.name must be a non-empty string")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise SkillError("Skill.description must be a non-empty string")
+        if not isinstance(self.instructions, str) or not self.instructions.strip():
+            raise SkillError("Skill.instructions must be a non-empty string")
+        if not isinstance(self.path, Path):
+            raise TypeError("Skill.path must be pathlib.Path")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("Skill.metadata must be a mapping")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in self.metadata.items()
+        ):
+            raise TypeError("Skill.metadata keys and values must be strings")
+        if not isinstance(self.front_matter, str):
+            raise TypeError("Skill.front_matter must be a string")
+        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "description", self.description.strip())
+        object.__setattr__(self, "instructions", self.instructions.strip())
+        object.__setattr__(
+            self, "metadata", MappingProxyType(dict(self.metadata)),
+        )
+
     def render(self) -> str:
         """Render a stable prompt fragment suitable for any chat provider."""
         return f"<skill name=\"{self.name}\">\n{self.instructions}\n</skill>"
@@ -124,6 +155,51 @@ def discover_skills(root: str | Path) -> tuple[Skill, ...]:
     return tuple(load_skill(p) for p in sorted(base.rglob("SKILL.md")))
 
 
+@lru_cache(maxsize=1)
+def builtin_skills() -> tuple[Skill, ...]:
+    """Return the packaged business-skill catalog in stable name order.
+
+    Built-ins are loaded once per process and remain instruction-only values;
+    selecting one never grants a Tool or any other executable authority.
+    """
+    skills = discover_skills(_BUILTIN_SKILLS_ROOT)
+    return tuple(sorted(skills, key=lambda skill: skill.name))
+
+
+def load_builtin_skill(name: str) -> Skill:
+    """Select one packaged Skill by name without scanning the whole catalog."""
+    if not isinstance(name, str) or not name.strip():
+        raise SkillError("built-in skill name must be a non-empty string")
+    selected = name.strip()
+    if any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in selected):
+        raise SkillError(f"invalid built-in skill name {selected!r}")
+    candidate = _BUILTIN_SKILLS_ROOT / selected
+    if candidate.is_dir():
+        skill = _load_builtin_path(candidate)
+        if skill.name != selected:
+            raise SkillError(
+                f"packaged skill directory {selected!r} declares name "
+                f"{skill.name!r}",
+            )
+        return skill
+    available = ", ".join(skill.name for skill in builtin_skills()) or "<none>"
+    raise SkillError(
+        f"unknown built-in skill {selected!r}; available: {available}",
+    )
+
+
+@lru_cache(maxsize=None)
+def _load_builtin_path(path: Path) -> Skill:
+    return load_skill(path)
+
+
+def _skills_from_path(path: str | Path) -> tuple[Skill, ...]:
+    candidate = Path(path).expanduser()
+    if candidate.is_file() or (candidate / "SKILL.md").is_file():
+        return (load_skill(candidate),)
+    return discover_skills(candidate)
+
+
 @dataclass(frozen=True, slots=True)
 class SkillRegistry:
     """A deduplicated skill collection that can extend a system prompt."""
@@ -132,11 +208,50 @@ class SkillRegistry:
 
     def __init__(self, skills: Iterable[Skill] = ()) -> None:
         chosen = tuple(skills)
+        if any(not isinstance(skill, Skill) for skill in chosen):
+            raise TypeError("SkillRegistry accepts only Skill values")
         names = [skill.name for skill in chosen]
         duplicate = next((name for name in names if names.count(name) > 1), None)
         if duplicate is not None:
             raise SkillError(f"duplicate skill name {duplicate!r}")
         object.__setattr__(self, "skills", chosen)
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        builtin_names: Iterable[str] | str = (),
+        paths: Iterable[str | Path] | str | Path = (),
+    ) -> "SkillRegistry":
+        """Compose explicit built-ins and portable local Skill paths.
+
+        Nothing is auto-selected. This keeps prompt size proportional to the
+        current job even when the packaged catalog grows.
+        """
+        names = (
+            (builtin_names,)
+            if isinstance(builtin_names, str)
+            else tuple(builtin_names)
+        )
+        sources = (
+            (paths,)
+            if isinstance(paths, (str, Path))
+            else tuple(paths)
+        )
+        selected = [load_builtin_skill(name) for name in names]
+        for path in sources:
+            selected.extend(_skills_from_path(path))
+        return cls(selected)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(skill.name for skill in self.skills)
+
+    def get(self, name: str) -> Skill:
+        for skill in self.skills:
+            if skill.name == name:
+                return skill
+        raise SkillError(f"skill {name!r} is not selected")
 
     def system_prompt(self, base: str = "") -> str:
         """Append all skills to ``base`` without changing its wording."""

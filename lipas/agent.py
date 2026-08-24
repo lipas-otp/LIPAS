@@ -449,6 +449,7 @@ class Agent:
         event_sink: EventSink | None = None,
         event_cursor: int | None = None,
         _claimed_run: Run | None = None,
+        _initial_metadata: Mapping[str, Any] | None = None,
     ) -> FinalResult:
         """Run or resume this Agent through the durable ReAct phase machine.
 
@@ -512,17 +513,19 @@ class Agent:
                 claim_store_id=self.rowset.store.store_id,
             )
             if result.stop_reason == "cancelled":
-                terminal_event = execution_store.append_agent_event(
-                    run_id,
-                    AgentEventType.RUN_CANCELLED,
+                terminal_event = execution_store.get_agent_event(
+                    run_id, "run:cancelled",
+                ) or execution_store.append_agent_event(
+                    run_id, AgentEventType.RUN_CANCELLED,
                     identity="run:cancelled",
                     iteration=result.state.iteration,
                     data={"stop_reason": result.stop_reason},
                 )
             elif checkpoint is not None and checkpoint.phase == "terminal":
-                terminal_event = execution_store.append_agent_event(
-                    run_id,
-                    AgentEventType.RUN_COMPLETED,
+                terminal_event = execution_store.get_agent_event(
+                    run_id, "run:completed",
+                ) or execution_store.append_agent_event(
+                    run_id, AgentEventType.RUN_COMPLETED,
                     identity="run:completed",
                     iteration=result.state.iteration,
                     data={
@@ -533,9 +536,10 @@ class Agent:
                     },
                 )
             else:
-                terminal_event = execution_store.append_agent_event(
-                    run_id,
-                    AgentEventType.RUN_FAILED,
+                terminal_event = execution_store.get_agent_event(
+                    run_id, "run:failed",
+                ) or execution_store.append_agent_event(
+                    run_id, AgentEventType.RUN_FAILED,
                     identity="run:failed",
                     data={"error": dict(run.error or {})},
                 )
@@ -550,6 +554,9 @@ class Agent:
                 messages=tuple(messages),
                 metadata={
                     "caused_by": run_id,
+                    **dict(_initial_metadata or {}),
+                    # These identities are execution-owned and cannot be
+                    # redirected by a member-provided metadata mapping.
                     "execution_run_id": run_id,
                     "run_id": run_id,
                 },
