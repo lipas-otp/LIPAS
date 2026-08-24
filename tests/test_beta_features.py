@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -533,6 +535,46 @@ def test_operation_journal_repairs_audit_after_commit_crash_window(tmp_path):
         assert reopened.repair_audit() == 0
 
 
+def test_concurrent_operation_execute_has_one_submission_owner(tmp_path):
+    path = tmp_path / "operations.db"
+    OperationJournal(path).close()
+    start = threading.Barrier(2)
+    provider_entered = threading.Event()
+    second_rejected = threading.Event()
+    release_provider = threading.Event()
+    provider_calls: list[str] = []
+
+    def provider(*, idempotency_key: str):
+        provider_calls.append(idempotency_key)
+        provider_entered.set()
+        assert release_provider.wait(timeout=2)
+        return {"sent": True}
+
+    def execute_once() -> str:
+        with OperationJournal(path) as journal:
+            start.wait(timeout=2)
+            try:
+                return journal.execute(
+                    key="shared-key",
+                    kind="email",
+                    request={"to": "a@example.test"},
+                    provider=provider,
+                ).state
+            except PendingOperation:
+                second_rejected.set()
+                return "not-owner"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(execute_once) for _ in range(2)]
+        assert provider_entered.wait(timeout=2)
+        assert second_rejected.wait(timeout=2)
+        release_provider.set()
+        outcomes = [future.result(timeout=2) for future in futures]
+
+    assert provider_calls == ["shared-key"]
+    assert sorted(outcomes) == ["not-owner", "succeeded"]
+
+
 def test_operation_journal_repairs_terminal_audit_after_commit(tmp_path):
     class Crash(BaseException):
         pass
@@ -715,6 +757,33 @@ def test_llm_retry_accounts_usage_from_every_billed_attempt():
     spends = rowset.store.filter(tag="resource_spent")
     totals = {claim.fields["bucket"]: claim.fields["amount"] for claim in spends}
     assert totals == {"tokens_in": 5.0, "tokens_out": 3.0}
+
+
+def test_llm_orphan_can_be_closed_from_provider_observation():
+    rowset = RowSet(
+        ClaimStore(),
+        [HistoryRow(), CapabilityRow(), EffectRow()],
+    )
+    harness = LLMHarness(
+        adapter=FakeAdapter.from_replies([]),
+        rowset=rowset,
+    )
+    request = Request("fake", [{"role": "user", "content": "hi"}], 10)
+    harness._fold_intent("call_aaaaaaaaaaaa", request, None, "run-1")
+    observed = Reply(
+        content=({"type": "text", "text": "provider-completed"},),
+        usage=Usage(input=2, output=1),
+        stop_reason="end_turn",
+        model="fake",
+    )
+    recovered = harness.reconcile_orphan(
+        "call_aaaaaaaaaaaa", reply=observed, attempts=2,
+    )
+    assert recovered.content == observed.content
+    node = rowset.project("effect").nodes["call_aaaaaaaaaaaa"]
+    assert node.is_terminal
+    assert node.result is not None
+    assert node.result.fields["attempts"] == 2
 
 
 def test_llm_cost_budget_accumulates_actual_priced_usage():

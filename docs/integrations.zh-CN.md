@@ -1,7 +1,7 @@
-# 实验性互操作 Adapter
+# Capability client 与实验性互操作 Adapter
 
-> **Experimental：**这些 adapter 是兼容样例，不是 LIPAS 核心产品界面；它们可能移动或
-> 变化，不提供兼容性承诺。
+本指南中的 HTTP/MCP client 是第一方 capability boundary。LangGraph、AutoGen、OpenClaw
+与 MCP server bridge 仍是兼容样例，不属于核心产品界面，可能移动或变化，不提供兼容性承诺。
 
 LIPAS 优先发展自己的本地任务 Agent 体验。只有用户已经存在明确互操作需求时，才使用
 这些入口。所有入口仍进入同一个 `ActionGateway`，避免实验性 adapter 在产品内部创造
@@ -57,6 +57,52 @@ execute = LangGraphActionNode(gateway, approved=True)
 tool = LangGraphToolAdapter(gateway, "save_note", approved=True)
 langchain_tool = tool.as_langchain_tool()  # 仅此方法需要 langchain-core
 ```
+
+需要把 LangGraph 节点委托给具名 LIPAS member 时，使用 `LangGraphHandoffNode`；需要
+把 AutoGen message 委托给 durable member 时，使用 `AutoGenHandoffHandler`：
+
+```python
+from lipas.integrations import AutoGenHandoffHandler, LangGraphHandoffNode
+
+graph_node = LangGraphHandoffNode(runtime.coordinator(), "reviewer")
+autogen_handler = AutoGenHandoffHandler(runtime.coordinator(), "reviewer")
+```
+
+两个 handoff adapter 都把宿主的 thread/checkpoint/message id 作为 replay identity：不会
+随机生成 handoff id，不会把 framework team/graph state model 导入核心，也不会绕过 LIPAS
+的 approval、cancellation、budget 与 audit 规则。重启后应使用相同的 member contract
+version；如果语义改变，必须使用新的 handoff identity。
+
+## 第一方 HTTP/MCP client 与 Email connector
+
+真实外部 capability 使用 `HttpClient`、`MCPClient`/`MCPHttpClient`，而不是在每个业务
+场景里各写一套网络逻辑。HTTP write 在发送前写入 `OperationJournal`，需要稳定
+`idempotency_key`；timeout/transport error 会进入 `uncertain`，必须通过同一个 journal 或
+`/api/operations/<key>/reconcile` 完成 reconciliation 后才能使用新 key。
+
+```python
+from lipas import EgressPolicy, HttpClient, OperationJournal
+from lipas.integrations import MCPClient, MCPHttpClient
+
+http = HttpClient(
+    base_url="https://api.example.test/v1",
+    egress=EgressPolicy(frozenset({"api.example.test"})),
+    journal=OperationJournal("operations.db"),
+)
+response = await http.request(
+    "POST", "messages", json_body={"text": "hello"},
+    idempotency_key="ticket-42-message-1",
+)
+mcp = MCPClient(MCPHttpClient("https://mcp.example.test/mcp"))
+await mcp.initialize()
+await mcp.call_tool("lookup_ticket", {"id": "42"}, request_id="ticket-42-lookup-1")
+```
+
+`EmailConnector` 是 connector boundary，不是新的 Agent 类型。它要求 provider 返回
+provider reference 并实现按 idempotency key lookup；pending/uncertain key 会被拒绝，必须
+先获得显式 approval，再发送；之后可用 `connector.reconcile(key)`。异步 gateway timeout 会保留后台调用并允许 late completion
+收敛 Effect；无法强杀的同步工具可在 operator/provider lookup 后显式调用
+`ToolHarness.reconcile_orphan()`。
 
 ## Hermes MCP
 

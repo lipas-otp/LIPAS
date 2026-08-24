@@ -127,6 +127,31 @@ def test_expired_run_is_fenced_across_store_connections(tmp_path):
         second_store.close()
 
 
+def test_agent_event_identity_cannot_be_reused_with_different_payload(tmp_path):
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        task = store.create_task("event identity", tmp_path)
+        run = store.create_run(task.id)
+        first = store.append_agent_event(
+            run.id,
+            "tool_started",
+            identity="tool:0:started",
+            data={"tool": "read"},
+        )
+        assert store.append_agent_event(
+            run.id,
+            "tool_started",
+            identity="tool:0:started",
+            data={"tool": "read"},
+        ) == first
+        with pytest.raises(ExecutionStateError, match="different event"):
+            store.append_agent_event(
+                run.id,
+                "tool_started",
+                identity="tool:0:started",
+                data={"tool": "write"},
+            )
+
+
 def test_late_heartbeat_can_renew_until_a_replacement_changes_the_token(tmp_path):
     with ExecutionStore(tmp_path / "execution.db") as store:
         _, first = _active_run(store, tmp_path)
@@ -535,6 +560,21 @@ def test_execution_audit_repairs_after_committed_transition_crash(tmp_path):
         assert len(claims) == 1
         assert claims[0].claim_id.startswith("execution_audit_")
         assert reopened.repair_audit() == 0
+
+
+def test_execution_open_repairs_only_a_bounded_outbox_batch(tmp_path):
+    path = tmp_path / "execution.db"
+    with ExecutionStore(path) as store:
+        for index in range(300):
+            store.create_task(
+                f"task {index}", tmp_path, task_id=f"task-{index}",
+            )
+
+    rowset = RowSet(ClaimStore())
+    with ExecutionStore(path, rowset=rowset) as reopened:
+        assert len(rowset.store) == 256
+        assert reopened.repair_audit() == 44
+        assert len(rowset.store) == 300
 
 
 def test_cancel_task_reaches_cancelled_state_and_stops_active_run(tmp_path):

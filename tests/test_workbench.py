@@ -54,7 +54,7 @@ def _complete_control_run(workbench: Workbench, run_id: str) -> None:
     )
 
 
-def test_attach_rowset_requires_explicit_run_scope_and_is_failure_atomic(
+def test_execution_scope_is_run_scoped_stable_and_failure_atomic(
     tmp_path, monkeypatch,
 ):
     from lipas import workbench as workbench_module
@@ -64,22 +64,25 @@ def test_attach_rowset_requires_explicit_run_scope_and_is_failure_atomic(
     try:
         with Workbench(tmp_path / "home", sandbox="local") as workbench:
             _, run = workbench.create_task("scope", tmp_path)
-            with pytest.warns(DeprecationWarning, match="without run_id"):
-                workbench.attach_rowset(rowset)
-
             previous = workbench.execution
+            with workbench.execution_scope(rowset, run_id=run.id) as scoped:
+                assert scoped is not previous
+                assert workbench.execution is previous
+                assert scoped.get_run(run.id) is not None
+            assert workbench.execution is previous
 
-            class AttachFailure(RuntimeError):
+            class ScopeFailure(RuntimeError):
                 pass
 
             def fail_replacement(*_args, **_kwargs):
-                raise AttachFailure("cannot attach")
+                raise ScopeFailure("cannot open scope")
 
             monkeypatch.setattr(
                 workbench_module, "ExecutionStore", fail_replacement,
             )
-            with pytest.raises(AttachFailure, match="cannot attach"):
-                workbench.attach_rowset(rowset, run_id=run.id)
+            with pytest.raises(ScopeFailure, match="cannot open scope"):
+                with workbench.execution_scope(rowset, run_id=run.id):
+                    pass
             assert workbench.execution is previous
             assert workbench.execution.get_run(run.id) is not None
     finally:
@@ -139,6 +142,46 @@ def test_new_runs_receive_distinct_claim_sessions(tmp_path):
         assert reopened.claims_path_for_run(second.id) == second_path
 
 
+def test_workbench_rejects_cross_task_evidence_and_event_id_conflicts(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        first_task, first_run = workbench.create_task("first", workspace)
+        second_task, second_run = workbench.create_task("second", workspace)
+
+        with pytest.raises(WorkspacePolicyError, match="does not belong"):
+            workbench.workspace_tools(first_task.id, second_run.id)
+        with pytest.raises(WorkspacePolicyError, match="does not belong"):
+            workbench.add_artifact(
+                task_id=second_task.id,
+                run_id=first_run.id,
+                kind="invalid",
+            )
+
+        event = workbench.add_event(
+            task_id=first_task.id,
+            run_id=first_run.id,
+            kind="stable",
+            data={"value": 1},
+            event_id="stable-event",
+        )
+        assert workbench.add_event(
+            task_id=first_task.id,
+            run_id=first_run.id,
+            kind="stable",
+            data={"value": 1},
+            event_id="stable-event",
+        ) == event
+        with pytest.raises(WorkspacePolicyError, match="different data"):
+            workbench.add_event(
+                task_id=first_task.id,
+                run_id=first_run.id,
+                kind="stable",
+                data={"value": 2},
+                event_id="stable-event",
+            )
+
+
 def test_checkpointed_unmapped_run_uses_legacy_claim_session(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -183,6 +226,65 @@ def test_change_set_stages_diff_and_applies_without_early_workspace_write(tmp_pa
         assert workbench.apply_change_set(task.id) == ("note.txt",)
         assert (workspace / "note.txt").read_text(encoding="utf-8") == "after\n"
         assert workbench.change_set(task.id).state == "applied"  # type: ignore[union-attr]
+
+
+def test_change_set_snapshot_rejects_a_source_file_race(tmp_path, monkeypatch):
+    from lipas import workbench as workbench_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "note.txt"
+    source.write_text("before\n", encoding="utf-8")
+    original_copy = workbench_module.shutil.copy2
+
+    def copy_then_mutate(source_path, destination_path):
+        result = original_copy(source_path, destination_path)
+        Path(source_path).write_text("changed concurrently\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(workbench_module.shutil, "copy2", copy_then_mutate)
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        task, run = workbench.create_task("snapshot", workspace)
+        with pytest.raises(WorkspacePolicyError, match="changed during snapshot"):
+            workbench.create_change_set(task.id, run.id)
+        assert workbench.change_set(task.id) is None
+
+
+def test_change_set_apply_rejects_a_staged_file_race(tmp_path, monkeypatch):
+    from lipas import workbench as workbench_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    original = workspace / "note.txt"
+    original.write_text("before\n", encoding="utf-8")
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        task, run = workbench.create_task(
+            "update", workspace, isolate_changes=True,
+        )
+        change_set = workbench.change_set(task.id)
+        assert change_set is not None
+        staged = Path(change_set.stage_root) / "note.txt"
+        staged.write_text("after\n", encoding="utf-8")
+        _complete_control_run(workbench, run.id)
+        workbench.prepare_change_set(task.id)
+
+        original_manifest = workbench_module._stage_manifest
+        calls = 0
+
+        def manifest_then_mutate(root):
+            nonlocal calls
+            result = original_manifest(root)
+            calls += 1
+            if calls == 2:
+                staged.write_text("raced\n", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(
+            workbench_module, "_stage_manifest", manifest_then_mutate,
+        )
+        with pytest.raises(WorkspacePolicyError, match="staged file changed"):
+            workbench.apply_change_set(task.id)
+        assert original.read_text(encoding="utf-8") == "before\n"
 
 
 def test_change_set_fails_closed_on_workspace_drift(tmp_path):
@@ -302,35 +404,35 @@ def test_workbench_durable_approval_to_verified_report(tmp_path):
             tools=workbench.workspace_tools(task.id, run.id),
             session_path=workbench.claims_path_for_run(run.id),
         )
-        workbench.attach_rowset(agent.rowset, run_id=run.id)
         try:
-            with pytest.raises(RunSuspended) as write_approval:
-                asyncio.run(agent.run_durable(
-                    task.goal, execution_store=workbench.execution,
-                    run_id=run.id, approval_policy=workbench_approval_policy,
-                ))
-            write_request = write_approval.value.interrupt.request
-            assert write_request["arguments"]["content"]["redacted"] is True
-            assert "done" not in str(write_request)
-            workbench.record_approval_required(write_approval.value.interrupt)
-            workbench.resolve_approval(
-                write_approval.value.interrupt.id, allow=True,
-                response={"by": "test"},
-            )
-            with pytest.raises(RunSuspended) as command_approval:
-                asyncio.run(agent.resume_durable(
-                    execution_store=workbench.execution, run_id=run.id,
+            with workbench.execution_scope(agent.rowset, run_id=run.id) as execution:
+                with pytest.raises(RunSuspended) as write_approval:
+                    asyncio.run(agent.run_durable(
+                        task.goal, execution_store=execution,
+                        run_id=run.id, approval_policy=workbench_approval_policy,
+                    ))
+                write_request = write_approval.value.interrupt.request
+                assert write_request["arguments"]["content"]["redacted"] is True
+                assert "done" not in str(write_request)
+                workbench.record_approval_required(write_approval.value.interrupt)
+                workbench.resolve_approval(
+                    write_approval.value.interrupt.id, allow=True,
+                    response={"by": "test"},
+                )
+                with pytest.raises(RunSuspended) as command_approval:
+                    asyncio.run(agent.resume_durable(
+                        execution_store=execution, run_id=run.id,
+                        approval_policy=workbench_approval_policy,
+                    ))
+                workbench.record_approval_required(command_approval.value.interrupt)
+                workbench.resolve_approval(
+                    command_approval.value.interrupt.id, allow=True,
+                    response={"by": "test"},
+                )
+                result = asyncio.run(agent.resume_durable(
+                    execution_store=execution, run_id=run.id,
                     approval_policy=workbench_approval_policy,
                 ))
-            workbench.record_approval_required(command_approval.value.interrupt)
-            workbench.resolve_approval(
-                command_approval.value.interrupt.id, allow=True,
-                response={"by": "test"},
-            )
-            result = asyncio.run(agent.resume_durable(
-                execution_store=workbench.execution, run_id=run.id,
-                approval_policy=workbench_approval_policy,
-            ))
         finally:
             agent.close()
 

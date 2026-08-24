@@ -11,24 +11,44 @@ an optional advanced embedding surface.
 ```text
 Agent  = one assistant that thinks and uses tools
 @tool  = an explicit capability with a declared side effect
-Team   = a durable handoff between named assistants or functions
+AgentCoordinator = ExecutionStore-backed ownership across named members
+Team   = the legacy mailbox compatibility facade
 ```
 
-> **0.32.0 compatible model endpoints alpha.** The unified Runtime now connects
-> to OpenAI-compatible Chat Completions providers through an explicit URL,
-> model, and API key, including the compatible surfaces offered by Volcengine
-> Ark, Alibaba Bailian, Tencent Hunyuan, and DeepSeek. No provider/model
-> fallback is implicit; the 0.31 storage and per-Run evidence boundaries remain.
+> **0.40.0 local operator and recovery beta.** `AgentCoordinator` now maps every
+> handoff to one deterministic Task/Run under the existing `ExecutionStore`.
+> Sequential, RoundRobin, bounded parallel, map/reduce, durable Selector, and
+> bounded Swarm policies therefore share one lease, cancellation, event, and
+> terminal-replay authority instead of creating a graph or mailbox database.
+> Aggregate event handles, shared budget/capability policy, durable Agent
+> members, dependency-free LangGraph/AutoGen handoff adapters, and the
+> scaffold/conformance SDK are included in this boundary.
+
+> **0.38.0 SQLite concurrency and evidence store.** Durable Runs can now execute
+> concurrently without a Runtime-wide lock. Every core store shares one WAL,
+> timeout, transaction, and failure policy; Claim tapes support concurrent
+> idempotent append, bounded pages, and rebuildable projection snapshots. The
+> 18 Scenarios and 17 instruction-only Skills from 0.35 remain available.
+
+> **0.40.0 is now shipped.** `LocalWebOperator` exposes the same Task/Run/
+> Interrupt/event projections over a loopback HTTP boundary; `/` serves a small
+> dependency-free browser projection, mutation routes
+> require a bearer token. `FaultCampaign` and `benchmark_execution_store()`
+> provide deterministic recovery drills and local transition measurements.
+> The hardening pass adds bounded task detail (diffs, artifacts, reports),
+> safe task cancellation/approval aliases, reusable fault plans, and a
+> multi-connection SQLite contention probe.
 
 ## One system, two layers
 
 ```text
-LIPAS local task workbench (0.32.0 compatible-endpoint alpha)
-  Task / Workspace / Approval / Artifact / Task CLI / future Local Web
+LIPAS business and product layer (0.40.0 SQLite-first runtime)
+  Scenario / Skill / Task / Workspace / Approval / Artifact / Local Web operator
                               │
                               ▼
 LIPAS Python runtime (available today)
-  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation / Team
+  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation
+  AgentCoordinator / legacy Team
 ```
 
 The workbench is the first-party way to use LIPAS for workspace tasks such as
@@ -49,11 +69,18 @@ with LIPASRuntime.open(".lipas") as runtime:
     runtime.handoffs
     runtime.sessions
     runtime.artifacts
+    coordinator = runtime.coordinator()
+    operator = runtime.operator(operator_token="change-me")
 ```
 
 The global control and product tables live in `.lipas/workspace.db`. Each Run
 keeps its Claim/Effect tape under `.lipas/runs/<run-id>/claims.db`, preserving
 budget and replay isolation without creating another Task/Run state machine.
+SQLite remains the deliberate local engine: WAL keeps readers moving, write
+transactions stay short, `synchronous=FULL` protects the durable default, and
+per-Run evidence files remove unnecessary global hotspots. It is a bounded
+single-writer design, not a disguised distributed database; see
+[SQLite storage and concurrency](docs/sqlite-storage.md).
 Legacy workspaces are never changed on open: inspect and migrate them with
 `lipas migrate plan` and `lipas migrate apply --yes`. Migration and rollback
 are copy-on-write, preserve verified backups, account for SQLite WAL state,
@@ -78,7 +105,7 @@ derived views of the same record: history answers what happened, capability
 enforces spend limits, and effects record `intent → result | rejection`.
 
 ```text
-ordinary Python Agent / Tool / Execution / Operation / Team
+ordinary Python Agent / Tool / Execution / Operation / AgentCoordinator
                  │
                  ▼
            append-only Claims
@@ -89,7 +116,7 @@ ordinary Python Agent / Tool / Execution / Operation / Team
 
 That one evidence tape is why the pieces fit together rather than becoming
 unrelated features: guards and budgets decide before a call; replay substitutes a
-recorded result; supervision records its recommendation; a Team handoff has a
+recorded result; supervision records its recommendation; a coordinator handoff has a
 stable causal id; an external write can be reconciled against its recorded
 intent; execution control stores mirror their transitions through recoverable
 outboxes. Your code remains natural Python because LIPAS records the boundary
@@ -159,7 +186,7 @@ intended, potentially billable provider probe.
 
 New to LIPAS? Read [LIPAS, step by step](docs/tutorial.md) as a small,
 linear introduction: first Agent, tools, side effects, results, sessions,
-budgets, replay, durable recovery, writes, Skills, Teams, and then complete
+budgets, replay, durable recovery, writes, Skills, coordination, and then complete
 runnable projects. The numbered
 [example course](examples/README.md) remains the reference collection for
 focused scenarios.
@@ -167,25 +194,35 @@ focused scenarios.
 ## When to add more
 
 Keep one Agent when one coherent goal shares one conversation, tool set,
-budget, and answer. Multiple steps or multiple tools do not require a Team.
+budget, and answer. Multiple steps or multiple tools do not require multiple
+Agents.
 
-Add a `Team` only when work needs a separate owner or recovery boundary: an
+Add an `AgentCoordinator` only when work needs a separate owner or recovery boundary: an
 independently restartable task, a different authority/budget, a separately
-audited result, or a human/external-operation handoff. A Team member is usually
+audited result, or a human/external-operation handoff. A member is usually
 an Agent, but can be a plain async function. In a normal script:
 
 ```python
-from lipas import Team
+from lipas import AgentCoordinator
 
 
 async def researcher(prompt):
     return {"finding": f"researched: {prompt}"}
 
 
-with Team.open("runs/team.db") as team:
-    team.add("research", researcher)
-    finding = team.ask_sync("research", "check release risks")
+async def main():
+    with AgentCoordinator.open("runs/coordination.db") as coordinator:
+        coordinator.add("research", researcher)
+        finding = await coordinator.handoff(
+            "research", "check release risks",
+            coordination_id="release-risk-v1",
+        )
+        print(finding.value)
 ```
+
+Use legacy `Team` only when maintaining the mailbox API. New orchestration and
+its exact recovery limits are documented in
+[Multi-Agent coordination](docs/multi-agent.md).
 
 ## Reliability, only when you ask for it
 
@@ -196,8 +233,14 @@ with Team.open("runs/team.db") as team:
 | `budgets={...}` | pre-flight rejection before a known limit is exceeded |
 | `tool_guards=[...]` | recorded policy denial before a live call |
 | `OperationJournal` | idempotency-key persistence and reconciliation state for an external write |
-| `Team` | durable, at-least-once handoff with leases and acknowledgement |
+| `AgentCoordinator` | deterministic handoff Runs, bounded policies, cancellation, and terminal replay |
+| legacy `Team` | mailbox-compatible at-least-once handoff for existing applications |
 | `ExecutionStore` + `Agent.run_durable()` | leased ReAct checkpoints, approval interruption, cancellation, and crash recovery |
+| `CoordinationEventHandle` | reconnectable aggregate events without a second global sequence |
+| `LocalWebOperator` | local Task/Run/Interrupt projection with token-protected mutations |
+| `FaultCampaign` / `run_fault_matrix()` | isolated named recovery fixtures without hidden retries |
+| `benchmark_execution_store()` | bounded SQLite transition and contention measurements |
+| `ExtensionManifest` / `run_conformance()` | offline provenance, connector-safety, and version checks |
 
 The record is not a magic memory system and LIPAS is not a graph/workflow DSL.
 Your application still owns its domain data, business rules, and user-facing
@@ -207,10 +250,10 @@ workflow.
 durable event cursors expose normalized run/model/tool events; adapters that
 produce real deltas surface them through the same `AgentEvent` protocol.
 
-## Local workspace tasks (product alpha)
+## Local workspace tasks (0.40 product beta)
 
-The 0.31.0 release makes the local-task vertical use the unified runtime by
-default. It
+The historical 0.31.0 slice made the local-task vertical use the unified runtime by
+default. The current 0.40 product beta
 reuses the same `ExecutionStore` and Effect tape from a separate product layer;
 Workspace, Artifact, and Report concepts do not leak back into the Agent
 runtime. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
@@ -272,7 +315,7 @@ when a Run waits for approval. `task approvals` is the durable operator inbox.
 Use `task approve <id> --defer-resume` to queue
 the allowed Run for a worker. Each Run has its own Claim/Effect session while
 the global `ExecutionStore` remains the authoritative queue, preventing
-parallel Tasks from sharing budget or single-writer journal state.
+parallel Tasks from sharing a budget projection or one hot evidence sequence.
 
 For Git workspaces, staging snapshots tracked and non-ignored untracked files;
 for other workspaces it snapshots ordinary files. Secret-like paths and text
@@ -282,40 +325,68 @@ This first snapshot backend is intentionally bounded; dependency directories
 excluded by Git may need installation or a later read-only mount design for
 verification.
 
-The 0.31 boundary is explicit: legacy `Team` remains a compatibility
-orchestration layer whose mailbox ownership has not yet moved completely onto
-`ExecutionStore`, and broad automatic recovery after every model/tool phase
-timeout is still roadmap work. Durable cancellation, approval resume, orphan
-detection, and completed-Effect restoration are available today.
+The current boundary is explicit: `AgentCoordinator` is the new
+ExecutionStore-backed orchestration standard library; legacy `Team` keeps its
+mailbox only for compatibility and is not a second Task/Run API for new code.
+An ordinary Agent member shares context and causality, but does not implicitly
+become durable. A SQLite-backed Agent member is different: its already-claimed
+handoff Run directly carries the Agent checkpoint, Approval/Input Interrupt,
+and Effect tape, so resume and replay do not double-claim. An ambiguous
+model/tool phase timeout is marked recovery-required; the operator must
+reconcile the Effect/provider, record an observation/evidence object, and
+explicitly reopen the Run before resume. `LLMHarness.reconcile_orphan()` and
+`ToolHarness.reconcile_orphan()` close intent-only Effects without issuing an
+unverified second request.
 
 ## Experimental interoperability
 
 LIPAS develops its own task product first. LangGraph, MCP-server, and
 OpenCrew/OpenClaw adapters are experimental compatibility samples: they are
-not core product surfaces and carry no compatibility commitment. See the
-[experimental integration guide](docs/integrations.md) only when an existing
-system genuinely needs such an entry point.
+not core product surfaces and carry no compatibility commitment. The HTTP and
+MCP clients are first-party capability boundaries. See the
+[integration guide](docs/integrations.md) for both.
 
-## Reusable Skills
+## Business Skills and Scenarios
 
-A Skill is a portable `SKILL.md` instruction file: it captures how an Agent
-should approach recurring work without granting it any new authority. Tools
-remain the only executable capability. Start by copying one of the ready-made
-[example skills](examples/skills), then point an Agent at its directory:
+A Skill is a portable instruction file; a `BusinessScenario` composes the
+smallest relevant Skill bundle, lifecycle, and required Tool contracts. Neither
+grants authority. Tools remain the only executable capability, while durable
+Runs own approval, recovery, and evidence. LIPAS packages 17 Skills and 18
+Scenarios across files, engineering, office, personal writing, and scoped
+connector workflows:
 
 ```python
-from lipas import Agent
-from my_app.tools import search_papers
+from lipas import Agent, ScenarioRegistry
+
+scenarios = ScenarioRegistry.from_names([
+    "coding-change",
+    "release-readiness",
+])
+skills = scenarios.skill_registry(
+    paths=["skills/repository-conventions"],
+)
 
 agent = Agent.ollama(
-    tools=[search_papers],
-    skills="skills/research-brief",
+    skills=skills,
 )
 ```
 
-The research, support-triage, daily-brief, and safe-external-actions Skills are
-deliberately small templates: edit them for your own standards rather than
-treating prompt text as a permission system.
+Nothing is auto-selected, so catalog growth does not inflate unrelated
+prompts. Inspect recipes and capability boundaries without running a model:
+
+```bash
+lipas skill list
+lipas scenario list
+lipas scenario show email-delivery
+lipas scenario check email-delivery --factory connectors:email_tools
+lipas chat --scenario office-report --once "Draft a project update"
+lipas task start . "repair the parser" --scenario coding-change
+```
+
+Connector Scenarios are contracts, not built-in account access. Email delivery
+still requires an application-supplied `send_email` Tool, explicit scope,
+preview approval, idempotency, provider evidence, and uncertain-result
+reconciliation. See [business Skills, Scenarios, and capabilities](docs/business-skills.md).
 
 ## Try and inspect
 
@@ -341,13 +412,24 @@ in time, not that LIPAS contacted the internet.
 - [LIPAS, step by step](docs/tutorial.md) — the recommended linear tutorial,
   from one Agent through complete projects.
 - [Execution model](docs/execution-model.md) — the exact semantics and limits
-  of claims, effects, durable runs, replay, external operations, and Teams.
+  of claims, effects, durable runs, replay, and external operations.
+- [Multi-Agent coordination](docs/multi-agent.md) — deterministic handoffs,
+  coordination policies, cancellation, replay, and remaining limits.
+- [SQLite storage and concurrency](docs/sqlite-storage.md) — WAL policy,
+  concurrent Run boundaries, evidence paging/snapshots, and honest scale limits.
 - [Roadmap](docs/roadmap.md) — how the runtime and local task workbench advance
   as one LIPAS project.
+- [Strategy](docs/strategy.md) — LIPAS's position alongside LangGraph and
+  AutoGen, current gaps, architectural guardrails, and the path to 0.40.
 - [OpenAI-compatible model endpoints](docs/model-providers.md) — connect an
   explicit Chat Completions URL, model, and API key without hidden fallback.
 - [Experimental integrations](docs/integrations.md) — optional LangGraph,
   MCP-server, OpenCrew/OpenClaw, and Action Gateway compatibility samples.
+- [Installation, onboarding, and design-partner validation](docs/onboarding.md)
+  — doctor, offline tour, migration, backup, external capability readiness,
+  and the repeatable recovery/reconciliation pilot protocol.
+- [0.39/0.40 coordination and operator contracts](docs/multi-agent.md) — aggregate
+  event handles, shared policy, framework boundaries, local operator, and drills.
 - [Examples](examples/README.md) — focused, runnable scenarios from the high
   level API down to the lower-level harnesses.
 - [Changelog](CHANGELOG.md) — release history.

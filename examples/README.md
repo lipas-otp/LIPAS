@@ -45,7 +45,7 @@ tool's side-effect declaration truthful.
 
 These lessons are self-contained. Lesson 05 needs the `ollama` extra because
 it constructs an Ollama-backed Agent, but it rejects the request before it
-contacts an Ollama daemon or model. Lessons 06–12 use only the core package
+contacts an Ollama daemon or model. Lessons 06–15 use only the core package
 and run fully offline.
 
 | Lesson | Run | Boundary it teaches | Add it when… |
@@ -58,6 +58,9 @@ and run fully offline.
 | 10 | `python -m examples.10_research_review_team` | Two-owner evidence and review workflow | One assistant is no longer the right ownership boundary. |
 | 11 | `python -m examples.11_durable_execution` | Checkpointed approval suspension and resume | One Agent run must safely continue after waiting or interruption. |
 | 12 | `python -m examples.12_local_task_product` | Staged change, approval, restart, verification, and explicit delivery | You want the complete first-party local task product boundary. |
+| 13 | `python -m examples.13_multi_agent_coordination` | ExecutionStore-backed sequential and map/reduce ownership | Several owners need bounded concurrency, replay, and one control authority. |
+| 14 | `python -m examples.14_operator_beta` | Local operator/browser projection, isolated fault matrix, and two-connection SQLite contention measurement | You are validating the shipped 0.40 operator and recovery boundary. |
+| 15 | `python -m examples.15_external_connectors` | Idempotent email delivery and transport-neutral MCP client boundaries | You are adding a real connector without inventing a second authority. |
 
 ## Reusable Skills
 

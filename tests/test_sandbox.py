@@ -49,3 +49,22 @@ def test_local_sandbox_is_an_explicit_nonisolated_backend(tmp_path):
     assert result.exit_code == 0
     assert not result.isolated
     assert not result.network_isolated
+
+
+def test_local_sandbox_preserves_output_when_communication_hits_timeout_boundary(
+    tmp_path,
+):
+    async def run_many():
+        return [
+            await LocalCommandSandbox().run(
+                ["/usr/bin/printf", "ok"],
+                workspace=tmp_path,
+                environment={"PATH": "/usr/bin:/bin"},
+                timeout_s=2,
+            )
+            for _ in range(12)
+        ]
+
+    results = asyncio.run(run_many())
+    assert all(result.stdout == "ok" for result in results)
+    assert all(result.exit_code == 0 for result in results)

@@ -9,23 +9,38 @@ Python runtime 是内部可靠性基础，也保留为可选的高级嵌入能�
 ```text
 Agent  = 一个会思考并使用工具的 assistant
 @tool  = 一项带已声明副作用的显式 capability
-Team   = 在具名 assistant 或函数之间建立可持久化 handoff
+AgentCoordinator = 在具名成员之间建立 ExecutionStore-backed 归属
+Team   = legacy mailbox 兼容 facade
 ```
 
-> **0.32.0 Compatible 模型端点 Alpha。** 统一 Runtime 现在可以通过显式 URL、model
-> 与 API key 连接 OpenAI-compatible Chat Completions provider，包括火山引擎方舟、
-> 阿里百炼、腾讯混元与 DeepSeek 提供的兼容接口。LIPAS 不隐式 fallback provider/model；
-> 0.31 的 storage 与每 Run 证据边界保持不变。
+> **0.40.0 local operator 与 recovery beta。** `AgentCoordinator` 现在把每个 handoff 映射为现有
+> `ExecutionStore` 下确定性的 Task/Run。Sequential、RoundRobin、受限 parallel、
+> map/reduce、durable Selector 与受限 Swarm 因而共用同一套 lease、cancellation、event
+> 与 terminal replay 权威，不另建 graph 或 mailbox database。
+> 这一边界包含聚合 event handle、shared budget/capability policy、durable Agent 成员、
+> 无依赖 LangGraph/AutoGen handoff adapter，以及 scaffold/conformance SDK。
+
+> **0.38.0 SQLite 并发与证据存储。** durable Run 现在无需 Runtime 全局锁即可并发
+> 执行；所有核心 Store 共享同一套 WAL、超时、事务和错误策略；Claim tape 支持并发
+> 幂等追加、有界分页和可重建 projection snapshot。0.35 的 18 个 Scenario 与 17 个
+> instruction-only Skill 全部继续保留。
+
+> **0.40.0 已发布。** `LocalWebOperator` 在 loopback HTTP 边界投影同一套 Task/Run/
+> Interrupt/event；`/` 提供无依赖的浏览器 projection，mutation route 必须使用 bearer token。`FaultCampaign` 和
+> `benchmark_execution_store()` 提供确定性的恢复演练与本地 transition 测量。本轮加固
+> 增加有界 Task detail（diff、artifact、report）、安全的 Task 取消/审批别名、可复用
+> fault plan，以及多连接 SQLite contention probe。
 
 ## 一个系统，两层能力
 
 ```text
-LIPAS 本地任务工作台（0.32.0 compatible-endpoint alpha）
-  Task / Workspace / Approval / Artifact / Task CLI / 未来的 Local Web
+LIPAS 业务与产品层（0.40.0 SQLite-first runtime）
+  Scenario / Skill / Task / Workspace / Approval / Artifact / Local Web operator
                               │
                               ▼
 LIPAS Python runtime（当前可用）
-  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation / Team
+  Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation
+  AgentCoordinator / legacy Team
 ```
 
 工作台是 LIPAS 执行工作区任务的第一方体验，例如检查文件、进行受控修改、运行验证并
@@ -44,11 +59,17 @@ with LIPASRuntime.open(".lipas") as runtime:
     runtime.handoffs
     runtime.sessions
     runtime.artifacts
+    coordinator = runtime.coordinator()
+    operator = runtime.operator(operator_token="change-me")
 ```
 
 全局控制与产品表位于 `.lipas/workspace.db`。每个 Run 的 Claim/Effect tape 继续位于
 `.lipas/runs/<run-id>/claims.db`，从而保持 budget 与 replay 隔离，而不会形成第二套
-Task/Run 状态机。打开旧工作区绝不会静默改写数据；请先运行 `lipas migrate plan`，再以
+Task/Run 状态机。SQLite 是经过明确选择的本地内核：WAL 让 reader 不受短写事务阻塞，
+默认 `synchronous=FULL` 保护持久提交，per-Run evidence 文件减少全局热点。它是有界的
+单写者设计，不伪装成分布式数据库；详见
+[SQLite 存储与并发](docs/sqlite-storage.zh-CN.md)。打开旧工作区绝不会静默改写数据；请先
+运行 `lipas migrate plan`，再以
 `lipas migrate apply --yes` 显式迁移。migration 与 rollback 采用 copy-on-write，保留并
 验证备份、处理 SQLite WAL 状态，并拒绝活跃 Runtime 或 SQLite writer。死亡进程留下的
 stale migration lock 可以恢复；活跃 lock 绝不会被删除。
@@ -69,7 +90,7 @@ LIPAS 不要求你编写 graph 或特殊 workflow 语言。你只需写普通 Py
 `intent → result | rejection`。
 
 ```text
-普通 Python Agent / Tool / Execution / Operation / Team
+普通 Python Agent / Tool / Execution / Operation / AgentCoordinator
                  │
                  ▼
            append-only Claims
@@ -79,7 +100,7 @@ LIPAS 不要求你编写 graph 或特殊 workflow 语言。你只需写普通 Py
 ```
 
 这同一条证据 tape 使各项功能能够协作，而不是成为互不相干的特性：guard 和 budget 在
-调用前作决定；replay 替换已记录的结果；supervision 记录其建议；Team handoff 有
+调用前作决定；replay 替换已记录的结果；supervision 记录其建议；coordinator handoff 有
 稳定 causal id；外部 write 可以相对于其记录的 intent 进行 reconciliation；执行控制
 store 通过可修复 outbox 镜像 transition。代码保持自然的 Python，因为 LIPAS 记录的
 是工作边界，而不是取代你的控制流。
@@ -145,30 +166,38 @@ streaming、tool、错误语义和精确兼容边界见
 
 第一次接触 LIPAS？请按顺序阅读[循序上手 LIPAS](docs/tutorial.zh-CN.md)：从第一个
 Agent、工具、副作用、结果、session，逐步到 budget、replay、持久恢复、write、
-Skill、Team 和完整可运行项目。编号的
+Skill、多 Agent 协调和完整可运行项目。编号的
 [示例课程](examples/README.zh-CN.md)仍是聚焦场景的参考集合。
 
 ## 何时增加更多组件
 
 当一个连贯目标共享同一段对话、工具集、budget 和答案时，请保持一个 Agent。多个
-步骤或多个工具并不意味着需要 Team。
+步骤或多个工具并不意味着需要多个 Agent。
 
-只有当工作需要独立 owner 或恢复边界时才添加 `Team`：例如可独立重启的任务、不同
-authority/budget、需单独审计的结果，或人工/外部操作 handoff。Team 成员通常是
+只有当工作需要独立 owner 或恢复边界时才添加 `AgentCoordinator`：例如可独立重启的任务、不同
+authority/budget、需单独审计的结果，或人工/外部操作 handoff。成员通常是
 Agent，也可以是普通 async 函数。普通脚本中可以这样写：
 
 ```python
-from lipas import Team
+from lipas import AgentCoordinator
 
 
 async def researcher(prompt):
     return {"finding": f"researched: {prompt}"}
 
 
-with Team.open("runs/team.db") as team:
-    team.add("research", researcher)
-    finding = team.ask_sync("research", "check release risks")
+async def main():
+    with AgentCoordinator.open("runs/coordination.db") as coordinator:
+        coordinator.add("research", researcher)
+        finding = await coordinator.handoff(
+            "research", "check release risks",
+            coordination_id="release-risk-v1",
+        )
+        print(finding.value)
 ```
+
+只有维护 mailbox API 时才使用 legacy `Team`。新协调及其精确恢复边界见
+[多 Agent 协调](docs/multi-agent.zh-CN.md)。
 
 ## 只在需要时引入可靠性
 
@@ -179,8 +208,14 @@ with Team.open("runs/team.db") as team:
 | `budgets={...}` | 已知限制前的 pre-flight rejection |
 | `tool_guards=[...]` | 实时调用前有记录的 policy denial |
 | `OperationJournal` | external write 的 idempotency-key 持久化与 reconciliation state |
-| `Team` | 带 lease 和 acknowledgement 的持久、at-least-once handoff |
+| `AgentCoordinator` | 确定性 handoff Run、受限 policy、cancellation 与 terminal replay |
+| legacy `Team` | 面向已有应用的 mailbox-compatible at-least-once handoff |
 | `ExecutionStore` + `Agent.run_durable()` | 带 lease 的 ReAct checkpoint、审批中断、取消与崩溃恢复 |
+| `CoordinationEventHandle` | 不引入第二条全局序列的可重连聚合事件 |
+| `LocalWebOperator` | 带 token mutation protection 的本地 Task/Run/Interrupt projection |
+| `FaultCampaign` / `run_fault_matrix()` | 无隐藏 retry 的隔离 named recovery fixture |
+| `benchmark_execution_store()` | 有界 SQLite transition 与 contention 测量 |
+| `ExtensionManifest` / `run_conformance()` | 离线 provenance、connector 安全与版本检查 |
 
 这份记录不是魔法 memory system，LIPAS 也不是 graph/workflow DSL。应用仍然拥有自己
 的领域数据、业务规则和面向用户的流程。
@@ -189,9 +224,10 @@ with Team.open("runs/team.db") as team:
 cursor 提供规范化 run/model/tool 事件。adapter 产出的真实 delta 也通过同一套
 `AgentEvent` 协议向上提供。
 
-## 本地工作区任务（产品 alpha）
+## 本地工作区任务（0.40 产品 beta）
 
-0.31.0 让本地任务产品纵切默认使用统一 runtime。它在独立产品层复用同一个
+历史 0.31.0 切片让本地任务产品纵切默认使用统一 runtime；当前 0.40 产品 beta
+在独立产品层复用同一个
 `ExecutionStore` 与 Effect tape，不会把 Workspace、Artifact 或 Report 概念反向塞进
 Agent runtime。默认状态目录是 `~/.lipas`，也可以用 `LIPAS_HOME` 或 `--home` 指定。
 
@@ -244,41 +280,67 @@ dispatcher：以受限并发运行多个 Task，重启后领取过期 lease，�
 执行槽。`task approvals` 是持久 operator inbox；使用
 `task approve <id> --defer-resume` 可让批准后的 Run 回到 worker 队列。
 每个 Run 使用独立 Claim/Effect session，全局 `ExecutionStore` 仍是权威队列，从而避免
-并行 Task 共享 budget 或 single-writer journal state。
+并行 Task 共享 budget projection 或同一条热点 evidence sequence。
 
 Git workspace 会快照 tracked 与未被 ignore 的 untracked 文件；其他 workspace 快照普通
 文件。疑似 secret 的路径和文本内容、symlink、生成式 cache 目录以及超过单文件限制的文件
 会被排除，超出总文件/大小上限则失败关闭。首版 snapshot backend 有意保持受限；被 Git ignore 的依赖目录在验证时可能需要重新
 安装，后续可增加 read-only mount 方案。
 
-0.31 的边界也保持明确：legacy `Team` 仍是兼容 orchestration 层，mailbox ownership 尚未
-完全迁移到 `ExecutionStore`；对所有模型/工具阶段 timeout 的广泛自动恢复也仍在路线图中。
-durable cancellation、审批恢复、orphan 检测和已完成 Effect 恢复当前已经可用。
+当前边界保持明确：`AgentCoordinator` 是新的 ExecutionStore-backed orchestration
+标准库；legacy `Team` 只为兼容保留 mailbox，不再作为新代码的第二套 Task/Run API。
+普通 Agent 成员共享 context 与 causality，但不会自动变成 durable。使用 SQLite-backed
+session 的 Agent 成员则直接让已 claim 的 handoff Run 承载 Agent checkpoint、Approval/Input
+Interrupt 与 Effect tape，因此 resume/replay 不会 double claim。含糊的模型/工具阶段
+timeout 会被标记为 recovery-required；operator 必须先完成 Effect/provider reconciliation、
+记录 observation/evidence，再显式 reopen Run，之后才能 resume。`LLMHarness.reconcile_orphan()`
+与 `ToolHarness.reconcile_orphan()` 可以在不发起未经验证的第二次请求的前提下关闭
+intent-only Effect。
 
 ## 实验性互操作
 
 LIPAS 优先发展自己的任务产品。LangGraph、MCP server、OpenCrew/OpenClaw adapter
-只是实验性兼容样例，不属于核心产品界面，也不承诺长期兼容。只有现有系统确实需要入口
-时，才参考[实验性 Integration 指南](docs/integrations.zh-CN.md)。
+只是实验性兼容样例，不属于核心产品界面，也不承诺长期兼容；HTTP/MCP client 则是第一方
+capability boundary。详见[Integration 指南](docs/integrations.zh-CN.md)。
 
-## 可复用 Skill
+## 业务 Skill 与 Scenario
 
-Skill 是可移植的 `SKILL.md` instruction 文件：它捕获 Agent 应如何处理重复工作，
-但不会授予任何新 authority。工具仍然是唯一的可执行 capability。先复制一个现成的
-[示例 Skill](examples/skills)，然后将其目录传给 Agent：
+Skill 是可移植的 instruction 文件；`BusinessScenario` 组合最小相关 Skill bundle、
+生命周期和所需 Tool contract。两者都不授予 authority。Tool 仍是唯一可执行
+capability，durable Run 负责审批、恢复和证据。LIPAS 内置 17 个 Skill 与 18 个
+Scenario，覆盖文件、工程、办公、个人写作与受限 connector workflow：
 
 ```python
-from lipas import Agent
-from my_app.tools import search_papers
+from lipas import Agent, ScenarioRegistry
+
+scenarios = ScenarioRegistry.from_names([
+    "coding-change",
+    "release-readiness",
+])
+skills = scenarios.skill_registry(
+    paths=["skills/repository-conventions"],
+)
 
 agent = Agent.ollama(
-    tools=[search_papers],
-    skills="skills/research-brief",
+    skills=skills,
 )
 ```
 
-research、support-triage、daily-brief 与 safe-external-actions Skill 有意保持为小
-模板：应当按你的标准编辑它们，不要把 prompt 文本当作 permission system。
+系统不会自动选择任何内容，因此目录增长不会膨胀无关任务的 prompt。无需运行模型即可
+查看配方与 capability boundary：
+
+```bash
+lipas skill list
+lipas scenario list
+lipas scenario show email-delivery
+lipas scenario check email-delivery --factory connectors:email_tools
+lipas chat --scenario office-report --once "起草项目进展报告"
+lipas task start . "修复 parser" --scenario coding-change
+```
+
+Connector Scenario 是契约，不是内置账号访问。Email delivery 仍需要应用提供
+`send_email` Tool、显式 scope、preview approval、幂等、provider evidence 与
+uncertain-result reconciliation。详见[业务 Skill、Scenario 与 Capability](docs/business-skills.zh-CN.md)。
 
 ## 尝试并检查
 
@@ -302,13 +364,23 @@ lipas effects runs/chat.db
 - [循序上手 LIPAS](docs/tutorial.zh-CN.md) —— 推荐的线性教程，从一个 Agent 到
   完整项目。
 - [执行模型](docs/execution-model.zh-CN.md) —— Claim、effect、持久 run、replay、
-  external operation 与 Team 的精确语义和限制。
+  external operation 的精确语义和限制。
+- [多 Agent 协调](docs/multi-agent.zh-CN.md) —— 确定性 handoff、协调 policy、
+  cancellation、replay 与剩余边界。
+- [SQLite 存储与并发](docs/sqlite-storage.zh-CN.md) —— WAL 策略、并发 Run 边界、
+  evidence 分页/snapshot 与诚实的规模限制。
 - [路线图](docs/roadmap.zh-CN.md) —— runtime 与本地任务工作台如何作为同一个
   LIPAS 项目推进。
+- [战略](docs/strategy.zh-CN.md) —— LIPAS 与 LangGraph、AutoGen 的定位、当前缺口、
+  架构护栏以及通往 0.40 的路径。
 - [OpenAI-compatible 模型端点](docs/model-providers.zh-CN.md) —— 通过显式 Chat
   Completions URL、model 与 API key 接入，不使用隐藏 fallback。
 - [实验性 Integration](docs/integrations.zh-CN.md) —— 可选 LangGraph、MCP server、
   OpenCrew/OpenClaw 和 Action Gateway 兼容样例。
+- [安装、onboarding 与 Design partner 验证](docs/onboarding.zh-CN.md) —— doctor、离线 tour、
+  migration、备份、external capability readiness，以及可重复的恢复/reconciliation 试点协议。
+- [0.39/0.40 协调与 operator 契约](docs/multi-agent.zh-CN.md) —— 聚合 event handle、
+  shared policy、框架 boundary、本地 operator 与故障演练。
 - [示例](examples/README.zh-CN.md) —— 从高层 API 到更底层 harness 的聚焦、可运行
   场景。
 - [更新日志](CHANGELOG.md) —— release 历史。

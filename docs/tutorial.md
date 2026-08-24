@@ -249,26 +249,33 @@ agent = Agent.ollama(
 ```
 
 Use one Agent for one coherent goal, even when it uses several tools and takes
-several steps. Add a `Team` only when work needs a separate owner, restart
-boundary, authority, or audit trail. A Team member may be an Agent or an
+several steps. Add an `AgentCoordinator` only when work needs a separate owner,
+restart boundary, authority, or audit trail. A member may be an Agent or an
 ordinary async function:
 
 ```python
-from lipas import Team
+from lipas import AgentCoordinator
 
 
 async def researcher(prompt: str) -> dict[str, str]:
     return {"finding": f"research complete: {prompt}"}
 
 
-with Team.open("runs/team.db") as team:
-    team.add("research", researcher)
-    finding = team.ask_sync("research", "check release risks")
+async def coordinate() -> None:
+    with AgentCoordinator.open("runs/coordination.db") as coordinator:
+        coordinator.add("research", researcher)
+        finding = await coordinator.handoff(
+            "research", "check release risks",
+            coordination_id="release-risk-v1",
+        )
+        print(finding.value)
 ```
 
-`Team` delivery is at least once. Supply a stable `message_id=` if the member
-will initiate idempotent or external work. The two-owner project below shows
-the complete shape.
+The handoff is one deterministic ExecutionStore Run. Completed work replays;
+expired work fails closed unless the whole member was registered
+`redelivery_safe=True`. Legacy `Team` remains only for the mailbox examples and
+existing applications. See [Multi-Agent coordination](multi-agent.md) before
+coordinating external writes.
 
 ## 10. Resume one Agent run after approval or interruption
 
@@ -353,8 +360,10 @@ the LIPAS boundary before replacing a tool body with a real client.
 | [Daily brief](../examples/04_daily_brief.py) | Chapters 1–6 | Several read-only sources become one operational recommendation. |
 | [Safe external operation](../examples/09_external_operation.py) | Chapters 7–8 | Idempotency keys, uncertainty after failure, reconciliation, and an audit record. |
 | [Research review Team](../examples/10_research_review_team.py) | Chapter 9 | Two independently owned handoffs with stable message identities. |
+| [Multi-Agent coordination](../examples/13_multi_agent_coordination.py) | Chapter 9 | ExecutionStore-backed sequential and map/reduce ownership with terminal replay. |
 | [Durable execution](../examples/11_durable_execution.py) | Chapter 10 | Separate execution/effect stores, a durable approval Interrupt, and resume of the same run. |
 | [Local task product](../examples/12_local_task_product.py) | Chapter 10 | An isolated ChangeSet, command approval, restart, verification evidence, review, and explicit apply. |
+| [Operator beta](../examples/14_operator_beta.py) | Chapter 10 | A local Task/Run projection, deterministic fault drill, and bounded SQLite transition benchmark. |
 
 Run the first three with a local Ollama model, for example:
 
@@ -364,7 +373,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-The latter four are provider-free. The complete example catalogue, including
+The latter five are provider-free. The complete example catalogue, including
 replay and supervision, is in [examples/README.md](../examples/README.md).
 
 ## API card

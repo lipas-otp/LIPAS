@@ -35,17 +35,20 @@ def _final_reply() -> Reply:
     )
 
 
-class KillAfterToolResultStore(ExecutionStore):
-    """Stop after the Effect result commits but before its checkpoint commits."""
+class KillAtPhaseStore(ExecutionStore):
+    """Stop at one named checkpoint boundary."""
+
+    phase = "after_tool"
 
     def save_checkpoint(self, *args, **kwargs):
-        if kwargs.get("phase") == "after_tool":
+        if kwargs.get("phase") == self.phase:
             os.kill(os.getpid(), signal.SIGKILL)
         return super().save_checkpoint(*args, **kwargs)
 
 
 def main() -> None:
-    mode, root_text, run_id = sys.argv[1:]
+    mode, root_text, run_id, *rest = sys.argv[1:]
+    phase = rest[0] if rest else "after_tool"
     root = Path(root_text)
     attempts = root / "write-attempts.log"
     artifact = root / "artifact.txt"
@@ -60,10 +63,16 @@ def main() -> None:
         artifact.write_text(text, encoding="utf-8")
         return text
 
-    adapter = FakeAdapter.from_replies(
-        [_tool_reply()] if mode == "crash" else [_final_reply()],
-    )
-    store_type = KillAfterToolResultStore if mode == "crash" else ExecutionStore
+    if mode == "crash":
+        replies = [_tool_reply()]
+        if phase in {"before_llm", "terminal"}:
+            replies.append(_final_reply())
+    else:
+        replies = [_tool_reply(), _final_reply()] if phase == "before_llm" else [_final_reply()]
+    adapter = FakeAdapter.from_replies(replies)
+    if mode == "crash":
+        KillAtPhaseStore.phase = phase
+    store_type = KillAtPhaseStore if mode == "crash" else ExecutionStore
     with store_type(root / "execution.db") as executions:
         with Agent(
             adapter=adapter,

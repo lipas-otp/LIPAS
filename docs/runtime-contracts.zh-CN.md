@@ -13,15 +13,19 @@ with LIPASRuntime.open(".lipas") as runtime:
     runtime.execution   # Task / Run 的权威状态机
     runtime.claims      # 审计证据与 projection
     runtime.operations  # 幂等外部操作边界
-    runtime.handoffs    # 可选的 at-least-once 协调边界
+    runtime.handoffs    # legacy mailbox 兼容边界
     runtime.sessions    # 乐观并发 conversation snapshot
     runtime.artifacts   # 产品 artifact repository
+    coordinator = runtime.coordinator()  # ExecutionStore-backed handoff
 ```
 
 `ExecutionStore` 仍是持久 Task/Run/Interrupt 控制状态的唯一权威来源。
 `workspace.db` 是 composition root 打开的唯一全局产品数据库；调用方不再自行拼装、
 选择路径或关闭一组松散 store。Run evidence 继续位于 `runs/<run-id>/claims.db`，从而
-保持 budget、replay 与 single-writer 隔离，而不会形成另一套 Run 状态机。
+保持 budget、replay 与 writer 热点隔离，而不会形成另一套 Run 状态机。所有常规连接
+共享 0.40 的 SQLite WAL、超时、事务和错误策略。Claim tape 可以协调并发 connection，
+但仍诚实地受限于 SQLite 的单物理 writer；详见
+[SQLite 存储与并发](sqlite-storage.zh-CN.md)。
 
 ## 存储迁移与诊断
 
@@ -53,7 +57,7 @@ runtime readiness；仅在 `PATH` 中发现可执行文件不会被当成隔离�
 - `RunContext`：稳定 run id、协作式 cancellation token 和可选的绝对 monotonic
   deadline。deadline 跨越所有模型与工具阶段，不会在每个阶段重新计时。
   `current_run_context()` 让工具读取宿主上下文，而不增加模型可见的 schema 参数；
-  `asyncio.to_thread` 中的同步工具同样可见。
+  有界且传播 context 的同步 Tool executor 中同样可见。
 - `AgentEvent`：有序、provider-neutral 的 run/model/tool 事件。`Agent.stream`、
   `Session` 与 `RunHandle` 使用同一协议。durable 事件由 `ExecutionStore` 持久化并支持
   cursor 之后的 catch-up。
@@ -61,11 +65,41 @@ runtime readiness；仅在 `PATH` 中发现可执行文件不会被当成隔离�
 - `RunHandle`：一次正在运行的 Session 调用，提供 `result()`、`events()` 与协作式
   `cancel()`。
 
+`AgentCoordinator` 把同一契约扩展到具名成员。每个 handoff 都是确定性的
+ExecutionStore Run，具备 branch `RunContext`、lease heartbeat、持久 cancellation、
+terminal replay 与 handoff 生命周期事件。成员 registry 与 policy 是应用组合，不是另一套
+durable 状态机。详见[多 Agent 协调](multi-agent.zh-CN.md)。
+
+`coordinator.event_handle(coordination_id)` 提供有界、可重连的聚合 page，合并各 Run
+的 `AgentEvent` 流。`SharedBudgetPolicy` 在 handoff claim 前以原子事务预留共享硬预算，
+`CapabilityPolicy` 在成员注册时检查 host 声明的 capability；二者都不会让 Skill 或
+Memory 获得 authority。
+
+0.40 operator 继续保持这条边界：`LocalWebOperator` 只是同一组 Task、Run、Interrupt 与
+event cursor 的本地 HTTP projection。它默认绑定 loopback，绝不返回 lease token，mutation
+必须携带显式 bearer token。由 Runtime 创建的 operator 还可以投影有界 Workbench Task detail
+（product event、artifact、ChangeSet diff 状态与 report），但这些仍是 Workbench projection，
+不是第二个 authority。`FaultPlan`/`FaultCampaign` 与 `benchmark_execution_store()` 只是
+有界故障/测量 helper。root browser page 和 `/api/runs/<id>/events` 只是同一 cursor 契约上的
+薄 polling client；`run_fault_matrix()` 也不创建 queue、metrics database 或 retry policy。
+
 durable 重连时，把最后确认的 `event_cursor=` 与 `event_sink=` 传给
 `run_durable`/`resume_durable`。持久记录是权威来源；event sink 断开不会改变 Run 结果。
-`LIPASRuntime.run_durable()`/`resume_durable()` 会串行执行 convenience call，因为一个
-composition-root Workbench 只有一个可变 audit attachment。并发 worker 像内置 dispatcher
-一样，在同一权威数据库上使用独立 Workbench view。
+`LIPASRuntime.run_durable()`/`resume_durable()` 会创建 Run-scoped ExecutionStore
+evidence attachment。composition-root Workbench 的 control store 始终稳定，因此互不相关的
+durable call 可以并发运行，不会关闭或重定向彼此的 audit sink；SQLite 仍会串行提交这些
+很短的控制事务。
+
+直接嵌入 Workbench 时使用同一 ownership 边界：
+
+```python
+with workbench.execution_scope(agent.rowset, run_id=run.id) as execution:
+    result = await agent.run_durable(
+        task.goal, execution_store=execution, run_id=run.id,
+    )
+```
+
+scope 只拥有并关闭自己的临时 connection，绝不会替换 `workbench.execution`。
 
 ## Input 不是 Approval
 
@@ -100,6 +134,8 @@ false，因为当前 adapter 只接收 text/tool message block。
 - 对话状态和未来 memory 是上下文，不是 replay 或 approval authority；
 - Claim/Effect 是审计证据；
 - Tool 是唯一可执行 capability；
+- `AgentCoordinator` 在现有 `ExecutionStore` 下组合确定性 handoff Run，不拥有 mailbox
+  或 graph 权威；
 - legacy `Team`/`Mailbox` 仍可作为兼容 orchestration 层使用，但不再被视为核心 Run 的
   第二套身份；
 - `StrategyRegistry` 与 belief-adaptive calculus 继续服务高级/实验 projection；核心

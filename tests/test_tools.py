@@ -1,3 +1,7 @@
+import asyncio
+import os
+import select
+
 import pytest
 from typing import Annotated, Literal, Optional, Union
 
@@ -217,6 +221,44 @@ def test_async_tools_are_supported_by_acall():
         """F."""
         return x
     assert f.name == "f"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_sync_tool_executor_is_recreated_after_fork():
+    @tool(side_effect=SideEffectClass.PURE)
+    def process_id() -> int:
+        """Return the worker process id."""
+        return os.getpid()
+
+    assert asyncio.run(process_id.acall({})) == os.getpid()
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - assertions execute in parent
+        os.close(read_fd)
+        try:
+            value = asyncio.run(asyncio.wait_for(process_id.acall({}), timeout=1))
+            os.write(write_fd, str(value).encode("ascii"))
+            status = 0
+        except BaseException:
+            status = 1
+        finally:
+            os.close(write_fd)
+        os._exit(status)
+
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], 2)
+        if not ready:
+            os.kill(child_pid, 9)
+            os.waitpid(child_pid, 0)
+            pytest.fail("forked child could not use the synchronous tool executor")
+        observed = os.read(read_fd, 64)
+    finally:
+        os.close(read_fd)
+    _, status = os.waitpid(child_pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert int(observed) == child_pid
 
 
 def test_non_optional_union_rejected():

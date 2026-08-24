@@ -14,9 +14,10 @@ with LIPASRuntime.open(".lipas") as runtime:
     runtime.execution   # authoritative Task / Run state machine
     runtime.claims      # audit evidence and projections
     runtime.operations  # idempotent external-operation boundary
-    runtime.handoffs    # optional at-least-once coordination boundary
+    runtime.handoffs    # legacy mailbox compatibility boundary
     runtime.sessions    # optimistic conversation snapshots
     runtime.artifacts   # product artifact repository
+    coordinator = runtime.coordinator()  # ExecutionStore-backed handoffs
 ```
 
 `ExecutionStore` remains authoritative for durable Task/Run/Interrupt control.
@@ -24,7 +25,11 @@ with LIPASRuntime.open(".lipas") as runtime:
 root. Callers no longer construct, select paths for, or close a set of loosely
 related stores themselves. Run evidence stays in
 `runs/<run-id>/claims.db`; this preserves budget, replay, and single-writer
-isolation without creating another Run state machine.
+hotspot isolation without creating another Run state machine. All normal
+connections share the 0.40 SQLite WAL, timeout, transaction, and failure
+policy. Claim tapes coordinate concurrent connections while remaining bounded
+by SQLite's one physical writer; details are in
+[SQLite storage and concurrency](sqlite-storage.md).
 
 ## Storage migration and diagnostics
 
@@ -62,7 +67,7 @@ same concepts:
   absolute monotonic deadline. The deadline spans model and tool phases; it is
   not restarted for each phase. `current_run_context()` exposes the context to
   tool code without adding model-visible schema parameters, including inside
-  synchronous tools executed with `asyncio.to_thread`.
+  synchronous tools executed by the bounded context-propagating executor.
 - `AgentEvent`: ordered provider-neutral run/model/tool events. `Agent.stream`,
   `Session`, and `RunHandle` emit this protocol. Durable events are persisted
   by `ExecutionStore` and can be fetched after a cursor.
@@ -71,13 +76,50 @@ same concepts:
 - `RunHandle`: one running Session call with `result()`, `events()`, and
   cooperative `cancel()`.
 
+`AgentCoordinator` extends the same contract to named members. Each handoff is
+a deterministic ExecutionStore Run with a branch `RunContext`, lease heartbeat,
+persisted cancellation, terminal replay, and handoff lifecycle events. The
+member registry and policies are application composition, not another durable
+state machine. See [Multi-Agent coordination](multi-agent.md).
+
+`coordinator.event_handle(coordination_id)` provides bounded reconnectable
+aggregate pages over the per-Run `AgentEvent` streams. `SharedBudgetPolicy`
+reserves one hard shared pool atomically before a handoff claim, while
+`CapabilityPolicy` checks host-declared member capabilities at registration;
+neither policy grants authority to Skills or Memory.
+
+The 0.40 operator keeps this boundary: `LocalWebOperator` is a thin local HTTP
+projection of the same Tasks, Runs, Interrupts, and event cursors. It never
+returns lease tokens, binds to loopback by default, and requires an explicit
+bearer token for mutations. Runtime-created operators may additionally project
+bounded Workbench task detail (product events, artifacts, ChangeSet diff state,
+and reports), but those remain Workbench projections rather than a second
+authority. The root browser page and `/api/runs/<id>/events` are thin polling
+clients over the same bounded cursor contract. `FaultPlan`/`FaultCampaign`,
+`run_fault_matrix()`, and `benchmark_execution_store()` are bounded
+fault/measurement helpers; they do not create a queue, metrics database, or
+retry policy.
+
 For durable reconnects, pass `event_sink=` and the last acknowledged
 `event_cursor=` to `run_durable` or `resume_durable`. Persistence is
 authoritative: a failing event sink does not change the Run outcome.
-`LIPASRuntime.run_durable()` and `resume_durable()` serialize their convenience
-calls because one composition-root Workbench owns one mutable audit
-attachment. Concurrent workers use separate Workbench views over the same
-authoritative database, as the built-in dispatcher does.
+`LIPASRuntime.run_durable()` and `resume_durable()` create a Run-scoped
+ExecutionStore evidence attachment. The composition-root Workbench control
+store remains stable, so unrelated durable calls may run concurrently without
+closing or redirecting one another's audit sink. SQLite still serializes their
+brief control commits.
+
+Direct Workbench embeddings use the same ownership boundary:
+
+```python
+with workbench.execution_scope(agent.rowset, run_id=run.id) as execution:
+    result = await agent.run_durable(
+        task.goal, execution_store=execution, run_id=run.id,
+    )
+```
+
+The scope owns and closes only its temporary connection; it never replaces
+`workbench.execution`.
 
 ## Input is not approval
 
@@ -121,6 +163,8 @@ migrate away from ReAct-specific supervision.
   authority.
 - Claims and Effects are audit evidence.
 - Tools are the only executable capabilities.
+- `AgentCoordinator` composes deterministic handoff Runs under the existing
+  `ExecutionStore`; it owns no mailbox or graph authority.
 - The legacy `Team`/`Mailbox` surface remains available but is now a
   compatibility orchestration layer, not a second identity for core Runs.
 - `StrategyRegistry` and belief-adaptive calculus remain supported for

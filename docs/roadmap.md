@@ -2,8 +2,9 @@
 
 > Language: [English](roadmap.md) | [中文](roadmap.zh-CN.md)
 >
-> Status: 0.32 execution plan
-> Date: 2026-08-11
+> Status: 0.40.0 shipped — local operator, recovery drills, and extension
+> conformance hardening
+> Date: 2026-08-24
 
 ## Product direction
 
@@ -17,15 +18,18 @@ implementation layers:
 - a first-party local task workbench for running real workspace tasks with
   approvals, recovery, and delivery evidence.
 
-The runtime and bounded workbench are available today as the 0.31.0 unified
-local-runtime alpha. They share one repository, roadmap, release line,
-composition root, global database, and execution model.
+The runtime and bounded workbench are available today as the 0.40.0 local
+operator beta. They share one repository, release line, composition root,
+global workspace database, and execution model; per-Run evidence remains an
+intentional isolation boundary.
 
 Product precedence is explicit: the local task workbench and later product
 surfaces are the independent user-facing product; the Python runtime is its
 internal reliability foundation and an optional advanced embedding surface.
 LangGraph, MCP-server, and OpenCrew/OpenClaw adapters are experimental
 compatibility samples, not roadmap commitments or core product surfaces.
+The broader competitive position and investment sequence are explicit in the
+[LIPAS strategy](strategy.md).
 
 The first product goal is not to support the most models or Agent roles. It is
 to make users willing to delegate a real write operation because they can see
@@ -35,6 +39,10 @@ what will happen, control risky actions, recover safely, and verify the result.
 
 ```text
 CLI / Local Web
+       │
+       ▼
+Business layer
+  Scenario / Skill / Connector contract
        │
        ▼
 Task workbench
@@ -83,12 +91,35 @@ Representative tasks include fixing a bounded defect, updating configuration
 or documentation, checking release risk, transforming local data, and invoking
 approved HTTP or MCP operations.
 
+## Scenario growth model
+
+Business breadth grows outside the execution kernel:
+
+- Skills add instruction-only knowledge and are selected explicitly so a
+  larger catalog does not inflate every prompt.
+- Capabilities add bounded real-world actions and remain the only source of
+  execution authority.
+- `BusinessScenario` composes the minimal Skill bundle, lifecycle, and
+  capability requirements without creating a second state machine.
+- Durable Runs compose those contracts when a scenario needs approval,
+  waiting, recovery, reconciliation, or delivery evidence.
+
+The 0.40 catalog contains 17 Skills and 18 Scenarios across files, document
+processing, coding/review/release, office and personal writing, email,
+calendar, cloud drive, and ticket triage. Workspace Scenarios reuse bounded
+Workbench Tools; draft Scenarios need no executable authority. Connector
+Scenarios publish structural Tool and host-policy requirements but do not
+pretend that provider access is bundled. Real external writes still require
+scope, preview approval, idempotency, provider evidence, data-egress policy,
+and uncertain-result reconciliation.
+
 ## Current foundation
 
-The 0.10.0 public beta provides the Python Agent and tool API, durable SQLite
-sessions, Effects, guards, budgets, safe replay, supervision, external
-operation reconciliation, at-least-once Team handoffs, and the first durable
-execution foundation.
+The historical 0.10–0.39 slices provide the Python Agent and tool API, durable
+SQLite sessions, Effects, guards, budgets, safe replay, supervision, external
+operation reconciliation, coordination, and the first durable execution
+foundation. The current release is described below by its live contracts, not
+by those historical milestone labels.
 
 The source tree now contains the first complete durable ReAct slice.
 `ExecutionStore` persists Task, Run, versioned Checkpoint, and Interrupt state;
@@ -110,10 +141,11 @@ a crash. A real subprocess
 `SIGKILL` test verifies that a completed write Effect is restored rather than
 executed again when its following checkpoint was interrupted.
 
-The 0.10.0 release did not yet include caller-facing token streaming,
-automatic lease heartbeats, or the complete task-workbench experience. The
-execution state store and the claim/Effect session are deliberately separate
-durable records, and a durable Agent currently requires both SQLite stores.
+The execution state store and the claim/Effect session remain deliberately
+separate durable records, and a durable Agent currently requires both SQLite
+stores. Their crash window is covered by stable identities, transactional
+outboxes, repair, and explicit uncertain/orphan states; they are not claimed
+to be one distributed transaction.
 
 The 0.20.0 product alpha begins the product release line and adds automatic
 lease heartbeat, model/tool
@@ -127,8 +159,9 @@ by default; raw secrets are rejected before persistence, and allowlisted
 environment references are resolved only at tool execution. Product-lifecycle
 events are durable and available as JSONL. An end-to-end test covers task
 creation, write approval, recovery, verification approval, recovery, and report
-delivery. Live UI streaming, broader timeout recovery policy, and validation
-with real design partners remain unfinished.
+delivery. Those were the remaining gaps at the 0.20 milestone; 0.40 now ships
+the local operator, explicit timeout reconciliation, and the design-partner
+validation protocol (external partner validation remains an open experiment).
 
 The post-LIPA architecture review has now landed two contract slices:
 `LIPASRuntime` is the composition root; ordinary, Session, and durable calls
@@ -137,9 +170,25 @@ share `RunContext` and `AgentEvent`; durable event cursors support reconnect;
 requirements fail explicitly; and behaviour-neutral `RunObserver`
 recommendations are advisory by default. Schema v2 now consolidates compatible
 global state into `workspace.db`, with explicit backup/verify/rollback tooling
-and persistent audit diagnostics. Per-Run evidence remains isolated. Moving
-legacy Team ownership fully onto ExecutionStore is still a compatibility
-migration, not a claimed current guarantee.
+and persistent audit diagnostics. Per-Run evidence remains isolated. New
+multi-Agent work now uses `AgentCoordinator`, which maps deterministic handoff
+Task/Runs onto `ExecutionStore`. Legacy Team mailbox ownership remains a
+compatibility migration rather than a second authority for new work.
+Durable SQLite-backed Agent members now pass that already-claimed handoff Run
+into `Agent.run_durable()`: checkpoints, Approval/Input Interrupts, and Effect
+recovery share one Run and one lease, with same-envelope resume/replay.
+
+The 0.39 extension slice now also ships reconnectable aggregate event handles,
+atomic shared budget reservations, explicit capability delegation,
+dependency-free LangGraph/AutoGen handoff boundaries, and the
+scaffold/conformance SDK. The 0.40 release adds a token-protected
+`LocalWebOperator` projection, deterministic fault-campaign helpers, and a
+bounded local ExecutionStore transition benchmark. The hardening pass adds
+bounded task-detail product projections, explicit cancellation/approval
+aliases, immutable reusable fault plans, a named fault-matrix runner, a
+dependency-free browser projection, and a multi-connection contention probe.
+The browser remains intentionally thin and polls reconnectable event pages;
+it is not a second scheduler or metrics authority.
 
 The 0.32 model-access slice adds one first-party OpenAI-compatible Chat
 Completions boundary instead of separate provider subsystems. Explicit URL,
@@ -150,6 +199,65 @@ normalizes tools/usage/SSE/errors, and leaves unproven model capabilities
 unknown. It does not change the Workbench authority model or make provider
 availability a durability guarantee.
 
+The completed 0.35 scenario slice adds immutable `BusinessScenario`,
+`CapabilityRequirement`, `ScenarioAssessment`, and `ScenarioRegistry` values.
+CLI and Python callers can inspect, compose, and validate 18 recipes while
+loading only their selected Skills. Tool-less chat and the default Workbench
+fail before model execution when capability requirements are missing or their
+effect classes are dishonest. Connector assessment keeps account scope,
+secrets, egress, approval, idempotency, provider evidence, and reconciliation
+as explicit host obligations.
+
+The completed 0.38 storage slice keeps deployment SQLite-first instead of
+requiring PostgreSQL. A shared kernel gives every core Store the same WAL,
+bounded busy timeout, transaction, and failure policy. Durable convenience
+calls use Run-scoped evidence attachments instead of a Runtime-wide lock.
+Claim tapes coordinate concurrent connections, provide indexed cursor pages,
+and restore compatible deterministic projections from snapshots before
+replaying only the delta. Snapshots remain disposable derived state; the
+append-only evidence tape and ExecutionStore authority boundaries do not
+change. The target is local and moderate concurrency, not a hidden
+multi-machine database.
+
+The historical coordination slice added stable `HandoffEnvelope` identity,
+heartbeat/cancellation/terminal replay, fail-closed expired-lease policy, and
+sequential, RoundRobin, bounded parallel, map/reduce, durable Selector, and
+bounded Swarm composition. It reuses `ExecutionStore`; member registration is
+host configuration, not another persistent scheduler. Ordinary Agent members
+receive causal metadata and branch `RunContext`, but bridging their inner loop
+received causal metadata and branch `RunContext`. The 0.39 durable-member slice
+now bridges the inner loop to the already-claimed coordination Run's durable
+checkpoints, Interrupts, and Effect recovery without a second claim.
+
+## 0.40 hardening and product completeness
+
+The release line now closes the previously important gaps with bounded,
+provider-neutral capabilities:
+
+- [x] First-party `HttpClient` with HTTPS/egress policy, request identity,
+  idempotent external writes, and `uncertain` reconciliation through
+  `OperationJournal`.
+- [x] First-party `MCPClient`/`MCPHttpClient` alongside the existing audited
+  MCP server; MCP transport state never becomes LIPAS authority.
+- [x] Idempotent `EmailConnector` with provider reference, stable request
+  identity, and provider lookup reconciliation.
+- [x] A single operation reconciliation sweep plus Local Web projections for
+  pending/uncertain operations, approval risk, preview/diff, budget, scope,
+  and verification evidence.
+- [x] Provider request identity on canonical model requests and each LLM
+  retry attempt; aggregate billed usage remains in the Effect result.
+- [x] Background convergence for async timeout orphans and an explicit
+  `ToolHarness.reconcile_orphan()` closeout for sync tools that cannot be
+  force-killed.
+- [x] Deterministic checkpoint payload migration hooks and explicit schema
+  compatibility gates; unknown future versions still fail closed.
+- [x] Provider-free `doctor`/`tour --offline` onboarding plus an install and
+  design-partner validation playbook (see [onboarding](onboarding.md)).
+
+The release still does not claim that an arbitrary Python tool is sandboxed or
+that a provider without idempotency/reconciliation can offer exactly-once
+delivery.
+
 ## Delivery phases
 
 ### Phase 1: reliable execution slice
@@ -158,6 +266,12 @@ availability a durability guarantee.
   timeouts.
 - [x] Execute independent reads concurrently while keeping writes and
   policy/accounting-sensitive calls serial and recoverable.
+- [x] Give core SQLite stores one WAL/timeout/transaction policy and classify
+  contention, read-only, disk-full, and corruption failures explicitly.
+- [x] Remove the composition-root durable lock with stable Workbench ownership
+  and one Run-scoped evidence attachment per durable call.
+- [x] Add concurrent Claim admission, bounded cursor pages, indexed catch-up,
+  and rebuildable projection snapshots without compacting away evidence.
 - [x] Persist submitted Tasks and dispatch several Runs concurrently with
   atomic leases, heartbeat, expired-run reclaim, and approval slot release.
 - [x] Keep task writes in a per-Run staging workspace and require an explicit,
@@ -170,12 +284,15 @@ availability a durability guarantee.
 - [x] Add a hardened OpenAI-compatible Chat Completions route for Python, CLI,
   and Task workers without provider/model fallback.
 - [x] Introduce a behaviour-neutral, read-only RunObserver boundary.
-- [ ] Move legacy Team handoffs onto ExecutionStore and retire mailbox
-  authority after a documented migration.
+- [x] Add ExecutionStore-backed handoff Runs and a bounded multi-Agent
+  coordination standard library without another scheduler database.
+- [ ] Retire legacy Team mailbox authority after a documented compatibility
+  migration; do not dual-write one logical handoff meanwhile.
 - [x] Physically consolidate compatible control, event, product, and evidence
   tables behind `LIPASRuntime` without losing per-Run budget isolation.
-- [ ] Add timeout recovery around the shipped durable cancellation, approval
-  interrupt/resume, and orphan detection paths.
+- [x] Add timeout recovery around the shipped durable cancellation, approval
+  interrupt/resume, and orphan detection paths, including explicit uncertain
+  reconciliation and sync-tool orphan closeout.
 - [x] Add Task, Workspace, Run, Approval, Artifact, Verification, and Report
   application models.
 - [x] Add bounded filesystem, Shell, and Git capabilities.
@@ -190,25 +307,55 @@ process termination without silently losing state or repeating a completed
 write; path escapes are denied; every write and command has approval and
 evidence; and the report states changes, verification, and uncertainty.
 
-### Phase 2: CLI private alpha
+### Phase 2: CLI and extension alpha
 
-- Add first-party HTTP and MCP client capabilities needed by real LIPAS tasks.
-- Turn the shipped CLI approval inbox and its single-consumption state into a
-  focused diff/risk operator experience.
-- Show risk, budget, diff, commands, verification, and uncertain operations.
-- Make installation and the first real task usable without maintainer help.
-- Work with 3–5 design partners on recurring workspace tasks.
+- [x] Expand the explicit catalog to 17 Skills and 18 file, engineering,
+  office, personal, and connector Scenario contracts.
+- [x] Define a distributable Scenario/Connector package manifest, scaffold command,
+  and offline conformance checks, including provenance, connector scope,
+  approval/reconciliation declarations, and version compatibility fixtures.
+- [x] Strengthen bidirectional LangGraph and AutoGen action/handoff adapters without
+  importing their graph/team state models into the LIPAS core.
+- [x] Add an optional coordination standard library above ExecutionStore with
+  bounded Selector, RoundRobin, parallel map/reduce, and Swarm policies.
+- [x] Bridge an already-claimed handoff Run into durable Agent checkpoints,
+  Approval/Input Interrupts, and Effect recovery without double claiming.
+- [x] Add aggregate coordination event cursors, fan-in cause navigation, and
+  explicit shared budget/capability policy.
+- [x] Add deterministic fault-campaign and local transition-benchmark helpers
+  with a multi-connection contention mode and an isolated named fault-matrix
+  runner for process-kill, SQLite busy/corruption, cancellation, redelivery,
+  and uncertain-member fixtures.
+- [x] Add first-party HTTP and MCP client capabilities needed by real LIPAS
+  tasks.
+- [x] Add the first approved, idempotent email delivery connector after data
+  egress policy and uncertain-operation reconciliation became product-visible.
+- [x] Turn the CLI approval inbox and single-consumption state into a focused
+  diff/risk operator experience.
+- [x] Show risk, budget, diff, commands, verification, and uncertain
+  operations.
+- [x] Make installation and the first provider-free task usable without
+  maintainer help (`doctor`, `tour --offline`, migration plan/verify).
+- [ ] Work with 3–5 external design partners on recurring workspace tasks;
+  the protocol and measurement fixtures are shipped, but external validation
+  is intentionally not fabricated by the repository.
 
 Exit criterion: design partners complete real tasks and can explain from the
 report what changed, what was verified, and what remains uncertain.
 
-### Phase 3: Local Web
+### Phase 3: 0.40 Local Web beta
 
-- Add task list and task detail views.
-- Stream execution state, tool activity, and waiting approvals.
-- Support approve, deny, cancel, pause, and continue.
-- Present diffs, artifacts, budgets, verification, and orphan states without
-  requiring users to read raw logs.
+- [x] Add the dependency-free `LocalWebOperator` HTTP projection with loopback
+  default, redacted lease state, and bearer-token mutation guard.
+- [x] Add bounded task detail views with Run events, Interrupts, artifacts,
+  ChangeSet diff state, reports, and product events.
+- [x] Stream execution state, tool activity, and waiting approvals through
+  bounded reconnectable event pages and a polling browser projection.
+- [x] Support explicit approve/deny aliases and task/run cancellation. Pause
+  and continue remain cooperative worker operations rather than unsafe
+  operator-side lease manipulation.
+- [x] Present diffs, artifacts, budgets, verification, orphan and uncertain
+  states without requiring users to read raw logs.
 
 Exit criterion: users can judge task safety and completion from the product UI.
 

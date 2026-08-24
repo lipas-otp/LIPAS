@@ -1,6 +1,234 @@
 # Changelog
 
-## [Unreleased]
+## [0.40.0] — 2026-08-24 · Local Operator & Recovery Beta
+
+### Added
+
+- First-party `HttpClient` and `MCPClient`/`MCPHttpClient` capability boundaries.
+  HTTP writes require egress policy and stable idempotency keys; provider
+  transport failures become journalled `uncertain` operations.
+- Provider-neutral `EmailConnector` with provider request identity, delivery
+  reference, duplicate suppression, and lookup-based reconciliation.
+- Local Web approval/risk and operation projections, including explicit
+  `/api/approvals`, `/api/operations`, `/api/operations/{key}/reconcile`, and
+  `/api/runs/{id}/reopen` operator boundaries.
+- Canonical model `Request.request_id`, OpenAI-compatible request headers, and
+  one auditable `llm_attempt` claim per retry. Effect results retain aggregate
+  billed usage so failed/retried calls cannot disappear from cost accounting.
+- Checkpoint payload migration registry (`register_checkpoint_migration`) and
+  legacy envelope upgrade; unknown future schemas still fail closed.
+- Async timeout orphan convergence and explicit `ToolHarness.reconcile_orphan`
+  closeout for synchronous calls that cannot be force-killed.
+- Production-minded installation/onboarding and design-partner validation
+  protocols are consolidated under `docs/onboarding.md`.
+
+- The Local Web operator now projects task detail together with Run events,
+  Interrupts, artifacts, ChangeSet diff state, reports, and product events.
+  Task cancellation and explicit `/approve`/`/deny` aliases delegate to the
+  existing ExecutionStore transitions; stale mutations return a conflict
+  instead of an opaque server error.
+- Fault plans are immutable and reusable: each campaign run starts with a
+  fresh occurrence counter, so repeated recovery drills remain deterministic.
+- The SQLite transition benchmark can use several independent connections to
+  measure bounded writer contention (`workers=N`) without adding a metrics
+  authority or implying distributed throughput.
+- The local operator now serves a dependency-free `/`/`/ui` browser projection,
+  bounded reconnectable `/api/runs/{id}/events` pages, and an evidence summary
+  for pending approvals/inputs, orphan runs, uncertainty, budgets, verification,
+  risks, and event activity. It remains a projection over ExecutionStore.
+- Extension manifests now declare provenance, connector scope, approval and
+  reconciliation obligations, and an optional maximum LIPAS version.
+  `run_conformance()` checks semantic-version compatibility and connector safety
+  contracts offline. `run_fault_matrix()` isolates named process, SQLite,
+  cancellation, redelivery, and uncertain-member fixtures.
+- Reconciliation closeout now persists an operator observation in the operation
+  audit event; `found=true` requires a provider reference and Run reopening
+  requires JSON evidence. MCP SSE responses reject mismatched request ids,
+  and process-level HTTP interrupts preserve their original signal after
+  marking the write uncertain.
+- `LLMHarness.reconcile_orphan()` now closes an intent-only model Effect from
+  an observed Reply/error without issuing a second provider request.
+
+### Fixed
+
+- Durable phase timeouts and logical cancellation racing an unsettled Effect
+  now persist `recovery_required`/`reconcile_before_resume` diagnostics. The
+  operator API requires uncertainty acknowledgement, reconciliation
+  acknowledgement, and recorded evidence before reopening the Run; timeout is
+  never treated as a safe retry.
+- Concurrent first opens of the same SQLite execution database no longer race
+  on bootstrap metadata and raise a false unique-constraint error. Bootstrap is
+  idempotent and still fails closed for an unsupported schema version.
+
+### Verification
+
+- 711 tests are collected and pass in the normal environment (the loopback
+  socket test may be skipped in restricted sandboxes), including the operator
+  projection/authorization boundary,
+  terminal event replay, identity-conflict checks, reusable fault plans, and
+  multi-connection SQLite contention.
+
+## [0.39.0] — 2026-08-24 · Coordination, Extension SDK & Operator Beta
+
+### Added
+
+- `AgentCoordinator`, an optional ExecutionStore-backed multi-Agent standard
+  library. Stable `HandoffEnvelope` values map to deterministic Task/Runs, so
+  handoff lease, attempt, cancellation, terminal value/error, and public events
+  use the existing execution authority instead of a new mailbox or graph
+  database.
+- Sequential, RoundRobin, bounded parallel, map/reduce, durable Selector, and
+  bounded Swarm-style `Transfer` policies. Selector decisions and reducer work
+  are ordinary durable handoffs; parallel results preserve branch order and can
+  expose explicit partial failures.
+- Runtime and operator surfaces: `LIPASRuntime.coordinator()`, standalone
+  coordinator lifecycle, member inspection, `get_handoff_run()`, persisted
+  `cancel_handoff()`, and `handoff_started/completed/failed/cancelled` Agent
+  event types.
+- Durable SQLite-backed Agent members can now run on the already-claimed
+  coordination Run. Agent checkpoints, lease heartbeat, Effect recovery, and
+  Approval/Input Interrupts share that Run; resuming the same envelope never
+  performs a second claim.
+- Aggregate `CoordinationEventHandle` pages merge per-Run AgentEvents with a
+  reconnectable per-Run cursor map. `SharedBudgetPolicy` reservations are
+  atomic and durable, while `CapabilityPolicy` makes member delegation an
+  explicit registration contract.
+- The 0.39 extension SDK adds `ExtensionManifest`, editable
+  `scaffold_extension()`, and offline `run_conformance()` checks. Dependency-
+  free `LangGraphHandoffNode` and `AutoGenHandoffHandler` boundaries delegate
+  to the same LIPAS coordination Run without importing framework state models.
+- A provider-free multi-Agent lesson and bilingual coordination guide covering
+  member contracts, replay, redelivery safety, nesting, current limits, and the
+  durable Agent-member roadmap.
+- 0.40 beta foundations: `LocalWebOperator` projects Tasks, Runs, Interrupts,
+  and event cursors over a loopback HTTP boundary without exposing lease
+  tokens; mutation routes require an explicit bearer token. `FaultPlan`,
+  `FaultCampaign`, and `benchmark_execution_store()` provide deterministic
+  recovery drills and bounded local SQLite measurements without adding a queue
+  or metrics authority.
+
+### Changed
+
+- New multi-Agent code uses `AgentCoordinator`; legacy `Team` remains a mailbox
+  compatibility facade rather than a second Task/Run API. Member registration
+  is host-owned configuration while all coordination state is projected from
+  `ExecutionStore`.
+- Agent members receive stable `caused_by`, coordination/sender/recipient
+  metadata, and a branch `RunContext`. Explicit member contract versions join
+  the request fingerprint. Inputs are deep-snapshotted before fingerprinting/
+  invocation, and only bounded JSON-compatible terminal results can be replayed.
+- Resolving an Approval/Input Interrupt returns the same handoff Run to `pending`;
+  dispatching the same envelope resumes its checkpoint. Completed model/tool
+  Effects replay from the Agent claim tape, while uncertain external Effects
+  fail closed.
+- Shared reservations are idempotent by `(scope, handoff_id)` and are never
+  silently refunded after a failed member. Capability declarations do not
+  infer permissions from Skills, Memory, or external framework metadata.
+
+### Safety and limits
+
+- Stable handoff identity reuse with different input fails closed. One live
+  lease owns a handoff, heartbeat observes persisted cancellation, and an
+  expired lease is not redelivered unless the whole member invocation declares
+  `redelivery_safe=True`. Lease loss never authorizes cancellation of a
+  possible replacement owner.
+- Durable member failures are terminal and are not silently retried. Ordinary
+  exception details are not persisted as public results; oversized or
+  non-serializable values and spoofed internal result markers fail instead of
+  recording an unreplayable success.
+- Ordinary `Agent` members without a SQLite-backed session retain the compatible
+  non-durable path. Durable Agent recovery is restricted to the stable SQLite
+  claim tape; ordinary async members still require an explicit `redelivery_safe`
+  declaration before expired-lease reclaim.
+
+### Verified
+
+- 679 tests pass, including stable identity/version conflicts, terminal replay,
+  cross-connection lease/heartbeat races, crash-style expired ownership,
+  cancellation settlement without redelivery, all coordination policies,
+  one-claim durable Agent approval/input resume and replay, payload mutation
+  isolation, bounded serialization, and Runtime lifecycle.
+- Mypy passes all 69 public source files. Ruff, bytecode compilation, the
+  provider-free Tour, release metadata/README mirroring, and whitespace checks
+  pass.
+
+## [0.38.0] — 2026-08-22 · SQLite Concurrency & Evidence Store
+
+### Added
+
+- A shared SQLite storage kernel configures every normal durable connection
+  with foreign keys, a bounded busy timeout, WAL, power-loss-oriented
+  `synchronous=FULL`, untrusted schemas, and automatic WAL checkpoint policy.
+  Read-only URI connections are also forced into query-only mode. SQLite
+  failures are classified as busy, constraint, read-only, disk-full,
+  corruption, or other without hiding the original database exception.
+- `SqliteClaimStore.read_page()` provides cursor-based bounded evidence reads.
+  `checkpoint_projection()` persists a versioned, rebuildable projection
+  snapshot, while the append-only Claim tape remains authoritative. Compatible
+  snapshots allow reopen to replay only the delta instead of all history.
+- Claim tapes now coordinate concurrent connections with `BEGIN IMMEDIATE`,
+  database-assigned monotonic sequence admission, durable claim-id lookup, and
+  safe idempotent redelivery. Tag/source/kind sequence indexes make catch-up and
+  audit queries proportional to the requested slice.
+- Concurrency tests cover four competing Claim writers, concurrent stable-id
+  redelivery, snapshot/delta reopen, transaction rollback, WAL policy, and two
+  durable Runs crossing the model boundary at the same time.
+
+### Changed
+
+- `LIPASRuntime.run_durable()` and `resume_durable()` create a Run-scoped
+  `ExecutionStore` evidence attachment. The Workbench control store remains
+  stable, removing the Runtime-wide durable lock and allowing unrelated Runs
+  to execute concurrently without redirecting or closing one another's audit
+  sink.
+- `Workbench.execution_scope()` is now the only Workbench-owned Run evidence
+  attachment. The mutable `attach_rowset()`/`attach_global_rowset()` path was
+  removed so CLI, examples, and applications cannot replace and close the
+  authoritative control handle behind another Run.
+- Execution outbox repair uses the Claim unique index rather than rebuilding a
+  complete in-memory identity set. Run-scoped repair uses an indexed Run filter,
+  claimable Run discovery has a state/lease/creation index, normal transitions
+  drain only a bounded batch, and explicit repair streams the complete backlog.
+  Legacy outbox reconstruction is stamped once instead of rescanning all
+  authoritative rows on every Store open.
+- Synchronous Tools use one lazy, bounded process executor with context
+  propagation and a bounded submission gate. Forked children create their own
+  executor instead of inheriting invalid parent thread state. Short-lived CLI,
+  test, and notebook event loops no longer repeatedly create executor pools;
+  timeout still leaves an unkillable synchronous action visibly uncertain
+  rather than recording a false terminal result.
+- SQLite is the supported local and moderate-concurrency backend for 0.38.
+  PostgreSQL is not required, and no remote backend or silent fallback has been
+  introduced.
+
+### Safety and limits
+
+- SQLite still has one physical writer per database file. LIPAS scales local
+  work by short transactions, WAL readers, bounded admission, workspace-level
+  databases, and per-Run evidence tapes; it does not claim multi-machine or
+  unbounded write concurrency.
+- Projection snapshots never delete or replace evidence and are ignored when
+  their reducer/configuration fingerprint is incompatible. Snapshot payloads
+  are checksummed and anchored to an existing Claim sequence; a corrupt cache
+  falls back to the append-only tape. An optional snapshot failure cannot turn
+  an already committed Claim into a retryable application failure.
+- A normal write waits for at most one configured SQLite busy timeout. Extra
+  writer-acquisition attempts require an explicit caller choice, and transaction
+  helpers never replay a body or an external side effect.
+- Concurrent `OperationJournal.execute()` calls now derive submission ownership
+  from the atomic insert. A loser cannot call the provider after observing the
+  winner's pending operation. Workbench evidence rejects cross-Task Run ids and
+  conflicting event-id reuse; ChangeSet snapshot/apply paths detect source and
+  staged-file races before delivery.
+
+### Verified
+
+- 645 tests pass, including the complete Scenario, compatible-provider,
+  durable recovery, Workbench, migration, crash-window, and integration suite.
+- Mypy, Ruff, bytecode compilation, release metadata, and documentation checks
+  pass.
+
+## [0.35.0] — 2026-08-22 · Business Scenario Contracts Alpha
 
 ### Added
 
@@ -13,6 +241,54 @@
   no-auth gateways. Credential flags are mutually exclusive, provider-only
   arguments fail when they would be ignored, and a custom probe prompt is
   rejected unless `--live` is present.
+- A provider-neutral catalog of 17 business Skills covering file/document
+  work, coding/review/release, email/report/meeting/notice/proposal/calendar,
+  personal letters/speeches/greetings, and connector operating method.
+  `SkillRegistry.from_sources(...)` composes explicit built-ins with portable
+  local `SKILL.md` paths without auto-injecting the whole catalog.
+- `lipas skill list/show` inspect knowledge without running a model. Repeatable
+  `--skill` and `--skill-path` select knowledge for built-in chat and Task
+  Agents; custom task factories can accept the composed `skills=` registry.
+- Immutable `BusinessScenario`, `CapabilityRequirement`,
+  `ScenarioAssessment`, and `ScenarioRegistry` contracts. Eighteen packaged
+  recipes cover draft-only, staged-workspace, and connector workflows while
+  keeping authority in normal Tools and durable Runs.
+- `lipas scenario list/show/check` exposes lifecycle, Skill bundle, required
+  Tool names and input fields, effect classes, approval point, and idempotency/reconciliation
+  obligations without running a model. Repeatable `--scenario` composes a
+  minimal Skill set for chat, Task, worker, and resume paths.
+- A bilingual product strategy defines LIPAS's trustworthy-execution position
+  alongside LangGraph and AutoGen, the remaining graph/team/ecosystem gaps,
+  architectural guardrails, and a sequenced path through 0.40.
+
+### Changed
+
+- Packaged Skill discovery is cached per process, Skill metadata is exposed as
+  an immutable mapping, and prompt size remains proportional to explicitly
+  selected business knowledge.
+- Tool-less chat and the default Task Workbench fail before model execution
+  when a selected Scenario lacks required capabilities. Custom factories can
+  accept composed `skills=` and optional `scenarios=` without a second DSL.
+
+### Safety
+
+- Email and personal-writing Skills are draft/instruction only. They cannot
+  contact recipients or grant file, shell, network, or delivery authority;
+  future sending connectors remain subject to Tool approval, idempotency, and
+  uncertain-result reconciliation.
+- Email, calendar, cloud-drive, and ticket connector Scenarios are contracts,
+  not bundled provider access. Tool name/input/effect checks explicitly do not claim
+  to prove account/object scope, secret handling, data-egress policy, human
+  approval, provider evidence, or uncertain-result reconciliation.
+
+### Verified
+
+- 628 tests pass, including Scenario composition, capability absence and
+  effect-class mismatch rejection, draft-only authority boundaries, CLI
+  selection, and the complete pre-existing durable/runtime suite.
+- Mypy passes all 61 public source files. Ruff, bytecode compilation,
+  documentation-link validation, README/PKG-INFO mirroring, the provider-free
+  durable Tour, and whitespace checks pass.
 
 ## [0.32.0] — 2026-08-11 · Compatible Model Endpoints Alpha
 

@@ -69,6 +69,52 @@ For a trusted local gateway that deliberately has no authentication, replace
 mutually exclusive. `--prompt` also requires `--live`, so a dry check never
 silently ignores probe input.
 
+## Select business knowledge and Scenarios
+
+Packaged Skills are instruction-only and can be inspected without a model:
+
+```bash
+lipas skill list
+lipas skill show coding-task
+```
+
+Scenarios compose the minimal Skill bundle, lifecycle, and Tool requirements:
+
+```bash
+lipas scenario list
+lipas scenario list --category office
+lipas scenario show coding-change
+lipas scenario check email-delivery --factory connectors:email_tools --json
+```
+
+`scenario check` validates exact Tool names, required input fields, and honest side-effect declarations.
+For connector Scenarios it also reports host-policy obligations that Tool shape
+alone cannot prove.
+
+Use repeatable `--skill` to select only the knowledge needed by a built-in
+chat or task Agent, and repeatable `--skill-path` to add portable local
+`SKILL.md` files:
+
+```bash
+lipas chat \
+  --scenario email-draft \
+  --once "Draft a concise customer update"
+
+lipas task start . "repair the parser regression" \
+  --scenario coding-change
+```
+
+Repeat `--scenario` to compose recipes; repeat `--skill` or `--skill-path` for
+additional knowledge. No selection adds Tools or permissions. A tool-less chat
+rejects a workspace/connector Scenario whose declared capabilities would be
+missing. Custom chat and task factories may accept the composed
+`SkillRegistry` through `skills=` or `**kwargs`; task factories may also accept
+the selected `ScenarioRegistry` through `scenarios=`. Worker and resume
+commands accept the same selection flags.
+
+See [business Skills, Scenarios, and capabilities](business-skills.md) for the
+catalog and the boundary between drafting an email and sending one.
+
 Inside chat, `:trace` renders the current claim tape, `:effects` shows orphan
 and rejected effects, and `:quit` exits. `--once "…"` is useful for scripts.
 The session file is created automatically; do not `touch` it first.
@@ -107,6 +153,7 @@ apply the copy-on-write migration:
 lipas migrate plan --home ~/.lipas
 lipas migrate apply --home ~/.lipas --yes
 lipas migrate verify --home ~/.lipas
+lipas audit --home ~/.lipas --repair
 ```
 
 The migration retains the original databases and an additional
@@ -135,7 +182,49 @@ staging, command/write approval, Effect recording, or recovery.
 CLI, Python API, Sessions, Handoffs, Operations, and product events share the
 same global database. Per-Run Claim/Effect tapes remain separate under
 `runs/<run-id>/claims.db` so budgets and replay evidence cannot leak between
-concurrent Runs.
+concurrent Runs. In 0.40, core connections share WAL and bounded contention
+policy, and durable convenience calls no longer hold a Runtime-wide lock.
+SQLite remains a single physical writer; deployment and scale guidance is in
+[SQLite storage and concurrency](sqlite-storage.md).
+
+## Local Web operator (0.40.0)
+
+The Python API exposes a dependency-free operator projection without adding a
+second queue or status store:
+
+```python
+with LIPASRuntime.open(".lipas") as runtime:
+    operator = runtime.operator(operator_token="use-a-local-secret")
+    operator.serve_forever(host="127.0.0.1", port=8787)
+```
+
+`serve_forever` owns the serving thread. If an application runs it in a
+dedicated thread, call `operator.shutdown()` from another thread and let the
+loop close the server; the Runtime/Store itself must still be opened in the
+serving thread when the default thread-bound SQLite connection is used.
+
+`GET /`, `/ui`, `/health`, `/api/snapshot`, `/api/tasks`, `/api/tasks/<id>`,
+`/api/runs`, `/api/runs/<id>`, and `/api/runs/<id>/events` return bounded,
+redacted projections. The root route is a small dependency-free browser page;
+the JSON routes are the reconnectable contract. When the
+operator is created by `LIPASRuntime`, task detail also includes Workbench
+events, artifacts, ChangeSet paths/diff, and the current report. `POST
+/api/tasks/<id>/cancel`, `POST /api/runs/<id>/cancel`, and `POST
+/api/interrupts/<id>/{resolve,approve,deny}` delegate to the existing durable
+transitions and require `Authorization: Bearer ...`. Stale mutations return
+HTTP 409 so a UI can refresh and retry without guessing state. The operator
+remains a projection rather than a second scheduler; clients can
+reconnect using the same per-Run and aggregate event cursors.
+
+`GET /api/approvals` adds risk, scope, preview/diff, and budget fields;
+`GET /api/operations` lists pending/uncertain external operations. A provider or
+operator can explicitly reconcile one with `POST
+/api/operations/<key>/reconcile` (`found=true|false`); the request must include
+an observation, and `found=true` must include the provider reference. A durable
+phase timeout requires `POST /api/runs/<id>/reopen` with
+`{"acknowledge_uncertain":true,"reconciled":true,"evidence":{"observation":"..."}}`
+after its Effect/provider outcome has been reconciled. Neither route retries a
+live operation implicitly or treats a checkbox alone as provider evidence.
 
 ## Inspect a run
 

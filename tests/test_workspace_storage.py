@@ -81,11 +81,13 @@ def test_run_evidence_mirror_excludes_other_runs_control_events(tmp_path):
         run_claims = open_session(
             runtime.workbench.claims_path_for_run(selected.id),
         )
-        runtime.workbench.attach_rowset(run_claims, run_id=selected.id)
-        mirrored = [
-            claim for claim in run_claims.store
-            if claim.source == "execution.store"
-        ]
+        with runtime.workbench.execution_scope(
+            run_claims, run_id=selected.id,
+        ):
+            mirrored = [
+                claim for claim in run_claims.store
+                if claim.source == "execution.store"
+            ]
         assert mirrored
         assert all(claim.fields.get("run_id") == selected.id for claim in mirrored)
         assert not any(claim.fields.get("run_id") == other.id for claim in mirrored)

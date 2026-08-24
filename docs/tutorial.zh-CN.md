@@ -230,24 +230,31 @@ agent = Agent.ollama(
 ```
 
 即使一个 Agent 使用多个工具、经历多步，面对一个连贯目标时仍应使用一个 Agent。只在
-工作需要独立 owner、重启边界、authority 或 audit trail 时才添加 `Team`。Team 成员
+工作需要独立 owner、重启边界、authority 或 audit trail 时才添加 `AgentCoordinator`。成员
 可以是 Agent 或普通 async 函数：
 
 ```python
-from lipas import Team
+from lipas import AgentCoordinator
 
 
 async def researcher(prompt: str) -> dict[str, str]:
     return {"finding": f"research complete: {prompt}"}
 
 
-with Team.open("runs/team.db") as team:
-    team.add("research", researcher)
-    finding = team.ask_sync("research", "check release risks")
+async def coordinate() -> None:
+    with AgentCoordinator.open("runs/coordination.db") as coordinator:
+        coordinator.add("research", researcher)
+        finding = await coordinator.handoff(
+            "research", "check release risks",
+            coordination_id="release-risk-v1",
+        )
+        print(finding.value)
 ```
 
-`Team` 投递是 at-least-once。如果成员将发起 idempotent 或 external 工作，请提供
-稳定 `message_id=`。下方的双 owner 项目展示完整形状。
+该 handoff 是一个确定性的 ExecutionStore Run；已完成工作直接 replay。过期工作默认
+失败关闭，只有整个成员以 `redelivery_safe=True` 注册时才允许重领。legacy `Team` 只为
+mailbox 示例和已有应用保留。协调 external write 前请先阅读
+[多 Agent 协调](multi-agent.zh-CN.md)。
 
 ## 10. 在审批或中断后恢复同一个 Agent run
 
@@ -326,8 +333,10 @@ timeout 已经提供；跨阶段绝对 deadline 与 durable event catch-up 使�
 | [Daily brief](../examples/04_daily_brief.py) | 第 1–6 章 | 将多个只读来源变成一项运营建议。 |
 | [Safe external operation](../examples/09_external_operation.py) | 第 7–8 章 | idempotency key、失败后的不确定性、reconciliation 和 audit record。 |
 | [Research review Team](../examples/10_research_review_team.py) | 第 9 章 | 两个独立 owner 的 handoff，以及稳定 message identity。 |
+| [多 Agent 协调](../examples/13_multi_agent_coordination.py) | 第 9 章 | ExecutionStore-backed sequential 与 map/reduce 归属，以及 terminal replay。 |
 | [Durable execution](../examples/11_durable_execution.py) | 第 10 章 | 分离的 execution/effect store、持久审批 Interrupt，以及恢复同一个 run。 |
 | [Local task product](../examples/12_local_task_product.py) | 第 10 章 | 隔离的 ChangeSet、命令审批、重启恢复、验证证据、review 与显式 apply。 |
+| [Operator beta](../examples/14_operator_beta.py) | 第 10 章 | 本地 Task/Run projection、确定性故障演练和有界 SQLite transition benchmark。 |
 
 例如，使用本地 Ollama 模型运行前三个：
 

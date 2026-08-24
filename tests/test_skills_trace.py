@@ -10,7 +10,14 @@ from lipas.calculus import Claim
 from lipas.agent import Agent
 from tests.fake_adapter import FakeAdapter
 from lipas.tools import SideEffectClass, ToolRegistry, tool
-from lipas.skills import SkillError, SkillRegistry, discover_skills, load_skill
+from lipas.skills import (
+    SkillError,
+    SkillRegistry,
+    builtin_skills,
+    discover_skills,
+    load_builtin_skill,
+    load_skill,
+)
 from lipas.trace import render_trace, write_jsonl
 
 
@@ -59,6 +66,62 @@ def test_ready_made_example_skills_are_portable_and_distinct():
         "support-triage",
     ]
     assert all(skill.description and skill.instructions for skill in skills)
+
+
+def test_builtin_business_skills_are_explicit_and_authority_honest():
+    skills = builtin_skills()
+    assert [skill.name for skill in skills] == [
+        "business-notice",
+        "business-report",
+        "calendar-planning",
+        "celebration-message",
+        "cloud-drive-operations",
+        "code-review",
+        "coding-task",
+        "document-processing",
+        "email-drafting",
+        "email-operations",
+        "meeting-notes",
+        "personal-letter",
+        "proposal-writing",
+        "release-readiness",
+        "speech-writing",
+        "ticket-triage",
+        "workspace-files",
+    ]
+    assert all(skill.metadata["authority"] for skill in skills)
+    assert "cannot contact" in load_builtin_skill("personal-letter").instructions
+    assert "Sending" in load_builtin_skill("email-drafting").instructions
+    assert "certify figures" in load_builtin_skill("business-report").instructions
+    assert "uncertain" in load_builtin_skill("email-operations").instructions
+
+    registry = SkillRegistry.from_sources(builtin_names=["coding-task"])
+    prompt = registry.system_prompt("Base")
+    assert registry.names == ("coding-task",)
+    assert '<skill name="coding-task">' in prompt
+    assert "email-drafting" not in prompt
+    with pytest.raises(SkillError, match="available"):
+        load_builtin_skill("missing-skill")
+
+    scalar = SkillRegistry.from_sources(builtin_names="email-drafting")
+    assert scalar.names == ("email-drafting",)
+
+
+def test_skill_registry_composes_builtin_and_local_sources(tmp_path):
+    path = tmp_path / "local" / "SKILL.md"
+    path.parent.mkdir()
+    path.write_text(
+        "---\nname: local-review\ndescription: Review local output.\n---\n"
+        "Check the final result.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry.from_sources(
+        builtin_names=["workspace-files"], paths=[path.parent],
+    )
+    assert registry.names == ("workspace-files", "local-review")
+    assert registry.get("local-review").path == path.resolve()
+    with pytest.raises(SkillError, match="not selected"):
+        registry.get("email-drafting")
 
 
 def test_agent_accepts_a_skill_directory_directly(tmp_path):

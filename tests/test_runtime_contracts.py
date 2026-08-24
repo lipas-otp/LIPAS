@@ -230,7 +230,9 @@ def test_input_interrupt_cannot_execute_tool_or_grant_later_approval(tmp_path):
     assert events[-1].type == "run_completed"
 
 
-def test_durable_deadline_returns_same_logical_result_and_settles_run(tmp_path):
+def test_durable_deadline_with_unsettled_model_requires_reconciliation(tmp_path):
+    from lipas import DurableRecoveryRequired
+
     agent = Agent(
         adapter=ScriptedAdapter([final("late")], delay_s=1),
         model="m",
@@ -239,19 +241,19 @@ def test_durable_deadline_returns_same_logical_result_and_settles_run(tmp_path):
     with ExecutionStore(tmp_path / "execution.db") as store:
         task = store.create_task("deadline", tmp_path)
         run = store.create_run(task.id)
-        result = asyncio.run(agent.run_durable(
-            "wait",
-            execution_store=store,
-            run_id=run.id,
-            timeout_s=0.01,
-        ))
+        with pytest.raises(DurableRecoveryRequired):
+            asyncio.run(agent.run_durable(
+                "wait",
+                execution_store=store,
+                run_id=run.id,
+                timeout_s=0.01,
+            ))
         settled = store.get_run(run.id)
         events = store.agent_events(run.id)
     agent.close()
-    assert result.stop_reason == "error"
-    assert result.error["type"] == "deadline_exceeded"
     assert settled.state.value == "failed"
-    assert events[-1].type == "run_completed"
+    assert settled.error["recovery_required"] is True
+    assert events[-1].type == "run_failed"
 
 
 def test_durable_reconnect_sink_failure_does_not_hide_settled_result(tmp_path):
@@ -349,7 +351,7 @@ def test_runtime_repair_restores_execution_audit_to_registered_run_tape(tmp_path
             repaired.store.close()
 
 
-def test_runtime_serializes_concurrent_durable_convenience_calls(tmp_path):
+def test_runtime_runs_concurrent_durable_calls_with_isolated_evidence(tmp_path):
     with LIPASRuntime.open(tmp_path / "state", sandbox="local") as runtime:
         _, first_run = runtime.workbench.create_task("first", tmp_path)
         _, second_run = runtime.workbench.create_task("second", tmp_path)
@@ -365,36 +367,66 @@ def test_runtime_serializes_concurrent_durable_convenience_calls(tmp_path):
         )
 
         async def scenario():
-            return await asyncio.gather(
+            gate = asyncio.Event()
+            arrivals = 0
+
+            async def gated_stream(adapter, request):
+                nonlocal arrivals
+                adapter.seen.append(request)
+                arrivals += 1
+                if arrivals == 2:
+                    gate.set()
+                await gate.wait()
+                reply = adapter.replies.pop(0)
+                for block in reply.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        yield Delta(index=0, text=str(block.get("text", "")))
+                yield Done(reply)
+
+            first_agent.adapter.stream = lambda request: gated_stream(
+                first_agent.adapter, request,
+            )
+            second_agent.adapter.stream = lambda request: gated_stream(
+                second_agent.adapter, request,
+            )
+            return await asyncio.wait_for(asyncio.gather(
                 runtime.run_durable(
                     first_agent, "first", run_id=first_run.id,
                 ),
                 runtime.run_durable(
                     second_agent, "second", run_id=second_run.id,
                 ),
-            )
+            ), timeout=1.0)
 
         try:
             results = asyncio.run(scenario())
+            first_claim_ids = {
+                claim.claim_id for claim in first_agent.rowset.store
+            }
+            second_claim_ids = {
+                claim.claim_id for claim in second_agent.rowset.store
+            }
         finally:
             first_agent.close()
             second_agent.close()
         assert [result.text for result in results] == ["first", "second"]
+        assert runtime.execution is runtime.workbench.execution
+        assert first_claim_ids
+        assert second_claim_ids
+        assert first_claim_ids.isdisjoint(second_claim_ids)
 
 
-def test_runtime_preserves_execution_error_when_reattach_also_fails(
-    tmp_path, monkeypatch,
+def test_runtime_preserves_execution_error_without_mutating_workbench_store(
+    tmp_path,
 ):
     class ExecutionFailure(RuntimeError):
-        pass
-
-    class ReattachFailure(RuntimeError):
         pass
 
     run_claims = None
     with LIPASRuntime.open(tmp_path / "state", sandbox="local") as runtime:
         _, run = runtime.workbench.create_task("fail", tmp_path)
         run_claims = runtime.claims_for_run(run.id)
+        stable_execution = runtime.execution
 
         class FailingAgent:
             rowset = run_claims
@@ -402,31 +434,11 @@ def test_runtime_preserves_execution_error_when_reattach_also_fails(
             async def run_durable(self, *_args, **_kwargs):
                 raise ExecutionFailure("execution failed")
 
-        attach_calls = 0
-        global_attach_calls = 0
-
-        original_attach = runtime.workbench.attach_rowset
-
-        def recording_attach(rowset, *, run_id=None):
-            nonlocal attach_calls
-            attach_calls += 1
-            return original_attach(rowset, run_id=run_id)
-
-        def flaky_global_attach(_rowset):
-            nonlocal global_attach_calls
-            global_attach_calls += 1
-            raise ReattachFailure("reattach failed")
-
-        monkeypatch.setattr(runtime.workbench, "attach_rowset", recording_attach)
-        monkeypatch.setattr(
-            runtime.workbench, "attach_global_rowset", flaky_global_attach,
-        )
         with pytest.raises(ExecutionFailure, match="execution failed"):
             asyncio.run(runtime.run_durable(
                 FailingAgent(), "hello", run_id=run.id,
             ))
-        assert attach_calls == 1
-        assert global_attach_calls == 1
+        assert runtime.execution is stable_execution
     assert run_claims is not None
     run_claims.store.close()
 

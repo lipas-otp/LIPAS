@@ -5,7 +5,7 @@
 This is the one conceptual document for LIPAS. You do not need it to write a
 first agent; start in the [README](../README.md) or the
 [step-by-step tutorial](tutorial.md). Read this when
-you need to know what a durable trace, replay, or Team actually guarantees.
+you need to know what a durable trace, replay, or handoff actually guarantees.
 
 ## Start from the application's need
 
@@ -16,16 +16,16 @@ LIPAS has four execution ideas:
 | `Agent` | One assistant: model, tools, and a reason/act loop | The normal starting point |
 | `@tool` | An explicit Python capability with a declared side-effect class | The assistant needs to read or change something |
 | `ExecutionStore` | Durable Task/Run ownership, checkpoints, cancellation, and approval Interrupts | The same Agent run must survive waiting or process loss |
-| `Team` | A durable handoff boundary between named assistants or functions | Work needs a separate owner, restart boundary, or audit trail |
+| `AgentCoordinator` | ExecutionStore-backed handoffs and bounded policies across named members | Work needs a separate owner, restart boundary, or audit trail |
 
 An Agent can use many tools and make many model calls. That alone does **not**
-call for a Team. Add `ExecutionStore` when the same Agent run needs recovery;
-add a Team only when the next piece of work should survive as
+call for multiple Agents. Add `ExecutionStore` when the same Agent run needs recovery;
+add a coordinator only when the next piece of work should survive as
 a separately owned handoff—for example, a research task handed from a planner
 to an independently restartable researcher, or a payment requiring a distinct
 approval boundary.
 
-Tools are not agents. They are the explicit hands of an Agent. A Team member
+Tools are not agents. They are the explicit hands of an Agent. A coordinator member
 is usually one Agent, but can be a plain async function when no model is
 needed.
 
@@ -68,7 +68,8 @@ Mutable coordination state has a different job and an explicit authority:
 | model/tool Effects, spend, replay, supervision | Agent Claim/Effect session | authoritative evidence |
 | Task, Run, lease, checkpoint, Interrupt | `ExecutionStore` | recoverable transition mirror when a `RowSet` is attached |
 | external-write reconciliation | `OperationJournal` | recoverable transition mirror |
-| Team delivery and acknowledgement | mailbox SQLite database | recoverable transition mirror |
+| coordinator handoff identity, lease, cancellation, terminal result | `ExecutionStore` | the same Task/Run event stream |
+| legacy Team delivery and acknowledgement | mailbox SQLite database | recoverable transition mirror |
 
 Leases and compare-and-swap checkpoints are not forced through Claim merge.
 Their authoritative SQLite transition instead appends a Claim-shaped event to
@@ -88,12 +89,18 @@ Intent is recorded before the live invocation. A result or rejection makes the
 outcome explicit. An intent without either is an **orphan**: an interrupted or
 unknown operation that must be investigated, not silently treated as success.
 
+Model requests carry a stable `request_id` derived from the Effect identity
+when the caller does not provide one. OpenAI-compatible adapters forward it as
+`Idempotency-Key` and `X-Request-ID`; every retry also records an `llm_attempt`
+claim. The final Effect stores aggregate billed usage, including failed retry
+attempts.
+
 Guards and budgets run before the live effect. A denial is still recorded as an
 intent plus a typed rejection. A tool with an `estimate=` must produce finite,
 non-negative estimates before it can run; an invalid or failing estimate is an
 `estimate_invalid` rejection, never a reason to bypass a hard budget. The
 accepted intent snapshots the submitted input. `caused_by` can link an Agent
-effect to its Team message; `compensates` can link a compensating effect to an
+effect to its handoff envelope; `compensates` can link a compensating effect to an
 earlier one.
 
 ## Replay: reproduce decisions without accidentally repeating effects
@@ -139,7 +146,7 @@ session remains the source of truth for model and tool Effects.
 The checkpoint records that session's stable `store_id`; resuming with a
 different claim database fails before any live model or tool call.
 Every authoritative SQLite control store carries an explicit schema version:
-`ExecutionStore`, `OperationJournal`, and the Team mailbox all fail closed when
+`ExecutionStore`, `OperationJournal`, and the legacy Team mailbox all fail closed when
 opened by an incompatible release. If `ExecutionStore` is constructed with
 `rowset=...`, each Task/Run/checkpoint/Interrupt transition is also mirrored
 from its transactional outbox into that Claim tape; the execution database
@@ -176,8 +183,16 @@ repair a crash between a recommendation and its checkpoint without duplicating
 the recommendation. The development line now includes automatic lease
 heartbeats and model/tool phase timeouts. Sync tools leave the event loop;
 cancellation leaves an orphan when the runtime cannot prove that the thread
-stopped. Broader timeout recovery policy remains future work. The recovery
-contract is exercised with a real subprocess
+stopped. A phase timeout persists `recovery_required`; the operator must
+reconcile the Effect/provider, record an observation/evidence object, and
+explicitly reopen the Run before resume. A boolean acknowledgement alone is
+not evidence.
+`ToolHarness.reconcile_orphan()` provides the equivalent explicit closeout for
+a synchronous tool whose thread cannot be force-killed. For an intent-only
+model Effect, `LLMHarness.reconcile_orphan()` records the provider-observed
+`Reply` (or an explicit error observation) without issuing another request.
+The recovery contract
+is exercised with a real subprocess
 `SIGKILL` after a completed write Effect and before its checkpoint: restart
 restores the Effect result and does not execute the write a second time.
 
@@ -192,8 +207,8 @@ cancel-only recovery path.
 
 Several Tasks may execute concurrently, but each Run owns a separate SQLite
 Claim/Effect session. The global execution database owns Task/Run/lease state;
-per-Run sessions own model/tool evidence and budgets. This avoids sharing the
-single-writer Claim sequence or one budget projection across unrelated Tasks.
+per-Run sessions own model/tool evidence and budgets. This avoids sharing one
+hot Claim sequence or budget projection across unrelated Tasks.
 Runs created before this layout retain their checkpoint-bound legacy session.
 
 A Run that suspends for approval becomes `waiting`, drops its lease, and frees
@@ -232,17 +247,34 @@ paths/text, symlinks, oversized files, and common generated caches, and it
 enforces aggregate file/byte limits. This is a bounded safety
 backend, not yet a copy-on-write filesystem or Git worktree transaction.
 
-## Teams: reliable handoff, not a graph DSL
+## Multi-Agent: policies over authoritative Runs
 
-`Team` records handoff, lease, acknowledgement, release, and recovery in its
-own durable session. Delivery is at least once: a crashed member's lease can
-expire and the same stable message can be delivered again. The receiver uses
-the message id as its idempotency/replay key. An acknowledgement is valid only
-while its lease is active; an expired worker cannot acknowledge late work.
+`AgentCoordinator` maps every `HandoffEnvelope` to one deterministic Task/Run
+in `ExecutionStore`. The Run owns the lease, attempt, persisted cancellation,
+terminal value or error, and public handoff events. Reusing one envelope
+identity with different input fails closed; repeating a completed request
+replays its stored JSON-compatible result without invoking the member.
 
-This is intentionally smaller than distributed ownership or a workflow graph.
-Each Agent keeps its own authority and budget today; cross-Team budget sharing,
-capability delegation, and mailbox replay are explicit application work.
+Sequential, RoundRobin, bounded parallel, map/reduce, Selector, and bounded
+Swarm transfer only compose these Runs. They do not own another queue or graph
+projection. Member registration remains host code configuration. Expired work
+is not redelivered unless that member explicitly declares its whole invocation
+`redelivery_safe`; a live lease conflict is visible rather than silently
+retried. Parent cancellation and absolute deadline reach every branch, while a
+persisted `cancel_handoff()` request is observed by heartbeat.
+
+An ordinary `Agent` member receives causality and branch `RunContext`, and its
+own session still records model/tool Effects. A SQLite-backed Agent member is
+bridged differently: its already-claimed coordination Run is passed to
+`Agent.run_durable()`, so checkpoints, Approval/Input Interrupts, heartbeat,
+and Effect recovery share one lease and one authority. An uncertain external
+Effect fails closed. Shared Team budgets, capability delegation, and durable
+nested Agent interrupts still need explicit future policy.
+
+Legacy `Team` continues to expose its mailbox handoff/acknowledgement API for
+existing applications. Its mailbox remains authoritative for that legacy API;
+new orchestration should use `AgentCoordinator` and must not treat both systems
+as authority for one logical handoff. See [Multi-Agent coordination](multi-agent.md).
 
 ## Streaming: one public event protocol
 
@@ -265,12 +297,14 @@ The provider-neutral `Request`, `Reply`, content, usage, and stream-event
 shapes live in `lipas.adapter`. Ollama, injected-client Anthropic, and the
 optional-SDK OpenAI Responses adapter implement those shapes.
 
-The authoritative SQLite state of `OperationJournal` and the Team mailbox
+The authoritative SQLite state of `OperationJournal` and the legacy Team mailbox
 delivery is durable, but their optional Claim audit is a separate transaction.
 Each authoritative mutation appends a Claim-shaped event to an outbox in the
 same SQLite transaction. Constructors and idempotent retry paths call
-`repair_audit()` to replay that outbox with stable Claim ids, so a process stop
-between databases can make the audit temporarily lag but cannot permanently
-lose or duplicate the mirrored event. This is recoverable mirroring, not a
-distributed transaction: callers must still use the journal/mailbox database,
-not presence of a Claim alone, to decide whether an operation or handoff exists.
+a bounded repair batch with stable Claim ids; explicit `repair_audit()` streams
+the complete remainder. A process stop between databases can therefore make
+the audit temporarily lag but cannot permanently lose or duplicate the mirrored
+event. This is recoverable mirroring, not a distributed transaction: callers
+must still use the journal/mailbox database, not presence of a Claim alone, to
+decide whether an operation or legacy handoff exists. Coordinator handoffs are
+already Task/Run facts in `ExecutionStore` and need no mailbox mirror.

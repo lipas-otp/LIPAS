@@ -119,8 +119,11 @@ def test_cancelled_sync_thread_is_uncertain_and_cannot_be_retried(tmp_path):
         )
         assert result.status == "uncertain"
         assert result.detail == {"timeout_s": 0.005, "orphan": True}
-        # asyncio's executor shutdown waits for the unkillable thread. The
-        # late side effect happened, but no false terminal Effect was written.
+        # The bounded process executor lets the timeout return promptly. The
+        # unkillable thread can still finish later, but no false terminal
+        # Effect is written in the meantime.
+        assert completed in ([], ["late"])
+        time.sleep(0.06)
         assert completed == ["late"]
         with pytest.raises(OrphanedEffectError):
             gateway.call_sync(

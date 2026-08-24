@@ -103,19 +103,21 @@ async def run_demo(root: Path = Path("runs")) -> None:
             tools=workbench.workspace_tools(task.id, run.id),
             session_path=claims_path,
         ) as agent:
-            workbench.attach_rowset(agent.rowset, run_id=run.id)
-            try:
-                await agent.run_durable(
-                    task.goal,
-                    execution_store=workbench.execution,
-                    run_id=run.id,
-                    approval_policy=workbench.approval_policy(task.id),
-                )
-            except RunSuspended as suspended:
-                workbench.record_approval_required(suspended.interrupt)
-                approval_id = suspended.interrupt.id
-            else:  # pragma: no cover - command execution always needs approval
-                raise AssertionError("verification command should require approval")
+            with workbench.execution_scope(agent.rowset, run_id=run.id) as execution:
+                try:
+                    await agent.run_durable(
+                        task.goal,
+                        execution_store=execution,
+                        run_id=run.id,
+                        approval_policy=workbench.approval_policy(task.id),
+                    )
+                except RunSuspended as suspended:
+                    workbench.record_approval_required(suspended.interrupt)
+                    approval_id = suspended.interrupt.id
+                else:  # pragma: no cover - command always needs approval
+                    raise AssertionError(
+                        "verification command should require approval",
+                    )
 
         change_set = workbench.change_set(task.id)
         assert change_set is not None
@@ -139,12 +141,12 @@ async def run_demo(root: Path = Path("runs")) -> None:
             tools=workbench.workspace_tools(task.id, run.id),
             session_path=workbench.claims_path_for_run(run.id),
         ) as agent:
-            workbench.attach_rowset(agent.rowset, run_id=run.id)
-            result = await agent.resume_durable(
-                execution_store=workbench.execution,
-                run_id=run.id,
-                approval_policy=workbench.approval_policy(task.id),
-            )
+            with workbench.execution_scope(agent.rowset, run_id=run.id) as execution:
+                result = await agent.resume_durable(
+                    execution_store=execution,
+                    run_id=run.id,
+                    approval_policy=workbench.approval_policy(task.id),
+                )
 
         report = workbench.build_report(task.id, result)
         print("original before apply:", original.read_text().strip())

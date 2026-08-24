@@ -2,7 +2,7 @@
 
 > 语言：[English](model-providers.md) | [中文](model-providers.zh-CN.md)
 
-LIPAS 0.32 可以使用实现 OpenAI-compatible Chat Completions 契约的 provider。接入时
+LIPAS 0.40 延续 0.32 的 provider 边界，可以使用实现 OpenAI-compatible Chat Completions 契约的 provider。接入时
 有意要求显式提供 URL、model name 与 credential：LIPAS 不猜测 provider，不静默替换
 模型，也不会 fallback 到另一个端点。
 

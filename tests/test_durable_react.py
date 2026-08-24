@@ -5,6 +5,7 @@ import asyncio
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from lipas import (
     Agent,
     DurablePhaseTimeout,
+    DurableRecoveryRequired,
     ExecutionStateError,
     ExecutionStore,
     RunState,
@@ -187,6 +189,16 @@ def test_model_phase_timeout_is_typed_and_fails_the_run(tmp_path):
         assert raised.value.phase == "model"
         failed = store.get_run(run.id)
         assert failed is not None and failed.state is RunState.FAILED
+        assert failed.error is not None
+        assert failed.error["recovery_required"] is True
+        reopened = store.reopen_uncertain(
+            run.id,
+            evidence={
+                "source": "test",
+                "observation": "provider lookup confirmed no terminal outcome",
+            },
+        )
+        assert reopened.state is RunState.PENDING
 
 
 def test_automatic_heartbeat_continues_during_a_slow_sync_tool(tmp_path):
@@ -326,7 +338,10 @@ def test_durable_runner_keeps_writes_serial(tmp_path):
             agent.close()
 
     assert result.text == "done"
-    assert calls == ["first", "second"]
+    # Parallel read handlers may enter their worker threads in either order;
+    # the durable contract is exactly-once execution and ordered tool-result
+    # folding, not an incidental thread-scheduling order.
+    assert sorted(calls) == ["first", "second"]
     assert maximum_active == 1
 
 
@@ -408,7 +423,7 @@ def test_parallel_read_results_recover_after_checkpoint_crash(tmp_path):
         store.save_checkpoint = original_save  # type: ignore[method-assign]
         first.close()
 
-    assert calls == ["first", "second"]
+    assert sorted(calls) == ["first", "second"]
     replacement = _reclaim(store, pending.id)
     second = Agent(
         adapter=FakeAdapter.from_replies([_final_reply("recovered")]),
@@ -618,6 +633,61 @@ def test_durable_runner_observes_cancel_before_next_external_call(tmp_path):
         terminal = store.get_checkpoint(pending.id)
         assert terminal is not None and terminal.phase == "terminal"
         assert terminal.state["final_result"]["stop_reason"] == "cancelled"
+
+
+def test_cancel_during_unsettled_sync_tool_requires_recovery(tmp_path):
+    started = threading.Event()
+
+    @tool(side_effect="idempotent_write")
+    def slow_write(text: str) -> str:
+        """Remain in-flight long enough for logical cancellation to race it."""
+        started.set()
+        # Keep the thread in-flight across several RunContext polling
+        # intervals. A very short sleep can legitimately settle before
+        # cooperative cancellation is observed, which is a different
+        # (ordinary cancelled) contract.
+        time.sleep(0.5)
+        return text
+
+    tool_reply = Reply(
+        content=({
+            "type": "tool_use",
+            "id": "tool_aaaaaaaaaaaa",
+            "name": "slow_write",
+            "input": {"text": "saved"},
+        },),
+        usage=Usage(input=2, output=1),
+        stop_reason="tool_use",
+        model="fake",
+    )
+
+    with ExecutionStore(tmp_path / "execution.db") as store:
+        _, run = _task_run(store, tmp_path)
+        agent = Agent(
+            adapter=FakeAdapter.from_replies([tool_reply, _final_reply()]),
+            model="fake",
+            tools=[slow_write],
+            session_path=tmp_path / "claims.db",
+        )
+
+        async def scenario() -> None:
+            running = asyncio.create_task(agent.run_durable(
+                "write", execution_store=store, run_id=run.id,
+                lease_seconds=1.0, heartbeat_interval_s=0.1,
+            ))
+            await asyncio.to_thread(started.wait, 1.0)
+            store.request_cancel(run.id)
+            with pytest.raises(DurableRecoveryRequired):
+                await running
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            agent.close()
+        failed = store.get_run(run.id)
+        assert failed is not None and failed.state is RunState.FAILED
+        assert failed.error is not None
+        assert failed.error["recovery_required"] is True
 
 
 def test_cancelled_terminal_run_can_restore_its_result(tmp_path):
@@ -1385,6 +1455,43 @@ def test_forced_process_stop_restores_completed_write_without_repeating_it(tmp_p
     with ExecutionStore(execution_path) as store:
         finished = store.get_run(run.id)
         assert finished is not None and finished.state is RunState.COMPLETED
+
+
+@pytest.mark.parametrize("phase", ["before_llm", "after_llm", "after_tool", "terminal"])
+def test_forced_process_stop_at_every_react_checkpoint_is_recoverable(tmp_path, phase):
+    """Each model/tool phase either replays or executes the write exactly once."""
+    project_root = Path(__file__).resolve().parents[1]
+    execution_path = tmp_path / "execution.db"
+    with ExecutionStore(execution_path) as store:
+        task = store.create_task(f"phase {phase}", tmp_path)
+        run = store.create_run(task.id, run_id=f"run-{phase}")
+
+    crashed = subprocess.run(
+        [
+            sys.executable, "-m", "tests.durable_process_worker", "crash",
+            str(tmp_path), run.id, phase,
+        ], cwd=project_root, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert crashed.returncode < 0, (phase, crashed.stderr)
+
+    with ExecutionStore(execution_path) as store:
+        stale = store.get_run(run.id)
+        assert stale is not None and stale.lease_expires is not None
+        delay = stale.lease_expires - time.time() + 0.02
+    if delay > 0:
+        time.sleep(delay)
+
+    resumed = subprocess.run(
+        [
+            sys.executable, "-m", "tests.durable_process_worker", "resume",
+            str(tmp_path), run.id, phase,
+        ], cwd=project_root, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert resumed.returncode == 0, (phase, resumed.stderr)
+    assert resumed.stdout.strip() == "recovered"
+    assert (tmp_path / "write-attempts.log").read_text(encoding="utf-8").splitlines() == [
+        "persisted once",
+    ]
 
 
 def test_denied_approval_restores_cancelled_result_without_live_work(tmp_path):
