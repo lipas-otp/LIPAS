@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import uuid
+import math
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -59,7 +60,13 @@ from lipas.adapter.protocol import LLMAdapter, StreamProtocolError
 from lipas.adapter.types import Done, StreamEvent
 
 from lipas.calculus import Claim
-from lipas.effect import EffectKind, LLMTarget
+from lipas.effect import (
+    EffectDecision,
+    EffectKind,
+    EffectObservation,
+    EffectProposal,
+    LLMTarget,
+)
 from lipas.exceptions import OrphanedEffectError
 from lipas.guard import Guard, GuardVerdict
 from lipas.replay import ReplayCursor
@@ -74,8 +81,8 @@ from lipas.rows.capability import (
 from lipas.rows.effect import (
     EffectRow,
     F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DETAIL, F_EFFECT_ID, F_ERROR,
-    F_KIND, F_MODEL, F_REASON, F_REPLY, F_REQUEST, F_STATUS, F_TOTAL_USAGE,
-    F_PROVIDER_REQUEST_ID,
+    F_KIND, F_MODEL, F_PROPOSAL_ID, F_REASON, F_REPLY,
+    F_REQUEST, F_STATUS, F_TOTAL_USAGE, F_PROVIDER_REQUEST_ID,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
 
@@ -100,9 +107,15 @@ def default_bucket_extractor(reply: Reply) -> dict[str, float]:
     out: dict[str, float] = {}
     total_input = u.input + u.cache_read + u.cache_write
     if total_input:
-        out["tokens_in"] = float(total_input)
+        try:
+            out["tokens_in"] = float(total_input)
+        except OverflowError as exc:
+            raise ValueError("token usage exceeds finite accounting range") from exc
     if u.output:
-        out["tokens_out"] = float(u.output)
+        try:
+            out["tokens_out"] = float(u.output)
+        except OverflowError as exc:
+            raise ValueError("token usage exceeds finite accounting range") from exc
     return out
 
 
@@ -206,23 +219,95 @@ class LLMHarness:
         effect_id: str | None = None,
         _replay_call_id: str | None = None,
         stream_sink: Callable[[StreamEvent], Awaitable[None] | None] | None = None,
+        proposal: EffectProposal | None = None,
+        admission: EffectDecision | None = None,
     ) -> Reply:
         """Execute one LLM call.
 
         See module docstring for the full pre-flight order.
         """
+        if not isinstance(request, Request):
+            raise TypeError("request must be an adapter Request")
+        if effect_id is not None and (
+            not isinstance(effect_id, str) or not effect_id.strip()
+        ):
+            raise ValueError("effect_id must be a non-empty string or None")
+        if _replay_call_id is not None and (
+            not isinstance(_replay_call_id, str) or not _replay_call_id.strip()
+        ):
+            raise ValueError("_replay_call_id must be a non-empty string or None")
+        if effect_id is not None:
+            effect_id = effect_id.strip()
+        if _replay_call_id is not None:
+            _replay_call_id = _replay_call_id.strip()
+        if proposal is not None and not isinstance(proposal, EffectProposal):
+            raise TypeError("proposal must be EffectProposal or None")
+        if admission is not None and not isinstance(admission, EffectDecision):
+            raise TypeError("admission must be EffectDecision or None")
+        if (
+            proposal is not None
+            and proposal.caused_by is not None
+            and caused_by is not None
+            and proposal.caused_by != caused_by
+        ):
+            raise ValueError("caused_by conflicts with proposal.caused_by")
+        if proposal is not None and caused_by is None:
+            caused_by = proposal.caused_by
+        proposal_claim_id = (
+            proposal.claim_id(EffectKind.LLM_CALL) if proposal is not None else None
+        )
+        proposal_id = proposal.effect_id if proposal is not None else None
+        if effect_id is not None and proposal_claim_id is not None and effect_id not in {
+            proposal_id, proposal_claim_id,
+        }:
+            raise ValueError("effect_id conflicts with proposal.effect_id")
+        if effect_id is not None and _replay_call_id is not None:
+            raise ValueError("pass effect_id or _replay_call_id, not both")
+        effect_id = (
+            proposal_claim_id or effect_id or _replay_call_id
+            or f"call_{uuid.uuid4().hex[:12]}"
+        )
+        if request.request_id is None:
+            request = replace(request, request_id=effect_id)
+        recovered = self._recover_existing(
+            effect_id, request, proposal=proposal, caused_by=caused_by,
+        )
+        if recovered is not None:
+            return recovered
+        if admission is not None and not admission.allowed:
+            return self._record_rejection(
+                effect_id=effect_id, request=request,
+                compensates=compensates, caused_by=caused_by,
+                rejection=admission, proposal=proposal,
+            )
+        # Ordinary transcript replay intentionally folds nothing. A
+        # product-level proposal is different: execute_effect() promises a
+        # durable proposal -> observation chain, so materialise the replayed
+        # reply on this target tape after Runtime admission. This also keeps
+        # an explicit admission denial from being bypassed by replay.
+        if (
+            proposal is not None or admission is not None
+        ) and self.replay_cursor is not None and not self.replay_cursor.exhausted():
+            self._fold_intent(
+                effect_id, request, compensates, caused_by, proposal=proposal,
+            )
+            replay_reply = self.replay_cursor.advance(request)
+            replay_outcome = RetryOutcome(
+                reply=replay_reply,
+                attempts=1,
+                total_usage=replay_reply.usage,
+            )
+            self._fold_result(effect_id, replay_outcome)
+            if replay_reply.stop_reason != "error" or replay_reply.usage.total:
+                self._fold_spend(
+                    effect_id,
+                    replace(replay_reply, usage=replay_outcome.billed_usage),
+                    pricing_model=request.model,
+                )
+            return replay_reply
         # 0. Replay short-circuit (P2.7). NO folds happen on this path.
         if self.replay_cursor is not None and not self.replay_cursor.exhausted():
             return self.replay_cursor.advance(request)
-
-        if effect_id is not None and _replay_call_id is not None:
-            raise ValueError("pass effect_id or _replay_call_id, not both")
-        effect_id = effect_id or _replay_call_id or f"call_{uuid.uuid4().hex[:12]}"
-        if request.request_id is None:
-            request = replace(request, request_id=effect_id)
-        recovered = self._recover_existing(effect_id, request)
-        if recovered is not None:
-            return recovered
         # Guards are observers. Give them an isolated copy so an accidental
         # mutation in policy code cannot rewrite the request that is admitted
         # or sent to a provider.
@@ -241,6 +326,7 @@ class LLMHarness:
             return self._record_rejection(
                 effect_id=effect_id, request=request,
                 compensates=compensates, caused_by=caused_by, rejection=bud_rej,
+                proposal=proposal,
             )
 
         # 2. Pre-flight: guards (P2.8 / P3.0).
@@ -249,10 +335,11 @@ class LLMHarness:
             return self._record_rejection(
                 effect_id=effect_id, request=request,
                 compensates=compensates, caused_by=caused_by, rejection=guard_rej,
+                proposal=proposal,
             )
 
         # 3. Record intent.
-        self._fold_intent(effect_id, request, compensates, caused_by)
+        self._fold_intent(effect_id, request, compensates, caused_by, proposal=proposal)
 
         # 4. Drive the adapter.
         outcome: RetryOutcome = await call_with_retry(
@@ -278,6 +365,76 @@ class LLMHarness:
             )
 
         return reply
+
+    def observation(self, effect_id: str) -> EffectObservation:
+        """Project the durable Effect tape into a truthful observation."""
+        claim_id, node = self._find_node(effect_id)
+        if node is None:
+            raise OrphanedEffectError(f"LLM effect {effect_id!r} has no intent")
+        if node.result is not None:
+            reply = node.result.fields.get(F_REPLY)
+            status = (
+                "succeeded" if node.result.fields.get(F_STATUS) == "ok" else "failed"
+            )
+            evidence: dict[str, Any] = {
+                "claim_effect_id": claim_id,
+                "attempts": node.result.fields.get(F_ATTEMPTS),
+                "provider_request_id": node.intent.fields.get(F_PROVIDER_REQUEST_ID),
+            }
+            if F_ERROR in node.result.fields:
+                evidence["error"] = deepcopy(node.result.fields[F_ERROR])
+            return EffectObservation(
+                effect_id,
+                status,
+                result=deepcopy(reply),
+                evidence=evidence,
+                claim_id=claim_id,
+            )
+        if node.rejection is not None:
+            return EffectObservation(
+                effect_id,
+                "rejected",
+                evidence={
+                    "claim_effect_id": claim_id,
+                    "reason": node.rejection.fields.get(F_REASON),
+                    "detail": node.rejection.fields.get(F_DETAIL, {}),
+                },
+                claim_id=claim_id,
+            )
+        return EffectObservation(
+            effect_id,
+            "uncertain",
+            evidence={"claim_effect_id": claim_id, "state": "orphan"},
+            claim_id=claim_id,
+        )
+
+    def _find_node(self, effect_id: str) -> tuple[str, Any]:
+        if not isinstance(effect_id, str) or not effect_id.strip():
+            raise ValueError("effect_id must be a non-empty string")
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
+        )
+        if effect_row is None:
+            raise OrphanedEffectError(f"LLM effect {effect_id!r} is not recorded")
+        projection = effect_row.project(self.rowset.store)
+        node = projection.nodes.get(effect_id)
+        if node is not None:
+            if node.kind is not EffectKind.LLM_CALL:
+                raise ValueError(f"effect id {effect_id!r} belongs to a non-LLM effect")
+            return effect_id, node
+        matches = [
+            (claim_id, candidate)
+            for claim_id, candidate in projection.nodes.items()
+            if (
+                candidate.kind is EffectKind.LLM_CALL
+                and candidate.intent.fields.get(F_PROPOSAL_ID) == effect_id
+            )
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"proposal id {effect_id!r} is ambiguous")
+        raise OrphanedEffectError(f"LLM effect {effect_id!r} is not recorded")
 
     def reconcile_orphan(
         self,
@@ -312,13 +469,8 @@ class LLMHarness:
             raise ValueError("attempts must be a positive int")
         if total_usage is not None and not isinstance(total_usage, Usage):
             raise TypeError("total_usage must be Usage or None")
-        effect_row = next(
-            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
-        )
-        if effect_row is None:
-            raise OrphanedEffectError(f"LLM effect {effect_id!r} is not recorded")
-        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
-        if node is None or node.intent is None:
+        claim_id, node = self._find_node(effect_id)
+        if node.intent is None:
             raise OrphanedEffectError(f"LLM effect {effect_id!r} has no intent")
         if node.kind is not EffectKind.LLM_CALL:
             raise ValueError(f"effect id {effect_id!r} belongs to a non-LLM effect")
@@ -356,16 +508,23 @@ class LLMHarness:
             attempts=attempts,
             total_usage=total_usage or reply.usage,
         )
-        self._fold_result(effect_id, outcome)
+        self._fold_result(claim_id, outcome)
         if reply.stop_reason != "error" or outcome.billed_usage.total:
             self._fold_spend(
-                effect_id,
+                claim_id,
                 replace(reply, usage=outcome.billed_usage),
                 pricing_model=model,
             )
         return deepcopy(reply)
 
-    def _recover_existing(self, effect_id: str, request: Request) -> Reply | None:
+    def _recover_existing(
+        self,
+        effect_id: str,
+        request: Request,
+        *,
+        proposal: EffectProposal | None = None,
+        caused_by: str | None = None,
+    ) -> Reply | None:
         """Return an already-recorded terminal call without live submission."""
         effect_row = next(
             (row for row in self.rowset.rows if isinstance(row, EffectRow)),
@@ -378,6 +537,18 @@ class LLMHarness:
             return None
         if node.kind is not EffectKind.LLM_CALL:
             raise ValueError(f"effect id {effect_id!r} belongs to a non-LLM effect")
+        if proposal is not None:
+            proposal_fields = proposal.claim_fields()
+            for key in (*proposal_fields, F_CAUSED_BY):
+                if node.intent.fields.get(key) != proposal_fields.get(key):
+                    raise ValueError(
+                        f"effect id {effect_id!r} was reused with different proposal provenance",
+                    )
+        recorded_caused_by = node.intent.fields.get(F_CAUSED_BY)
+        if recorded_caused_by != caused_by:
+            raise ValueError(
+                f"effect id {effect_id!r} was reused with different causation",
+            )
         recorded_request = node.intent.fields.get(F_REQUEST)
         if (
             not isinstance(recorded_request, Request)
@@ -476,18 +647,24 @@ class LLMHarness:
 
         estimate = await estimate_fn()
 
-        upper: dict[str, float] = {
-            "tokens_in":  float(estimate.input_tokens),
-            "tokens_out": float(estimate.max_output_tokens),
-            "cost_usd":   float(estimate.max_cost_usd),
-        }
+        try:
+            upper: dict[str, float] = {
+                "tokens_in":  float(estimate.input_tokens),
+                "tokens_out": float(estimate.max_output_tokens),
+                "cost_usd":   float(estimate.max_cost_usd),
+            }
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("resource estimate exceeds finite accounting range") from exc
+        if any(not math.isfinite(value) or value < 0 for value in upper.values()):
+            raise ValueError("resource estimate must contain finite non-negative values")
 
         proj = cap.project(self.rowset.store)
         for bucket, est_amount in upper.items():
             if bucket not in cap.budgets:
                 continue
             info = proj[bucket]
-            if info["spent"] + est_amount > info["limit"]:
+            projected = info["spent"] + est_amount
+            if not math.isfinite(projected) or projected > info["limit"]:
                 return BudgetRejection(
                     bucket=bucket,
                     spent=info["spent"],
@@ -538,6 +715,8 @@ class LLMHarness:
         request: Request,
         compensates: str | None,
         caused_by: str | None,
+        *,
+        proposal: EffectProposal | None = None,
     ) -> None:
         intent_fields: dict = {
             F_EFFECT_ID: effect_id,
@@ -553,6 +732,8 @@ class LLMHarness:
             intent_fields[F_COMPENSATES] = compensates
         if caused_by is not None:
             intent_fields[F_CAUSED_BY] = caused_by
+        if proposal is not None:
+            intent_fields.update(proposal.claim_fields())
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=intent_fields,
@@ -573,7 +754,13 @@ class LLMHarness:
             fields={
                 F_EFFECT_ID: effect_id,
                 F_KIND: EffectKind.LLM_CALL.value,
-                F_PROVIDER_REQUEST_ID: request.request_id or effect_id,
+                # The canonical intent keeps the logical request identity;
+                # each provider attempt gets its own derived identity so
+                # billing/retry reconciliation cannot collapse attempts into
+                # one ambiguous record.
+                F_PROVIDER_REQUEST_ID: self._attempt_provider_request_id(
+                    request.request_id or effect_id, attempt,
+                ),
                 "attempt": attempt,
                 "status": "error" if reply.stop_reason == "error" else "ok",
                 "error_kind": None if kind is None else kind.value,
@@ -618,7 +805,10 @@ class LLMHarness:
         *,
         pricing_model: str | None = None,
     ) -> None:
-        buckets = self.bucket_extractor(reply)
+        try:
+            buckets = _normalize_buckets(self.bucket_extractor(reply))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"bucket extractor returned invalid accounting: {exc}") from exc
         prices = getattr(self.adapter, "prices", None)
         if prices is not None and "cost_usd" not in buckets:
             try:
@@ -630,10 +820,12 @@ class LLMHarness:
                     pricing_model or reply.model,
                 )
             else:
-                buckets = {
-                    **buckets,
-                    "cost_usd": float(price.cost(reply.usage)),
-                }
+                try:
+                    priced = float(price.cost(reply.usage))
+                except (OverflowError, ValueError, TypeError) as exc:
+                    raise ValueError("model cost exceeds finite accounting range") from exc
+                buckets = {**buckets, "cost_usd": priced}
+                buckets = _normalize_buckets(buckets)
         if not buckets:
             return
 
@@ -652,12 +844,10 @@ class LLMHarness:
             ):
                 continue
 
-            is_overrun = (
-                cap is not None
-                and proj is not None
-                and bucket in cap.budgets
-                and proj[bucket]["spent"] + amount > proj[bucket]["limit"]
-            )
+            is_overrun = False
+            if cap is not None and proj is not None and bucket in cap.budgets:
+                projected = proj[bucket]["spent"] + amount
+                is_overrun = not math.isfinite(projected) or projected > proj[bucket]["limit"]
 
             if is_overrun:
                 logger.warning(
@@ -695,6 +885,14 @@ class LLMHarness:
         ).hexdigest()[:24]
         return f"spend_{digest}"
 
+    @staticmethod
+    def _attempt_provider_request_id(base: str, attempt: int) -> str:
+        if not isinstance(base, str) or not base.strip():
+            raise ValueError("provider request identity must be non-empty")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("attempt must be a positive int")
+        return f"{base.strip()}:attempt:{attempt}"
+
     # ── rejection path (shared P2.6 / P2.8) ────────────────────
 
     def _record_rejection(
@@ -704,17 +902,26 @@ class LLMHarness:
         request: Request,
         compensates: str | None,
         caused_by: str | None,
-        rejection: BudgetRejection | GuardRejection,
+        rejection: BudgetRejection | GuardRejection | EffectDecision,
+        proposal: EffectProposal | None = None,
     ) -> Reply:
         """Fold effect_intent + effect_rejected; return synthesized Reply."""
-        self._fold_intent(effect_id, request, compensates, caused_by)
+        self._fold_intent(
+            effect_id, request, compensates, caused_by, proposal=proposal,
+        )
+        if isinstance(rejection, EffectDecision):
+            reason = rejection.reason
+            detail = {"policy": rejection.policy, **dict(rejection.detail)}
+        else:
+            reason = rejection.reason
+            detail = rejection.as_detail()
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_REJECTED,
             fields={
                 F_EFFECT_ID: effect_id,
                 F_KIND:      EffectKind.LLM_CALL.value,
-                F_REASON:    rejection.reason,
-                F_DETAIL:    rejection.as_detail(),
+                F_REASON:    reason,
+                F_DETAIL:    detail,
             },
             source="harness.call",
         ))
@@ -723,8 +930,14 @@ class LLMHarness:
     @staticmethod
     def _synthesize_rejection_reply(
         request: Request,
-        rejection: BudgetRejection | GuardRejection,
+        rejection: BudgetRejection | GuardRejection | EffectDecision,
     ) -> Reply:
+        if isinstance(rejection, EffectDecision):
+            reason = rejection.reason
+            detail = {"policy": rejection.policy, **dict(rejection.detail)}
+        else:
+            reason = rejection.reason
+            detail = rejection.as_detail()
         return Reply(
             content=(),
             usage=Usage(),
@@ -732,7 +945,30 @@ class LLMHarness:
             model=request.model,
             error_detail={
                 "type":   "preflight_rejection",
-                "reason": rejection.reason,
-                **rejection.as_detail(),
+                "reason": reason,
+                **detail,
             },
         )
+
+
+def _normalize_buckets(value: Mapping[str, Any]) -> dict[str, float]:
+    """Validate accounting buckets before folding resource claims."""
+    if not isinstance(value, Mapping):
+        raise TypeError("bucket extractor must return a mapping")
+    normalized: dict[str, float] = {}
+    for bucket, amount in value.items():
+        if not isinstance(bucket, str) or not bucket.strip():
+            raise ValueError("bucket names must be non-empty strings")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise ValueError("bucket amounts must be finite non-negative numbers")
+        try:
+            numeric = float(amount)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError("bucket amounts must be finite non-negative numbers") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError("bucket amounts must be finite non-negative numbers")
+        key = bucket.strip()
+        if key in normalized:
+            raise ValueError(f"duplicate bucket {key!r}")
+        normalized[key] = numeric
+    return normalized

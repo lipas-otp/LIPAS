@@ -87,7 +87,13 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from lipas.calculus import Claim
-from lipas.effect import EffectKind, ToolTarget
+from lipas.effect import (
+    EffectDecision,
+    EffectKind,
+    EffectObservation,
+    EffectProposal,
+    ToolTarget,
+)
 from lipas.exceptions import OrphanedEffectError
 from lipas.guard import Guard, GuardVerdict
 from lipas.replay_tools import (
@@ -107,8 +113,8 @@ from lipas.rows.capability import (
 from lipas.rows.effect import (
     EffectRow,
     F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
-    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_OUTPUT, F_REASON, F_SPEND,
-    F_SIDE_EFFECT, F_STATUS, F_TOOL_NAME,
+    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_OUTPUT,
+    F_PROPOSAL_ID, F_REASON, F_SPEND, F_SIDE_EFFECT, F_STATUS, F_TOOL_NAME,
     TAG_EFFECT_INTENT, TAG_EFFECT_REJECTED, TAG_EFFECT_RESULT,
 )
 from lipas.tools import Tool, ToolNotFoundError, ToolRegistry
@@ -289,6 +295,8 @@ class ToolHarness:
         tool_use_id: str | None = None,
         compensates: str | None = None,
         caused_by: str | None = None,
+        proposal: EffectProposal | None = None,
+        admission: EffectDecision | None = None,
     ) -> dict:
         """Execute one tool call.
 
@@ -316,16 +324,56 @@ class ToolHarness:
         ReplayRefused (LIVE_REROUTE refusing EXTERNAL_WRITE) when the
         replay layer terminates the session.
         """
-        eid = effect_id or f"tool_{uuid.uuid4().hex[:12]}"
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("tool_name must be a non-empty string")
+        tool_name = tool_name.strip()
+        if not isinstance(arguments, Mapping):
+            raise TypeError("arguments must be a mapping")
+        if effect_id is not None and (
+            not isinstance(effect_id, str) or not effect_id.strip()
+        ):
+            raise ValueError("effect_id must be a non-empty string or None")
+        if tool_use_id is not None and (
+            not isinstance(tool_use_id, str) or not tool_use_id.strip()
+        ):
+            raise ValueError("tool_use_id must be a non-empty string or None")
+        if effect_id is not None:
+            effect_id = effect_id.strip()
+        if tool_use_id is not None:
+            tool_use_id = tool_use_id.strip()
+        if proposal is not None and not isinstance(proposal, EffectProposal):
+            raise TypeError("proposal must be EffectProposal or None")
+        if admission is not None and not isinstance(admission, EffectDecision):
+            raise TypeError("admission must be EffectDecision or None")
+        if (
+            proposal is not None
+            and proposal.caused_by is not None
+            and caused_by is not None
+            and proposal.caused_by != caused_by
+        ):
+            raise ValueError("caused_by conflicts with proposal.caused_by")
+        if proposal is not None and caused_by is None:
+            caused_by = proposal.caused_by
+        proposal_claim_id = (
+            proposal.claim_id(EffectKind.TOOL_CALL) if proposal is not None else None
+        )
+        proposal_id = proposal.effect_id if proposal is not None else None
+        if effect_id is not None and proposal_claim_id is not None and effect_id not in {
+            proposal_id, proposal_claim_id,
+        }:
+            raise ValueError("effect_id conflicts with proposal.effect_id")
+        eid = proposal_claim_id or effect_id or f"tool_{uuid.uuid4().hex[:12]}"
         result_id = tool_use_id or eid
         # A tool receives its own nested copy. This prevents a mutating client
         # from changing either the caller's mapping or the recorded intent.
         args = deepcopy(dict(arguments))
 
-        recovered = self._recover_existing(eid, result_id, tool_name, args)
+        recovered = self._recover_existing(
+            eid, result_id, tool_name, args, proposal=proposal,
+            caused_by=caused_by,
+        )
         if recovered is not None:
             return recovered
-
         # ── 0. Resolve tool ─────────────────────────────────
         try:
             tool = self.tools.get(tool_name)
@@ -334,7 +382,9 @@ class ToolHarness:
                 tool_name=tool_name,
                 available=tuple(self.tools.names()),
             )
-            self._fold_intent_unknown(eid, tool_name, args, compensates, caused_by)
+            self._fold_intent_unknown(
+                eid, tool_name, args, compensates, caused_by, proposal=proposal,
+            )
             self._fold_rejection(eid, rej)
             return self._tool_result(
                 result_id,
@@ -342,6 +392,37 @@ class ToolHarness:
                 f"{', '.join(rej.available) or '<none>'}",
                 is_error=True,
             )
+
+        if admission is not None and not admission.allowed:
+            self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
+            self._fold_admission_rejection(eid, admission)
+            return self._tool_result(
+                result_id,
+                f"Runtime admission denied: {admission.reason}",
+                is_error=True,
+            )
+
+        if proposal is not None:
+            declared_rank = _proposal_risk_rank(proposal.risk)
+            actual_rank = _tool_side_effect_rank(tool.side_effect.value)
+            if declared_rank is None or declared_rank < actual_rank:
+                mismatch = EffectDecision(
+                    False,
+                    "risk_mismatch",
+                    detail={
+                        "declared": proposal.risk,
+                        "actual": tool.side_effect.value,
+                    },
+                )
+                self._fold_intent(
+                    eid, tool, args, compensates, caused_by, proposal=proposal,
+                )
+                self._fold_admission_rejection(eid, mismatch)
+                return self._tool_result(
+                    result_id,
+                    f"Runtime admission denied: {mismatch.reason}",
+                    is_error=True,
+                )
 
         # ── 0a. Replay decision (P3.2 / RFC-001 §6.2) ──────
         # Inserted BEFORE schema gate so substitute paths bypass
@@ -385,10 +466,14 @@ class ToolHarness:
             if decision.operation == "substitute":
                 return self._do_replay_substitute(
                     eid, result_id, tool, args, compensates, caused_by, decision,
+                    proposal=proposal,
                 )
 
             if decision.operation == "refuse":
-                self._do_replay_refuse(eid, tool, args, compensates, caused_by, decision)
+                self._do_replay_refuse(
+                    eid, tool, args, compensates, caused_by, decision,
+                    proposal=proposal,
+                )
                 # _do_replay_refuse always raises; this point is unreachable.
 
             # decision.operation == "re-execute": fall through to the
@@ -406,7 +491,7 @@ class ToolHarness:
             args = deepcopy(dict(bound.arguments))
         except TypeError as e:
             schema_rej = SchemaRejection(tool_name=tool.name, detail=str(e))
-            self._fold_intent(eid, tool, args, compensates, caused_by)
+            self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
             self._fold_rejection(eid, schema_rej)
             return self._tool_result(
                 result_id, f"Schema violation: {e}", is_error=True,
@@ -419,7 +504,7 @@ class ToolHarness:
         # ── 2. Guard gate ───────────────────────────────────
         guard_rej = await self._preflight_guards(target)
         if guard_rej is not None:
-            self._fold_intent(eid, tool, args, compensates, caused_by)
+            self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
             self._fold_rejection(eid, guard_rej)
             return self._tool_result(
                 result_id,
@@ -431,7 +516,7 @@ class ToolHarness:
         # ── 3. Budget gate ──────────────────────────────────
         estimate, estimate_rej = self._estimate_dict(tool, args)
         if estimate_rej is not None:
-            self._fold_intent(eid, tool, args, compensates, caused_by)
+            self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
             self._fold_rejection(eid, estimate_rej)
             return self._tool_result(
                 result_id,
@@ -441,7 +526,7 @@ class ToolHarness:
         assert estimate is not None
         bud_rej  = self._preflight_budget(estimate)
         if bud_rej is not None:
-            self._fold_intent(eid, tool, args, compensates, caused_by)
+            self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
             self._fold_rejection(eid, bud_rej)
             return self._tool_result(
                 result_id,
@@ -451,7 +536,7 @@ class ToolHarness:
             )
 
         # ── 4. Record intent ────────────────────────────────
-        self._fold_intent(eid, tool, args, compensates, caused_by)
+        self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
 
         # ── 5. Execute ──────────────────────────────────────
         t0           = time.monotonic()
@@ -510,15 +595,112 @@ class ToolHarness:
 
         # ── 6. Record result ────────────────────────────────
         spend = self._compute_spend(estimate, wall_seconds)
-        self._fold_result(
-            eid, tool, output, status, error_detail, spend=spend,
-        )
+        try:
+            # EffectRow enforces a strict durable shape for container values.
+            # Validate before folding so a provider/tool that returned a
+            # cyclic mapping, non-finite number, or coercive key cannot leave
+            # an intent-only orphan behind. Unknown typed leaves are retained
+            # for applications that register a Claim codec; the fold itself
+            # remains the final serialization gate for those values.
+            output = _prepare_effect_output(output)
+            self._fold_result(
+                eid, tool, output, status, error_detail, spend=spend,
+            )
+        except Exception as exc:
+            # The tool body has already run, but its output was not durable.
+            # Record a truthful terminal error with a JSON-safe payload and
+            # keep the spend accounting: execution time and one logical call
+            # were consumed regardless of output serialization.
+            status = "error"
+            error_detail = {
+                "type": "tool_output_invalid",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }
+            output = None
+            self._fold_result(
+                eid, tool, output, status, error_detail, spend=spend,
+            )
+            self._fold_spend(eid, spend)
+            return self._tool_result(
+                result_id,
+                f"Tool output could not be recorded: {error_detail['message']}",
+                is_error=True,
+            )
 
         # ── 7. Record spend ─────────────────────────────────
         self._fold_spend(eid, spend)
 
         # ── 8. Synthesize tool_result ───────────────────────
         return self._tool_result(result_id, _stringify(output), is_error=False)
+
+    def observation(self, effect_id: str) -> EffectObservation:
+        """Project the durable Effect tape into a truthful observation."""
+        claim_id, node = self._find_node(effect_id)
+        if node is None:
+            raise OrphanedEffectError(f"tool effect {effect_id!r} has no intent")
+        if node.result is not None:
+            fields = node.result.fields
+            status = "succeeded" if fields.get(F_STATUS) == "ok" else "failed"
+            evidence: dict[str, Any] = {
+                "claim_effect_id": claim_id,
+                "spend": dict(fields.get(F_SPEND, {})),
+                "side_effect": fields.get(F_SIDE_EFFECT),
+            }
+            if F_ERROR in fields:
+                evidence["error"] = deepcopy(fields[F_ERROR])
+            return EffectObservation(
+                effect_id,
+                status,
+                result=deepcopy(fields.get(F_OUTPUT)),
+                evidence=evidence,
+                claim_id=claim_id,
+            )
+        if node.rejection is not None:
+            return EffectObservation(
+                effect_id,
+                "rejected",
+                evidence={
+                    "claim_effect_id": claim_id,
+                    "reason": node.rejection.fields.get(F_REASON),
+                    "detail": node.rejection.fields.get(F_DETAIL, {}),
+                },
+                claim_id=claim_id,
+            )
+        return EffectObservation(
+            effect_id,
+            "uncertain",
+            evidence={"claim_effect_id": claim_id, "state": "orphan"},
+            claim_id=claim_id,
+        )
+
+    def _find_node(self, effect_id: str) -> tuple[str, Any]:
+        if not isinstance(effect_id, str) or not effect_id.strip():
+            raise ValueError("effect_id must be a non-empty string")
+        effect_row = next(
+            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
+        )
+        if effect_row is None:
+            raise OrphanedEffectError(f"tool effect {effect_id!r} is not recorded")
+        projection = effect_row.project(self.rowset.store)
+        node = projection.nodes.get(effect_id)
+        if node is not None:
+            if node.kind is not EffectKind.TOOL_CALL:
+                raise ValueError(f"effect id {effect_id!r} belongs to a non-tool effect")
+            return effect_id, node
+        matches = [
+            (claim_id, candidate)
+            for claim_id, candidate in projection.nodes.items()
+            if (
+                candidate.kind is EffectKind.TOOL_CALL
+                and candidate.intent.fields.get(F_PROPOSAL_ID) == effect_id
+            )
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"proposal id {effect_id!r} is ambiguous")
+        raise OrphanedEffectError(f"tool effect {effect_id!r} is not recorded")
 
     def reconcile_orphan(
         self,
@@ -538,19 +720,19 @@ class ToolHarness:
         """
         if not isinstance(effect_id, str) or not effect_id:
             raise ValueError("effect_id must be a non-empty string")
-        if (
-            isinstance(wall_seconds, bool)
-            or not isinstance(wall_seconds, (int, float))
-            or wall_seconds < 0
-        ):
+        try:
+            valid_wall = (
+                not isinstance(wall_seconds, bool)
+                and isinstance(wall_seconds, (int, float))
+                and math.isfinite(float(wall_seconds))
+                and wall_seconds >= 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_wall = False
+        if not valid_wall:
             raise ValueError("wall_seconds must be a non-negative number")
-        effect_row = next(
-            (row for row in self.rowset.rows if isinstance(row, EffectRow)), None,
-        )
-        if effect_row is None:
-            raise OrphanedEffectError(f"tool effect {effect_id!r} is not recorded")
-        node = effect_row.project(self.rowset.store).nodes.get(effect_id)
-        if node is None or node.intent is None:
+        claim_id, node = self._find_node(effect_id)
+        if node.intent is None:
             raise OrphanedEffectError(f"tool effect {effect_id!r} has no intent")
         if node.result is not None or node.rejection is not None:
             return self._tool_result(
@@ -571,12 +753,50 @@ class ToolHarness:
             )
         spend = self._compute_spend(estimate, float(wall_seconds))
         status = "error" if error is not None else "ok"
-        self._fold_result(effect_id, tool, output, status, dict(error) if error else None, spend=spend)
-        self._fold_spend(effect_id, spend)
+        normalized_error: dict[str, Any] | None = None
+        if error is not None:
+            if not isinstance(error, Mapping):
+                raise TypeError("error must be a mapping or None")
+            try:
+                candidate_error = _prepare_effect_output(dict(error))
+                encoded_error = json.dumps(
+                    candidate_error, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                )
+                decoded_error = json.loads(encoded_error)
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise ValueError("error must be strict JSON") from exc
+            if not isinstance(decoded_error, dict):
+                raise ValueError("error must be a JSON object")
+            normalized_error = decoded_error
+        try:
+            prepared_output = _prepare_effect_output(output)
+        except (TypeError, ValueError, RecursionError) as exc:
+            # Reconciliation itself must never leave the original orphan
+            # open because an operator supplied malformed evidence. Record a
+            # truthful terminal error with a JSON-safe payload instead.
+            status = "error"
+            normalized_error = {
+                "type": "tool_output_invalid",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }
+            prepared_output = None
+        self._fold_result(
+            claim_id,
+            tool,
+            prepared_output,
+            status,
+            normalized_error,
+            spend=spend,
+        )
+        self._fold_spend(claim_id, spend)
         return self._tool_result(
             effect_id,
-            _stringify(output) if error is None else str(error.get("message", "error")),
-            is_error=error is not None,
+            _stringify(prepared_output) if status == "ok" else str(
+                (normalized_error or {}).get("message", "error")
+            ),
+            is_error=status != "ok",
         )
 
     def _restore_consumed_replay_effect_ids(self) -> None:
@@ -592,6 +812,9 @@ class ToolHarness:
         tool_use_id: str,
         tool_name: str,
         arguments: Mapping[str, Any],
+        *,
+        proposal: EffectProposal | None = None,
+        caused_by: str | None = None,
     ) -> dict | None:
         """Return a recorded terminal tool result without executing again."""
         effect_row = next(
@@ -606,6 +829,17 @@ class ToolHarness:
         if node.kind is not EffectKind.TOOL_CALL:
             raise ValueError(f"effect id {effect_id!r} belongs to a non-tool effect")
         fields = node.intent.fields
+        if proposal is not None:
+            proposal_fields = proposal.claim_fields()
+            for key in (*proposal_fields, F_CAUSED_BY):
+                if fields.get(key) != proposal_fields.get(key):
+                    raise ValueError(
+                        f"effect id {effect_id!r} was reused with different proposal provenance",
+                    )
+        if fields.get(F_CAUSED_BY) != caused_by:
+            raise ValueError(
+                f"effect id {effect_id!r} was reused with different causation",
+            )
         if fields.get(F_TOOL_NAME) != tool_name:
             raise ValueError(f"effect id {effect_id!r} was reused for a different tool")
 
@@ -631,7 +865,13 @@ class ToolHarness:
                 raise TypeError(
                     f"recorded tool effect {effect_id!r} has invalid spend",
                 )
-            self._fold_spend(effect_id, recorded_spend)
+            try:
+                normalized_spend = _normalize_spend(recorded_spend)
+            except (TypeError, ValueError) as exc:
+                raise OrphanedEffectError(
+                    f"recorded tool effect {effect_id!r} has invalid spend",
+                ) from exc
+            self._fold_spend(effect_id, normalized_spend)
             is_error = result_fields.get(F_STATUS) == "error"
             return self._tool_result(
                 tool_use_id,
@@ -707,6 +947,8 @@ class ToolHarness:
         compensates: str | None,
         caused_by: str | None,
         decision: ReplayDecision,
+        *,
+        proposal: EffectProposal | None = None,
     ) -> dict:
         """Mirror a recorded result into the target store without executing.
 
@@ -731,7 +973,7 @@ class ToolHarness:
                 f"(decision={decision!r})"
             )
 
-        self._fold_intent(eid, tool, args, compensates, caused_by)
+        self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
 
         new_fields = deepcopy(dict(recorded_node.result.fields))
         new_fields[F_EFFECT_ID] = eid
@@ -763,12 +1005,14 @@ class ToolHarness:
         compensates: str | None,
         caused_by: str | None,
         decision: ReplayDecision,
+        *,
+        proposal: EffectProposal | None = None,
     ) -> None:
         """Fold intent + rejection for a refused replay, then raise.
 
         Always raises ReplayRefused; never returns.
         """
-        self._fold_intent(eid, tool, args, compensates, caused_by)
+        self._fold_intent(eid, tool, args, compensates, caused_by, proposal=proposal)
         mode_value = (
             self.tool_replayer.mode.value
             if self.tool_replayer is not None else "?"
@@ -847,23 +1091,33 @@ class ToolHarness:
             if not isinstance(estimate, Mapping):
                 raise TypeError("estimate must return a mapping of bucket names to amounts")
             for bucket, amount in estimate.items():
-                if not isinstance(bucket, str) or not bucket:
+                if not isinstance(bucket, str) or not bucket.strip():
                     raise ValueError(f"invalid bucket name {bucket!r}")
-                if bucket not in tool.declared_buckets:
+                bucket_name = bucket.strip()
+                if bucket_name not in tool.declared_buckets:
                     raise ValueError(
                         f"estimate returned undeclared bucket {bucket!r}; "
                         f"declare it with @tool(declared_buckets=...)"
                     )
-                if (
-                    isinstance(amount, bool)
-                    or not isinstance(amount, (int, float))
-                    or not math.isfinite(float(amount))
-                    or amount < 0
-                ):
+                try:
+                    valid_amount = (
+                        not isinstance(amount, bool)
+                        and isinstance(amount, (int, float))
+                        and math.isfinite(float(amount))
+                        and amount >= 0
+                    )
+                except (OverflowError, TypeError, ValueError):
+                    valid_amount = False
+                if not valid_amount:
                     raise ValueError(
                         f"estimate for {bucket!r} must be a finite non-negative number, got {amount!r}"
                     )
-                upper[bucket] = float(amount)
+                if bucket_name in upper and bucket_name != "tool_calls":
+                    raise ValueError(f"estimate returned duplicate bucket {bucket_name!r}")
+                # tool_calls is system-managed and always exactly one logical
+                # invocation; a tool estimate cannot override it.
+                if bucket_name != "tool_calls":
+                    upper[bucket_name] = float(amount)
         except Exception as exc:
             return None, ToolEstimateRejection(
                 tool_name=tool.name,
@@ -883,7 +1137,14 @@ class ToolHarness:
             if bucket not in cap.budgets:
                 continue
             info = proj[bucket]
-            if info["spent"] + est_amount > info["limit"]:
+            try:
+                projected = _finite_sum(
+                    float(info["spent"]), float(est_amount),
+                    f"budget projection[{bucket!r}]",
+                )
+            except ValueError:
+                projected = math.inf
+            if projected > info["limit"]:
                 return ToolBudgetRejection(
                     bucket=bucket,
                     spent=info["spent"],
@@ -904,7 +1165,18 @@ class ToolHarness:
         buckets reuse the validated pre-flight estimate, so a non-deterministic
         estimate_fn cannot admit one amount and record another.
         """
-        spend = dict(estimate)
+        try:
+            valid_wall = (
+                not isinstance(wall_seconds, bool)
+                and isinstance(wall_seconds, (int, float))
+                and math.isfinite(float(wall_seconds))
+                and wall_seconds >= 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_wall = False
+        if not valid_wall:
+            raise ValueError("wall_seconds must be finite and non-negative")
+        spend = _normalize_spend(estimate)
         spend["tool_calls"] = 1.0
         spend["wall_seconds"] = float(wall_seconds)
         return spend
@@ -918,6 +1190,8 @@ class ToolHarness:
         args: Mapping[str, Any],
         compensates: str | None,
         caused_by: str | None,
+        *,
+        proposal: EffectProposal | None = None,
     ) -> None:
         fields: dict = {
             F_EFFECT_ID:             eid,
@@ -930,6 +1204,8 @@ class ToolHarness:
             fields[F_COMPENSATES] = compensates
         if caused_by is not None:
             fields[F_CAUSED_BY] = caused_by
+        if proposal is not None:
+            fields.update(proposal.claim_fields())
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=fields,
@@ -943,6 +1219,8 @@ class ToolHarness:
         args: Mapping[str, Any],
         compensates: str | None,
         caused_by: str | None,
+        *,
+        proposal: EffectProposal | None = None,
     ) -> None:
         """Intent for a tool we couldn't resolve.
 
@@ -964,6 +1242,8 @@ class ToolHarness:
             fields[F_COMPENSATES] = compensates
         if caused_by is not None:
             fields[F_CAUSED_BY] = caused_by
+        if proposal is not None:
+            fields.update(proposal.claim_fields())
         self.rowset.fold(Claim(
             tag=TAG_EFFECT_INTENT,
             fields=fields,
@@ -1006,12 +1286,13 @@ class ToolHarness:
         eid: str,
         spend: Mapping[str, float],
     ) -> None:
-        if not spend:
+        normalized = _normalize_spend(spend)
+        if not normalized:
             return
         cap  = self._capability_row()
         proj = cap.project(self.rowset.store) if cap is not None else None
 
-        for bucket, amount in spend.items():
+        for bucket, amount in normalized.items():
             if amount <= 0:
                 continue
             claim_id = self._spend_claim_id(eid, bucket)
@@ -1021,12 +1302,16 @@ class ToolHarness:
                 for claim in self.rowset.store.filter(tag=tag)
             ):
                 continue
-            is_overrun = (
-                cap is not None
-                and proj is not None
-                and bucket in cap.budgets
-                and proj[bucket]["spent"] + amount > proj[bucket]["limit"]
-            )
+            is_overrun = False
+            if cap is not None and proj is not None and bucket in cap.budgets:
+                try:
+                    projected = _finite_sum(
+                        float(proj[bucket]["spent"]), amount,
+                        f"budget projection[{bucket!r}]",
+                    )
+                except ValueError:
+                    projected = math.inf
+                is_overrun = projected > proj[bucket]["limit"]
             if is_overrun:
                 logger.warning(
                     "tool_harness: in-band budget overrun bucket=%r "
@@ -1079,6 +1364,22 @@ class ToolHarness:
             source="tool_harness.call",
         ))
 
+    def _fold_admission_rejection(
+        self,
+        eid: str,
+        decision: EffectDecision,
+    ) -> None:
+        self.rowset.fold(Claim(
+            tag=TAG_EFFECT_REJECTED,
+            fields={
+                F_EFFECT_ID: eid,
+                F_KIND: EffectKind.TOOL_CALL.value,
+                F_REASON: decision.reason,
+                F_DETAIL: {"policy": decision.policy, **dict(decision.detail)},
+            },
+            source="runtime.admission",
+        ))
+
     # ── tool_result synthesis ──────────────────────────────────
 
     @staticmethod
@@ -1102,6 +1403,58 @@ class ToolHarness:
 # Helpers
 # =====================================================================
 
+def _proposal_risk_rank(value: str) -> int | None:
+    if not isinstance(value, str):
+        return None
+    return {
+        "none": 0,
+        "read": 1,
+        "read_only": 1,
+        "idempotent_write": 2,
+        "external_write": 3,
+        "destructive": 3,
+        "high": 3,
+    }.get(value.strip().lower())
+
+
+def _tool_side_effect_rank(value: str) -> int:
+    return {
+        "pure": 0,
+        "read_only": 1,
+        "idempotent_write": 2,
+        "external_write": 3,
+    }.get(value, 3)
+
+
+def _normalize_spend(spend: Mapping[str, Any]) -> dict[str, float]:
+    """Validate a spend mapping before any ledger claims are folded."""
+    if not isinstance(spend, Mapping):
+        raise TypeError("spend must be a mapping")
+    normalized: dict[str, float] = {}
+    for bucket, amount in spend.items():
+        if not isinstance(bucket, str) or not bucket.strip():
+            raise ValueError("spend bucket names must be non-empty strings")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise ValueError("spend amounts must be finite non-negative numbers")
+        try:
+            numeric = float(amount)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError("spend amounts must be finite non-negative numbers") from exc
+        if not math.isfinite(numeric) or numeric < 0:
+            raise ValueError("spend amounts must be finite non-negative numbers")
+        key = bucket.strip()
+        if key in normalized:
+            raise ValueError(f"duplicate spend bucket {key!r}")
+        normalized[key] = numeric
+    return normalized
+
+
+def _finite_sum(left: float, right: float, label: str) -> float:
+    total = left + right
+    if not math.isfinite(total):
+        raise ValueError(f"{label} overflowed to a non-finite value")
+    return total
+
 def _stringify(output: Any) -> str:
     """Render a tool's output as a string for the LLM tool_result block.
 
@@ -1121,3 +1474,66 @@ def _stringify(output: Any) -> str:
         return json.dumps(output, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(output)
+
+
+def _prepare_effect_output(value: Any, *, _active: set[int] | None = None) -> Any:
+    """Validate and detach a tool output before it crosses the Effect tape.
+
+    EffectRow deliberately permits typed opaque leaves (the Claim codec may
+    know how to persist an application object), so this helper only walks
+    JSON-like containers. Sets are lowered to a deterministic list because
+    the built-in durable codec has no set representation. Non-finite values,
+    non-string mapping keys, and reference cycles are rejected; the caller
+    converts that failure into a terminal ``tool_output_invalid`` result.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("tool output contains a non-finite number")
+        return value
+    if _active is None:
+        _active = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in _active:
+            raise ValueError("tool output must not contain reference cycles")
+        _active.add(marker)
+        try:
+            out: dict[str, Any] = {}
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("tool output mappings must use string object keys")
+                out[key] = _prepare_effect_output(child, _active=_active)
+            return out
+        finally:
+            _active.remove(marker)
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in _active:
+            raise ValueError("tool output must not contain reference cycles")
+        _active.add(marker)
+        try:
+            values = [
+                _prepare_effect_output(child, _active=_active)
+                for child in value
+            ]
+            return tuple(values) if isinstance(value, tuple) else values
+        finally:
+            _active.remove(marker)
+    if isinstance(value, (set, frozenset)):
+        marker = id(value)
+        if marker in _active:
+            raise ValueError("tool output must not contain reference cycles")
+        _active.add(marker)
+        try:
+            values = [
+                _prepare_effect_output(child, _active=_active)
+                for child in value
+            ]
+            # repr is only an ordering key; values themselves remain intact.
+            values.sort(key=repr)
+            return values
+        finally:
+            _active.remove(marker)
+    return value

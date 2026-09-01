@@ -23,6 +23,23 @@ __all__ = [
 T = TypeVar("T")
 
 
+def _finite_number(value: Any, name: str, *, positive: bool = False) -> float:
+    """Validate deadline values without leaking ``float`` overflow errors."""
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and (not positive or value > 0)
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        qualifier = "finite and positive" if positive else "finite"
+        raise ValueError(f"{name} must be {qualifier}")
+    return float(value)
+
+
 class RunCancelled(asyncio.CancelledError):
     """Cooperative cancellation was requested for a logical run."""
 
@@ -67,20 +84,14 @@ class RunContext:
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id.strip():
             raise ValueError("RunContext.run_id must be a non-empty string")
-        if self.deadline is not None and (
-            isinstance(self.deadline, bool)
-            or not isinstance(self.deadline, (int, float))
-            or not math.isfinite(float(self.deadline))
-        ):
-            raise ValueError("RunContext.deadline must be a finite number or None")
+        if self.deadline is not None:
+            self.deadline = _finite_number(self.deadline, "RunContext.deadline")
         if not isinstance(self.cancellation, CancellationToken):
             raise TypeError("RunContext.cancellation must be a CancellationToken")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("RunContext.metadata must be a mapping")
         if self.cancel_check is not None and not callable(self.cancel_check):
             raise TypeError("RunContext.cancel_check must be callable or None")
-        if self.deadline is not None:
-            self.deadline = float(self.deadline)
 
     @classmethod
     def create(
@@ -96,14 +107,8 @@ class RunContext:
         if timeout_s is not None and deadline is not None:
             raise ValueError("pass either timeout_s or deadline, not both")
         if timeout_s is not None:
-            if (
-                isinstance(timeout_s, bool)
-                or not isinstance(timeout_s, (int, float))
-                or not math.isfinite(float(timeout_s))
-                or timeout_s <= 0
-            ):
-                raise ValueError("timeout_s must be a positive finite number")
-            deadline = time.monotonic() + float(timeout_s)
+            timeout_value = _finite_number(timeout_s, "timeout_s", positive=True)
+            deadline = time.monotonic() + timeout_value
         return cls(
             run_id=run_id or f"run_{uuid.uuid4().hex}",
             deadline=deadline,

@@ -8,6 +8,7 @@ request, reply, usage, pricing, or streaming types.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
 from decimal import Decimal
 from typing import Any, Literal, Mapping, Sequence, Union, cast
@@ -138,6 +139,7 @@ class Request:
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must be a non-empty string")
+        object.__setattr__(self, "model", self.model.strip())
         if not isinstance(self.system, str):
             raise TypeError("system must be a string")
         if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
@@ -156,19 +158,24 @@ class Request:
             not isinstance(self.request_id, str) or not self.request_id.strip()
         ):
             raise ValueError("request_id must be a non-empty string or None")
+        if self.request_id is not None:
+            object.__setattr__(self, "request_id", self.request_id.strip())
 
         messages: list[Mapping[str, Any]] = []
         for message in self.messages:
             if isinstance(message, Message):
-                messages.append(message.as_dict())
+                messages.append(deepcopy(message.as_dict()))
             elif isinstance(message, Mapping):
-                messages.append(message)
+                messages.append(deepcopy(dict(message)))
             else:
                 raise TypeError(
                     "Request.messages entries must be Mapping or "
                     f"Message, got {type(message).__name__}"
                 )
         object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "tools", deepcopy(tuple(self.tools)))
+        object.__setattr__(self, "stop_sequences", deepcopy(tuple(self.stop_sequences)))
+        object.__setattr__(self, "extra", deepcopy(dict(self.extra)))
 
 
 StopReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use", "error"]

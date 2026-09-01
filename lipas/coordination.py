@@ -18,7 +18,8 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
+from types import MappingProxyType
 
 from .behaviour import AgentState, FinalResult
 from .context import (
@@ -30,7 +31,10 @@ from .context import (
 from .durable import InputPolicy, ApprovalPolicy
 from .events import AgentEvent, AgentEventType
 from .exceptions import LipasError
-from .coordination_policy import CapabilityPolicy, SharedBudgetPolicy
+from .coordination_policy import (
+    ApprovalDelegation, CapabilityPolicy, SharedBudgetPolicy,
+    WorkspaceIdentity, WorkspacePolicyStore,
+)
 from .execution import (
     ExecutionLeaseError,
     ExecutionStateError,
@@ -60,7 +64,10 @@ __all__ = [
     "HandoffFailure",
     "HandoffOutcome",
     "MemberInfo",
+    "PlanStep",
+    "AgentPlan",
     "Transfer",
+    "ExternalRunEnvelope", "ExternalRunResult", "ExternalRunAdapter",
 ]
 
 
@@ -98,6 +105,97 @@ class CoordinationRecoveryRequired(CoordinationError):
 
 class CoordinationResultError(CoordinationError):
     """A member returned a value that cannot be durably replayed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRunEnvelope:
+    """Identity boundary for a hosted LangGraph/AutoGen execution.
+
+    The external framework owns its graph/team state; LIPAS owns exactly one
+    Task/Run identity and terminal evidence for the hosted invocation.
+    """
+
+    provider: str
+    external_run_id: str
+    goal: str
+    workspace: str
+    payload: Any = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("provider", "external_run_id", "goal", "workspace"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-empty")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("external run metadata must be a mapping")
+        try:
+            metadata = _json_value(dict(self.metadata), path="external run metadata")
+            payload = _json_value(self.payload, path="external run payload")
+        except CoordinationError as exc:
+            raise ValueError(str(exc)) from exc
+        # Metadata is part of the immutable plan contract.  Keep the nested
+        # JSON snapshot detached and expose only a read-only top-level view;
+        # callers can still serialise it with ``dict(...)``.
+        if not isinstance(metadata, dict):
+            raise ValueError("external run metadata must be a JSON object")
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+        object.__setattr__(self, "payload", payload)
+        for name in ("provider", "external_run_id", "goal", "workspace"):
+            object.__setattr__(self, name, getattr(self, name).strip())
+
+    @property
+    def identity(self) -> str:
+        return _stable_id("external", self.provider, self.external_run_id)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "external_run_id": self.external_run_id,
+            "goal": self.goal,
+            "workspace": self.workspace,
+            # Return a fresh JSON snapshot so callers cannot mutate nested
+            # payload/metadata values through an audit/export projection.
+            "payload": _json_value(self.payload, path="external run payload"),
+            "metadata": _json_value(dict(self.metadata), path="external run metadata"),
+            "identity": self.identity,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRunResult:
+    envelope: ExternalRunEnvelope
+    run_id: str
+    status: str
+    value: Any = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.envelope, ExternalRunEnvelope):
+            raise TypeError("external run result envelope must be ExternalRunEnvelope")
+        if not isinstance(self.run_id, str) or not self.run_id.strip():
+            raise ValueError("external run result run_id must be non-empty")
+        run_id = self.run_id.strip()
+        expected_run_id = _stable_id("external_run", self.envelope.identity)
+        if run_id != expected_run_id:
+            # ``execute_external`` derives the durable Run identity from the
+            # envelope.  Accepting an unrelated id here would let an adapter
+            # report a result for one external invocation while naming a
+            # different LIPAS Run, defeating replay and operator joins.
+            raise ValueError(
+                "external run result run_id does not match its envelope identity",
+            )
+        if self.status not in {"completed", "failed", "cancelled", "waiting"}:
+            raise ValueError("external run status is invalid")
+        try:
+            normalized = _json_value(self.value, path="external run result")
+        except CoordinationError as exc:
+            raise ValueError(str(exc)) from exc
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "value", normalized)
+
+
+class ExternalRunAdapter(Protocol):
+    async def execute(self, envelope: ExternalRunEnvelope, context: RunContext) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +334,7 @@ class HandoffEnvelope:
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"HandoffEnvelope.{name} must be non-empty")
+            object.__setattr__(self, name, value.strip())
         if (
             isinstance(self.sequence, bool)
             or not isinstance(self.sequence, int)
@@ -246,14 +345,28 @@ class HandoffEnvelope:
             not isinstance(self.parent_id, str) or not self.parent_id.strip()
         ):
             raise ValueError("HandoffEnvelope.parent_id must be non-empty or None")
+        if self.parent_id is not None:
+            object.__setattr__(self, "parent_id", self.parent_id.strip())
         if not isinstance(self.metadata, Mapping):
             raise TypeError("HandoffEnvelope.metadata must be a mapping")
-        if (
-            isinstance(self.created_at, bool)
-            or not isinstance(self.created_at, (int, float))
-            or not math.isfinite(float(self.created_at))
-        ):
+        try:
+            finite_created_at = (
+                not isinstance(self.created_at, bool)
+                and isinstance(self.created_at, (int, float))
+                and math.isfinite(float(self.created_at))
+            )
+        except (OverflowError, TypeError, ValueError):
+            finite_created_at = False
+        if not finite_created_at:
             raise ValueError("HandoffEnvelope.created_at must be finite")
+        object.__setattr__(self, "created_at", float(self.created_at))
+        # Metadata is part of the stable handoff identity.  Detach it from
+        # caller-owned mappings and reject values that JSON would coerce or
+        # serialize ambiguously at a later transport boundary.
+        metadata = _json_value(dict(self.metadata), path="handoff metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError("HandoffEnvelope.metadata must be a JSON object")
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
 
     @classmethod
     def create(
@@ -268,26 +381,188 @@ class HandoffEnvelope:
         metadata: Mapping[str, Any] | None = None,
         handoff_id: str | None = None,
     ) -> "HandoffEnvelope":
-        identity = handoff_id or _stable_id(
+        canonical_coordination = (
+            coordination_id.strip() if isinstance(coordination_id, str) else coordination_id
+        )
+        canonical_sender = sender.strip() if isinstance(sender, str) else sender
+        canonical_recipient = recipient.strip() if isinstance(recipient, str) else recipient
+        canonical_parent = (
+            parent_id.strip() if isinstance(parent_id, str) else parent_id
+        )
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping or None")
+        identity = (
+            handoff_id.strip()
+            if isinstance(handoff_id, str) and handoff_id.strip()
+            else _stable_id(
             "handoff",
-            coordination_id,
+            canonical_coordination,
             str(sequence),
-            sender,
-            recipient,
-            parent_id or "",
+            canonical_sender,
+            canonical_recipient,
+            canonical_parent or "",
+        )
         )
         return cls(
             id=identity,
-            coordination_id=coordination_id,
-            sender=sender,
-            recipient=recipient,
+            coordination_id=canonical_coordination,
+            sender=canonical_sender,
+            recipient=canonical_recipient,
             payload=_json_value(payload, path="payload"),
             sequence=sequence,
-            parent_id=parent_id,
+            parent_id=canonical_parent,
             metadata=cast(
                 Mapping[str, Any],
                 _json_value(dict(metadata or {}), path="metadata"),
             ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStep:
+    """A provider-neutral planned handoff; it has no execution authority."""
+
+    step_id: str
+    goal: str
+    recipient: str
+    depends_on: tuple[str, ...] = ()
+    required_capabilities: frozenset[str] = frozenset()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("step_id", "goal", "recipient"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"PlanStep.{name} must be non-empty")
+            object.__setattr__(self, name, value.strip())
+        if not isinstance(self.depends_on, tuple):
+            raise TypeError("PlanStep.depends_on must be a tuple")
+        normalized_dependencies = tuple(
+            item.strip() for item in self.depends_on
+            if isinstance(item, str) and item.strip()
+        )
+        if len(normalized_dependencies) != len(self.depends_on):
+            raise ValueError("PlanStep.depends_on must contain non-empty strings")
+        if len(set(normalized_dependencies)) != len(normalized_dependencies):
+            raise ValueError("PlanStep.depends_on must contain unique step ids")
+        # Dependency order is semantically irrelevant. Canonicalising keeps
+        # plan fingerprints and handoff envelopes stable across equivalent
+        # caller declarations.
+        object.__setattr__(self, "depends_on", tuple(sorted(normalized_dependencies)))
+        if not isinstance(self.required_capabilities, frozenset):
+            raise TypeError("required_capabilities must be a frozenset")
+        normalized_capabilities = frozenset(
+            item.strip() for item in self.required_capabilities
+            if isinstance(item, str) and item.strip()
+        )
+        if len(normalized_capabilities) != len(self.required_capabilities):
+            raise ValueError("required_capabilities must contain non-empty strings")
+        if len(normalized_capabilities) != len(tuple(self.required_capabilities)):
+            raise ValueError("required_capabilities must contain unique strings")
+        object.__setattr__(self, "required_capabilities", normalized_capabilities)
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("PlanStep.metadata must be a mapping")
+        try:
+            metadata = _json_value(dict(self.metadata), path="PlanStep.metadata")
+        except CoordinationError as exc:
+            raise ValueError(str(exc)) from exc
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a detached, transport-safe representation of this step."""
+        return {
+            "step_id": self.step_id,
+            "goal": self.goal,
+            "recipient": self.recipient,
+            "depends_on": list(self.depends_on),
+            "required_capabilities": sorted(self.required_capabilities),
+            "metadata": _json_value(
+                dict(self.metadata), path="PlanStep.metadata",
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPlan:
+    """A stable plan envelope for LangGraph/AutoGen boundary adapters."""
+
+    plan_id: str
+    conversation_id: str
+    steps: tuple[PlanStep, ...]
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        for name in ("plan_id", "conversation_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"AgentPlan.{name} must be non-empty")
+            object.__setattr__(self, name, value.strip())
+        if not isinstance(self.steps, tuple):
+            raise TypeError("AgentPlan.steps must be a tuple")
+        if not self.steps:
+            raise ValueError("AgentPlan.steps must be non-empty")
+        if any(not isinstance(step, PlanStep) for step in self.steps):
+            raise TypeError("AgentPlan.steps must contain PlanStep values")
+        if len({step.step_id for step in self.steps}) != len(self.steps):
+            raise ValueError("AgentPlan step ids must be unique")
+        known = {step.step_id for step in self.steps}
+        if any(
+            dep not in known
+            for step in self.steps
+            for dep in step.depends_on
+        ):
+            raise ValueError("AgentPlan depends_on must reference steps in this plan")
+        if any(step.step_id in step.depends_on for step in self.steps):
+            raise ValueError("AgentPlan steps cannot depend on themselves")
+        remaining = {step.step_id: set(step.depends_on) for step in self.steps}
+        while remaining:
+            ready = [identifier for identifier, deps in remaining.items() if not deps]
+            if not ready:
+                raise ValueError("AgentPlan dependencies contain a cycle")
+            for identifier in ready:
+                remaining.pop(identifier)
+                for deps in remaining.values():
+                    deps.discard(identifier)
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
+            raise ValueError("AgentPlan.version must be a positive int")
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a detached representation suitable for Plan/Handoff transport."""
+        return {
+            "plan_id": self.plan_id,
+            "conversation_id": self.conversation_id,
+            "version": self.version,
+            "steps": [step.as_dict() for step in self.steps],
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable digest of the immutable plan contract."""
+        encoded = json.dumps(
+            self.as_dict(), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def handoff(self, step_id: str, *, sender: str, payload: Any) -> HandoffEnvelope:
+        step = next((item for item in self.steps if item.step_id == step_id), None)
+        if step is None:
+            raise KeyError(step_id)
+        return HandoffEnvelope.create(
+            coordination_id=self.plan_id,
+            sender=sender,
+            recipient=step.recipient,
+            payload=payload,
+            handoff_id=_stable_id("plan_handoff", self.plan_id, step.step_id),
+            metadata={
+                "conversation_id": self.conversation_id,
+                "plan_id": self.plan_id,
+                "step_id": step.step_id,
+                "required_capabilities": sorted(step.required_capabilities),
+                # Preserve planner metadata (including workflow constraints)
+                # at the handoff boundary without treating it as authority.
+                "step_metadata": dict(step.metadata),
+            },
         )
 
 
@@ -302,6 +577,7 @@ class Transfer:
     def __post_init__(self) -> None:
         if not isinstance(self.recipient, str) or not self.recipient.strip():
             raise ValueError("Transfer.recipient must be non-empty")
+        object.__setattr__(self, "recipient", self.recipient.strip())
         if not isinstance(self.reason, str):
             raise TypeError("Transfer.reason must be a string")
 
@@ -342,6 +618,10 @@ class MemberInfo:
             raise ValueError(
                 "MemberInfo.capabilities must contain trimmed non-empty strings",
             )
+        normalized_capabilities = frozenset(value.strip() for value in self.capabilities)
+        if len(normalized_capabilities) != len(self.capabilities):
+            raise ValueError("MemberInfo.capabilities must contain unique values after normalization")
+        object.__setattr__(self, "capabilities", normalized_capabilities)
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +705,7 @@ class AgentCoordinator:
         max_result_bytes: int = _DEFAULT_MAX_BYTES,
         budget_policy: SharedBudgetPolicy | None = None,
         capability_policy: CapabilityPolicy | None = None,
+        policy_store: WorkspacePolicyStore | None = None,
         _owns_execution: bool = False,
     ) -> None:
         if not isinstance(execution, ExecutionStore):
@@ -457,8 +738,11 @@ class AgentCoordinator:
             capability_policy, CapabilityPolicy,
         ):
             raise TypeError("capability_policy must be CapabilityPolicy or None")
+        if policy_store is not None and not isinstance(policy_store, WorkspacePolicyStore):
+            raise TypeError("policy_store must be WorkspacePolicyStore or None")
         self.budget_policy = budget_policy
         self.capability_policy = capability_policy
+        self.policy_store = policy_store
         if budget_policy is not None:
             try:
                 self.execution.configure_coordination_budget(
@@ -485,14 +769,17 @@ class AgentCoordinator:
         resolved_workspace = Path(workspace).expanduser().resolve()
         resolved_workspace.mkdir(parents=True, exist_ok=True)
         execution = ExecutionStore(path)
+        policy_store = WorkspacePolicyStore(path)
         try:
             return cls(
                 execution,
                 workspace=resolved_workspace,
+                policy_store=policy_store,
                 _owns_execution=True,
                 **kwargs,
             )
         except BaseException:
+            policy_store.close()
             execution.close()
             raise
 
@@ -505,6 +792,206 @@ class AgentCoordinator:
         self._ensure_open()
         return CoordinationEventHandle(self, coordination_id)
 
+    async def execute_external(
+        self,
+        envelope: ExternalRunEnvelope,
+        adapter: ExternalRunAdapter | Callable[[ExternalRunEnvelope, RunContext], Awaitable[Any]],
+        *,
+        context: RunContext | None = None,
+    ) -> ExternalRunResult:
+        """Host one external graph/team invocation as a canonical Run.
+
+        This is intentionally a narrow boundary adapter: the external
+        framework cannot create Tasks, leases, or approval authority. A
+        repeated call with the same provider/run identity replays the
+        existing terminal result; a live owner is reported as ``CoordinationBusy``.
+        """
+        self._ensure_open()
+        if not isinstance(envelope, ExternalRunEnvelope):
+            raise TypeError("envelope must be ExternalRunEnvelope")
+        if context is not None and not isinstance(context, RunContext):
+            raise TypeError("context must be RunContext or None")
+        parent_context = context or RunContext.create(run_id=envelope.external_run_id)
+        # A cancelled/expired parent must not create a durable Task/Run before
+        # the host has a chance to observe that it cannot execute the work.
+        parent_context.check()
+        workspace = Path(envelope.workspace).expanduser().resolve()
+        if workspace != self.workspace and self.workspace not in workspace.parents:
+            raise ValueError("external run workspace must be inside coordinator workspace")
+        task_id = _stable_id("external_task", envelope.identity)
+        run_id = _stable_id("external_run", envelope.identity)
+        fingerprint = _external_request_fingerprint(envelope)
+        task = self.execution.get_task(task_id)
+        if task is None:
+            try:
+                task = self.execution.create_task(envelope.goal, workspace, task_id=task_id)
+            except ExecutionStateError:
+                # Another process may have won the deterministic create race.
+                # Re-read and validate its durable identity instead of turning
+                # a safe retry into an ambiguous startup failure.
+                task = self.execution.get_task(task_id)
+                if task is None:
+                    raise
+        elif task.goal != envelope.goal or Path(task.workspace).resolve() != workspace:
+            raise CoordinationIdentityConflict("external run identity has different durable input")
+        run = self.execution.get_run(run_id)
+        if run is None:
+            try:
+                run = self.execution.create_run(task.id, run_id=run_id)
+            except ExecutionStateError:
+                # As above, a concurrent caller may have inserted the same
+                # deterministic Run.  Only the committed row is authoritative.
+                run = self.execution.get_run(run_id)
+                if run is None:
+                    raise
+        if run.task_id != task.id:
+            raise CoordinationIdentityConflict("external run belongs to another task")
+        started_events = self.execution.agent_events(run.id)
+        started = next(
+            (
+                event for event in started_events
+                if event.type == AgentEventType.HANDOFF_STARTED
+                and event.data.get("external_run_id") == envelope.external_run_id
+            ),
+            None,
+        )
+        if started is not None:
+            recorded_fingerprint = started.data.get("request_fingerprint")
+            if recorded_fingerprint is not None and recorded_fingerprint != fingerprint:
+                raise CoordinationIdentityConflict(
+                    "external run identity has different durable input",
+                )
+        # Persist the request fingerprint before inspecting/claiming the Run.
+        # A crash between claim and the old post-claim event write must not
+        # leave a retry free to substitute a different payload under the same
+        # external identity.
+        if started is None:
+            self.execution.append_agent_event(
+                run.id, AgentEventType.HANDOFF_STARTED,
+                identity="external:started",
+                data={
+                    "provider": envelope.provider,
+                    "external_run_id": envelope.external_run_id,
+                    "request_fingerprint": fingerprint,
+                },
+            )
+        if run.state is RunState.COMPLETED:
+            return ExternalRunResult(envelope, run.id, "completed", run.result)
+        if run.state is RunState.FAILED:
+            return ExternalRunResult(envelope, run.id, "failed", run.error)
+        if run.state is RunState.CANCELLED:
+            return ExternalRunResult(envelope, run.id, "cancelled", run.result)
+        if run.state is RunState.WAITING:
+            return ExternalRunResult(envelope, run.id, "waiting", run.result)
+        try:
+            claimed = self.execution.claim_run(run.id, lease_seconds=self.lease_seconds)
+        except ExecutionLeaseError as exc:
+            raise CoordinationBusy(f"external run {run.id!r} is owned by another worker") from exc
+        branch = RunContext(
+            run_id=run.id,
+            deadline=parent_context.deadline,
+            cancellation=parent_context.cancellation,
+            metadata={**dict(parent_context.metadata), "external_run": envelope.as_dict()},
+            cancel_check=lambda: parent_context.cancelled,
+        )
+        lease_lost = asyncio.Event()
+        heartbeat_error: list[BaseException] = []
+        current_lease = claimed
+
+        async def heartbeat() -> None:
+            nonlocal current_lease
+            try:
+                while True:
+                    await asyncio.sleep(self.heartbeat_interval_s)
+                    current_lease = self.execution.renew_lease(
+                        run.id,
+                        current_lease.lease_token or "",
+                        lease_seconds=self.lease_seconds,
+                    )
+                    if current_lease.cancel_requested:
+                        lease_lost.set()
+                        return
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                heartbeat_error.append(exc)
+                lease_lost.set()
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            branch.cancel_check = lambda: parent_context.cancelled or lease_lost.is_set()
+            with bind_run_context(branch):
+                if hasattr(adapter, "execute"):
+                    value = await branch.wait(adapter.execute(envelope, branch))  # type: ignore[attr-defined]
+                else:
+                    value = await branch.wait(adapter(envelope, branch))  # type: ignore[misc]
+            branch.check()
+            value = _json_value(value, path="external run result")
+            if heartbeat_error:
+                raise CoordinationRecoveryRequired(
+                    f"lost lease for external run {run.id!r}",
+                ) from heartbeat_error[0]
+            completed = self.execution.complete_run(run.id, current_lease.lease_token or "", result=value)
+            self.execution.append_agent_event(
+                run.id, AgentEventType.HANDOFF_COMPLETED,
+                identity="external:completed",
+                data={"provider": envelope.provider, "external_run_id": envelope.external_run_id},
+            )
+            return ExternalRunResult(envelope, completed.id, "completed", value)
+        except asyncio.CancelledError as exc:
+            if not isinstance(exc, RunCancelled):
+                # Host task cancellation is not a normal business result.
+                # Persist the best-known cancellation state, then propagate
+                # the cancellation so callers can unwind their own task.
+                self.execution.request_cancel(run.id)
+                try:
+                    self.execution.finish_cancelled(
+                        run.id, current_lease.lease_token or "",
+                    )
+                except ExecutionStateError:
+                    pass
+                raise
+            if heartbeat_error:
+                raise CoordinationRecoveryRequired(
+                    f"lost lease for external run {run.id!r}",
+                ) from heartbeat_error[0]
+            self.execution.request_cancel(run.id)
+            cancelled_run: Run | None
+            try:
+                cancelled_run = self.execution.finish_cancelled(
+                    run.id, current_lease.lease_token or "",
+                )
+            except ExecutionStateError:
+                cancelled_run = self.execution.get_run(run.id)
+            return ExternalRunResult(
+                envelope, run.id, "cancelled",
+                None if cancelled_run is None else cancelled_run.result,
+            )
+        except (RunDeadlineExceeded,):
+            if heartbeat_error:
+                raise CoordinationRecoveryRequired(
+                    f"lost lease for external run {run.id!r}",
+                ) from heartbeat_error[0]
+            self.execution.request_cancel(run.id)
+            cancelled: Run | None
+            try:
+                cancelled = self.execution.finish_cancelled(run.id, current_lease.lease_token or "")
+            except ExecutionStateError:
+                cancelled = self.execution.get_run(run.id)
+            return ExternalRunResult(envelope, run.id, "cancelled", None if cancelled is None else cancelled.result)
+        except CoordinationRecoveryRequired:
+            raise
+        except Exception as exc:
+            failed: Run | None
+            try:
+                failed = self.execution.fail_run(run.id, current_lease.lease_token or "", error={"type": type(exc).__name__, "message": str(exc)})
+            except ExecutionStateError:
+                failed = self.execution.get_run(run.id)
+            return ExternalRunResult(envelope, run.id, "failed", None if failed is None else failed.error)
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
     def budget_snapshot(self) -> Mapping[str, Any] | None:
         """Return the durable shared budget projection, if configured."""
         self._ensure_open()
@@ -513,6 +1000,32 @@ class AgentCoordinator:
         return self.execution.coordination_budget_snapshot(
             self.budget_policy.scope,
         )
+
+    def register_identity(self, identity: WorkspaceIdentity, *, actor_id: str = "system") -> WorkspaceIdentity:
+        """Persist one shared-workspace identity when a policy store is configured."""
+        self._ensure_open()
+        if self.policy_store is None:
+            raise RuntimeError("shared identity persistence is not configured")
+        return self.policy_store.put_identity(identity, actor_id=actor_id)
+
+    def delegate_approval(self, delegation: ApprovalDelegation, *, actor_id: str | None = None) -> ApprovalDelegation:
+        """Persist a bounded approval delegation and its audit event."""
+        self._ensure_open()
+        if self.policy_store is None:
+            raise RuntimeError("shared identity persistence is not configured")
+        return self.policy_store.put_delegation(delegation, actor_id=actor_id)
+
+    def revoke_delegation(self, delegation_id: str, *, actor_id: str) -> None:
+        self._ensure_open()
+        if self.policy_store is None:
+            raise RuntimeError("shared identity persistence is not configured")
+        self.policy_store.revoke_delegation(delegation_id, actor_id=actor_id)
+
+    def policy_audit(self, *, limit: int = 100) -> tuple[Mapping[str, Any], ...]:
+        self._ensure_open()
+        if self.policy_store is None:
+            return ()
+        return self.policy_store.audit(limit=limit)
 
     def get_handoff_run(self, handoff: str | HandoffEnvelope) -> Run | None:
         """Return the authoritative Run for a stable handoff, if created."""
@@ -555,6 +1068,8 @@ class AgentCoordinator:
             raise TypeError("redelivery_safe must be bool")
         if not isinstance(receives_envelope, bool):
             raise TypeError("receives_envelope must be bool")
+        if isinstance(capabilities, (str, bytes, bytearray)):
+            raise TypeError("capabilities must be an iterable of strings, not a string")
         try:
             declared_capabilities = frozenset(capabilities)
         except TypeError as exc:
@@ -1148,6 +1663,8 @@ class AgentCoordinator:
         if self._closed:
             return
         if self._owns_execution:
+            if self.policy_store is not None:
+                self.policy_store.close()
             self.execution.close()
         self._closed = True
 
@@ -1796,6 +2313,20 @@ def _handoff_goal(envelope: HandoffEnvelope, fingerprint: str) -> str:
     )
 
 
+def _external_request_fingerprint(envelope: ExternalRunEnvelope) -> str:
+    """Hash all immutable external-run inputs used by a hosted invocation."""
+    payload = {
+        "provider": envelope.provider,
+        "external_run_id": envelope.external_run_id,
+        "goal": envelope.goal,
+        "workspace": envelope.workspace,
+        "payload": envelope.payload,
+        "metadata": dict(envelope.metadata),
+    }
+    encoded = _bounded_json(payload, _DEFAULT_MAX_BYTES, "external run request")
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _snapshot_envelope(envelope: HandoffEnvelope) -> HandoffEnvelope:
     """Deep-copy JSON fields so one dispatch has a stable durable request."""
     return HandoffEnvelope(
@@ -2067,11 +2598,15 @@ def _positive_int(value: int, name: str) -> int:
 
 
 def _positive_seconds(value: float, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or value <= 0
-    ):
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and value > 0
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
         raise ValueError(f"{name} must be a positive finite number")
     return float(value)

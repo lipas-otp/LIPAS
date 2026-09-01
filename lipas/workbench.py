@@ -11,9 +11,11 @@ import contextlib
 import hashlib
 import difflib
 import json
+import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -29,6 +31,22 @@ from .tools import SideEffectClass, Tool, tool
 from .security import SecretDetected, SecretPolicy
 from .sandbox import CommandSandbox, sandbox_from_name
 from .sqlite_storage import connect_sqlite
+from .document_tools import (
+    DocumentToolError,
+    convert_document,
+    read_pdf_text,
+)
+from .code_tools import (
+    CodeToolError,
+    analyze_csv as analyze_csv_file,
+    calculate_expression,
+    execute_python,
+)
+from .archive_tools import (
+    ArchiveToolError,
+    extract_archive as extract_archive_file,
+    inspect_archive as inspect_archive_file,
+)
 
 __all__ = [
     "Approval",
@@ -46,6 +64,63 @@ __all__ = [
 
 
 WORKBENCH_SCHEMA_VERSION = 1
+
+
+def _json_dumps(value: Any) -> str:
+    """Serialize product metadata as canonical, strict JSON."""
+    _validate_json_shape(value, "workbench JSON")
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _json_loads(value: str) -> Any:
+    """Decode only standards-compliant JSON from the product database."""
+    decoded = json.loads(
+        value,
+        parse_constant=lambda raw: (_ for _ in ()).throw(
+            ValueError(f"non-JSON numeric constant {raw!r}")
+        ),
+    )
+    _validate_json_shape(decoded, "workbench JSON")
+    return decoded
+
+
+def _validate_json_shape(
+    value: Any,
+    path: str,
+    *,
+    _active: set[int] | None = None,
+) -> None:
+    """Reject coercive/non-finite values at the product JSON boundary."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite numbers")
+        return
+    if not isinstance(value, (list, tuple, Mapping)):
+        raise TypeError(f"{path} contains unsupported {type(value).__name__}")
+    active = set() if _active is None else _active
+    marker = id(value)
+    if marker in active:
+        raise ValueError(f"{path} must not contain reference cycles")
+    active.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{path} must use string object keys")
+                _validate_json_shape(child, f"{path}.{key}", _active=active)
+        else:
+            for index, child in enumerate(value):
+                _validate_json_shape(child, f"{path}[{index}]", _active=active)
+    finally:
+        active.remove(marker)
 
 
 class WorkspacePolicyError(ValueError):
@@ -276,6 +351,7 @@ class Workbench:
         self.command_sandbox = sandbox_from_name(sandbox)
         self.execution = ExecutionStore(self.execution_path, rowset=rowset)
         self._conn = connect_sqlite(self.product_path)
+        self._closed = False
         try:
             self._init_schema()
         except BaseException:
@@ -293,17 +369,35 @@ class Workbench:
                 "SELECT value FROM workbench_meta WHERE key='schema_version'",
             ).fetchone()
             if row is None:
+                # Metadata is idempotent bootstrap state. Two independent
+                # Workbench handles may open one unified workspace during
+                # startup; the loser must reread the winner's stamp rather
+                # than fail on a UNIQUE race.
                 self._conn.execute(
-                    "INSERT INTO workbench_meta(key,value) VALUES('schema_version',?)",
+                    "INSERT OR IGNORE INTO workbench_meta(key,value) VALUES('schema_version',?)",
                     (str(WORKBENCH_SCHEMA_VERSION),),
                 )
+                row = self._conn.execute(
+                    "SELECT value FROM workbench_meta WHERE key='schema_version'",
+                ).fetchone()
+                if row is None:
+                    raise WorkbenchSchemaVersionMismatch(
+                        "workbench schema version is missing after bootstrap",
+                    )
             elif row[0] != str(WORKBENCH_SCHEMA_VERSION):
+                raise WorkbenchSchemaVersionMismatch(
+                    f"workbench database schema is {row[0]}; this release supports "
+                    f"{WORKBENCH_SCHEMA_VERSION}",
+                )
+            if row[0] != str(WORKBENCH_SCHEMA_VERSION):
                 raise WorkbenchSchemaVersionMismatch(
                     f"workbench database schema is {row[0]}; this release supports "
                     f"{WORKBENCH_SCHEMA_VERSION}",
                 )
 
     def close(self) -> None:
+        if self._closed:
+            return
         first_error: BaseException | None = None
         for resource in (self.execution, self._conn):
             try:
@@ -311,8 +405,13 @@ class Workbench:
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
+        self._closed = True
         if first_error is not None:
             raise first_error
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Workbench is closed")
 
     @contextlib.contextmanager
     def execution_scope(
@@ -327,6 +426,7 @@ class Workbench:
         Concurrent runs therefore cannot close or redirect one another's
         control connection, and this temporary connection has one clear owner.
         """
+        self._ensure_open()
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
         if self.execution.get_run(run_id) is None:
@@ -351,6 +451,7 @@ class Workbench:
         *,
         isolate_changes: bool = False,
     ) -> tuple[Task, Run]:
+        self._ensure_open()
         SecretPolicy().check(goal, path="task.goal")
         task = self.execution.create_task(goal, workspace)
         run = self.execution.create_run(task.id)
@@ -374,6 +475,7 @@ class Workbench:
         return task, run
 
     def create_change_set(self, task_id: str, run_id: str) -> ChangeSet:
+        self._ensure_open()
         task = self.execution.get_task(task_id)
         run = self.execution.get_run(run_id)
         if task is None or run is None or run.task_id != task_id:
@@ -383,11 +485,18 @@ class Workbench:
             return existing
         source = Path(task.workspace).resolve()
         stage = (self.runs_path / run_id / "workspace").resolve()
-        if stage.exists():
+        try:
+            stage.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            # Another Workbench handle may have won the same Run's
+            # ChangeSet race.  Re-read the durable row before treating the
+            # directory as an orphan; never delete a peer's staging tree.
+            existing = self.change_set(task_id)
+            if existing is not None:
+                return existing
             raise WorkspacePolicyError(
                 f"staging workspace already exists without a ChangeSet: {stage}",
             )
-        stage.mkdir(parents=True)
         baseline: dict[str, str] = {}
         total_bytes = 0
         excluded_secret_files = 0
@@ -432,16 +541,22 @@ class Workbench:
             shutil.rmtree(stage, ignore_errors=True)
             raise
         now = time.time()
-        with self._conn:
-            self._conn.execute(
-                "INSERT INTO workbench_change_sets"
-                "(run_id,task_id,source_root,stage_root,baseline_json,state,"
-                "created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)",
-                (
-                    run_id, task_id, str(source), str(stage),
-                    json.dumps(baseline, sort_keys=True), now, now,
-                ),
-            )
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO workbench_change_sets"
+                    "(run_id,task_id,source_root,stage_root,baseline_json,state,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)",
+                    (
+                        run_id, task_id, str(source), str(stage),
+                        _json_dumps(baseline), now, now,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            existing = self.change_set(task_id)
+            if existing is not None:
+                return existing
+            raise
         self.add_event(
             task_id=task_id,
             run_id=run_id,
@@ -459,6 +574,7 @@ class Workbench:
         return value
 
     def change_set(self, task_id: str) -> ChangeSet | None:
+        self._ensure_open()
         row = self._conn.execute(
             "SELECT task_id,run_id,source_root,stage_root,baseline_json,state,"
             "created_at,updated_at FROM workbench_change_sets WHERE task_id=?",
@@ -473,9 +589,14 @@ class Workbench:
             raise WorkspacePolicyError(
                 "persisted ChangeSet source does not match its Task workspace",
             )
+        run = self.execution.get_run(str(row[1]))
+        if run is None or run.task_id != task_id:
+            raise WorkspacePolicyError(
+                "persisted ChangeSet run does not belong to its Task",
+            )
         if not stage.is_relative_to(self.runs_path):
             raise WorkspacePolicyError("persisted ChangeSet stage escapes workbench home")
-        baseline = json.loads(row[4])
+        baseline = _json_loads(row[4])
         if (
             not isinstance(baseline, dict)
             or any(
@@ -486,6 +607,10 @@ class Workbench:
             )
         ):
             raise TypeError("ChangeSet baseline must map paths to SHA-256 strings")
+        if row[5] not in {"open", "ready", "applied", "discarded"}:
+            raise WorkspacePolicyError(
+                f"persisted ChangeSet has invalid state {row[5]!r}",
+            )
         return ChangeSet(
             task_id=row[0], run_id=row[1], source_root=str(source),
             stage_root=str(stage), baseline=baseline, state=row[5],
@@ -493,6 +618,7 @@ class Workbench:
         )
 
     def prepare_change_set(self, task_id: str) -> ChangeSet | None:
+        self._ensure_open()
         value = self.change_set(task_id)
         if value is None or value.state != "open":
             return value
@@ -514,6 +640,7 @@ class Workbench:
         return self.change_set(task_id)
 
     def change_set_paths(self, task_id: str) -> tuple[str, ...]:
+        self._ensure_open()
         value = self.change_set(task_id)
         if value is None:
             return ()
@@ -525,6 +652,7 @@ class Workbench:
         ))
 
     def change_set_diff(self, task_id: str) -> str:
+        self._ensure_open()
         value = self.change_set(task_id)
         if value is None:
             return ""
@@ -555,6 +683,7 @@ class Workbench:
         return _redact_text("".join(chunks)[-_CHANGESET_MAX_DIFF_BYTES:])
 
     def apply_change_set(self, task_id: str) -> tuple[str, ...]:
+        self._ensure_open()
         value = self.change_set(task_id)
         if value is None:
             raise ValueError(f"task {task_id!r} has no ChangeSet")
@@ -633,6 +762,7 @@ class Workbench:
         return paths
 
     def discard_change_set(self, task_id: str) -> None:
+        self._ensure_open()
         value = self.change_set(task_id)
         if value is None:
             raise ValueError(f"task {task_id!r} has no ChangeSet")
@@ -667,7 +797,10 @@ class Workbench:
         ).fetchone()
         if row is None:
             return
-        report = json.loads(row[0])
+        report = _json_loads(row[0])
+        if not isinstance(report, Mapping):
+            raise WorkspacePolicyError("persisted report is not an object")
+        report = dict(report)
         risks = [
             value for value in report.get("unresolved_risks", ())
             if not str(value).startswith("change set is ")
@@ -679,7 +812,7 @@ class Workbench:
         with self._conn:
             self._conn.execute(
                 "UPDATE workbench_reports SET report_json=? WHERE task_id=?",
-                (json.dumps(report, sort_keys=True), task_id),
+                (_json_dumps(report), task_id),
             )
 
     def claims_path_for_run(self, run_id: str) -> Path:
@@ -690,6 +823,7 @@ class Workbench:
         Runs receive separate sessions and can execute concurrently without
         sharing one hot Claim sequence or budget projection.
         """
+        self._ensure_open()
         run = self.execution.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -705,6 +839,11 @@ class Workbench:
             else self.runs_path / run_id / "claims.db"
         ).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            # Run evidence is durable product state, not a public artifact.
+            # Keep the per-run directory private before its claims database is
+            # first created by ``open_session``.
+            os.chmod(path.parent, 0o700)
         with self._conn:
             self._conn.execute(
                 "INSERT OR IGNORE INTO workbench_run_sessions"
@@ -729,6 +868,7 @@ class Workbench:
 
     def claim_session_paths(self) -> tuple[tuple[str, Path], ...]:
         """List registered Run evidence paths without creating missing tapes."""
+        self._ensure_open()
         rows = self._conn.execute(
             "SELECT run_id,claims_path FROM workbench_run_sessions ORDER BY run_id",
         ).fetchall()
@@ -738,9 +878,11 @@ class Workbench:
         )
 
     def list_tasks(self) -> tuple[Task, ...]:
+        self._ensure_open()
         return self.execution.list_tasks()
 
     def approvals(self, *, pending_only: bool = False) -> tuple[Approval, ...]:
+        self._ensure_open()
         from .execution import InterruptState
         state = InterruptState.PENDING if pending_only else None
         return tuple(
@@ -755,6 +897,7 @@ class Workbench:
         allow: bool,
         response: Any = None,
     ) -> Approval:
+        self._ensure_open()
         interrupt = self.execution.resolve_interrupt(
             approval_id, allow=allow, response=response,
         )
@@ -771,6 +914,7 @@ class Workbench:
         return Approval.from_interrupt(interrupt)
 
     def record_approval_required(self, interrupt: Interrupt) -> RunEvent:
+        self._ensure_open()
         run = self.execution.get_run(interrupt.run_id)
         if run is None:
             raise KeyError(interrupt.run_id)
@@ -786,6 +930,7 @@ class Workbench:
         )
 
     def record_run_state(self, run_id: str) -> RunEvent:
+        self._ensure_open()
         run = self.execution.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -806,7 +951,16 @@ class Workbench:
         data: Mapping[str, Any],
         event_id: str | None = None,
     ) -> RunEvent:
+        self._ensure_open()
         self._require_task_run(task_id, run_id)
+        if not isinstance(event_id, str) and event_id is not None:
+            raise TypeError("event_id must be a string or None")
+        if event_id is not None and not event_id.strip():
+            raise ValueError("event_id must be non-empty")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("kind must be a non-empty string")
+        if not isinstance(data, Mapping):
+            raise TypeError("data must be a mapping")
         event = RunEvent(
             id=event_id or f"event_{uuid.uuid4().hex}",
             task_id=task_id,
@@ -821,9 +975,7 @@ class Workbench:
                 "(id,task_id,run_id,kind,data_json,created_at) VALUES(?,?,?,?,?,?)",
                 (
                     event.id, event.task_id, event.run_id, event.kind,
-                    json.dumps(
-                        dict(event.data), sort_keys=True, allow_nan=False,
-                    ),
+                    _json_dumps(dict(event.data)),
                     event.created_at,
                 ),
             )
@@ -835,7 +987,7 @@ class Workbench:
         assert row is not None
         stored = RunEvent(
             id=row[0], task_id=row[1], run_id=row[2], kind=row[3],
-            data=json.loads(row[4]), created_at=row[5],
+            data=_json_loads(row[4]), created_at=row[5],
         )
         if (
             stored.task_id != event.task_id
@@ -849,17 +1001,26 @@ class Workbench:
         return stored
 
     def events(self, task_id: str) -> tuple[RunEvent, ...]:
-        return tuple(
-            RunEvent(
+        self._ensure_open()
+        values: list[RunEvent] = []
+        for row in self._conn.execute(
+            "SELECT id,task_id,run_id,kind,data_json,created_at "
+            "FROM workbench_events WHERE task_id=? ORDER BY created_at,id",
+            (task_id,),
+        ):
+            run = self.execution.get_run(str(row[2]))
+            if run is None or run.task_id != task_id:
+                raise WorkspacePolicyError(
+                    "persisted workbench event run does not belong to its Task",
+                )
+            data = _json_loads(row[4])
+            if not isinstance(data, Mapping):
+                raise WorkspacePolicyError("persisted workbench event data is not an object")
+            values.append(RunEvent(
                 id=row[0], task_id=row[1], run_id=row[2], kind=row[3],
-                data=json.loads(row[4]), created_at=row[5],
-            )
-            for row in self._conn.execute(
-                "SELECT id,task_id,run_id,kind,data_json,created_at "
-                "FROM workbench_events WHERE task_id=? ORDER BY created_at,id",
-                (task_id,),
-            )
-        )
+                data=data, created_at=row[5],
+            ))
+        return tuple(values)
 
     def add_artifact(
         self,
@@ -871,7 +1032,19 @@ class Workbench:
         sha256: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> Artifact:
+        self._ensure_open()
         self._require_task_run(task_id, run_id)
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("kind must be a non-empty string")
+        if path is not None and (not isinstance(path, str) or not path.strip()):
+            raise ValueError("path must be a non-empty string or None")
+        if sha256 is not None and (
+            not isinstance(sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        ):
+            raise ValueError("sha256 must be a lowercase SHA-256 string or None")
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
         artifact = Artifact(
             id=f"artifact_{uuid.uuid4().hex}",
             task_id=task_id,
@@ -882,7 +1055,7 @@ class Workbench:
             metadata=dict(metadata or {}),
             created_at=time.time(),
         )
-        encoded = json.dumps(dict(artifact.metadata), sort_keys=True)
+        encoded = _json_dumps(dict(artifact.metadata))
         with self._conn:
             self._conn.execute(
                 "INSERT INTO workbench_artifacts"
@@ -907,20 +1080,30 @@ class Workbench:
         return artifact
 
     def artifacts(self, task_id: str) -> tuple[Artifact, ...]:
-        return tuple(
-            Artifact(
+        self._ensure_open()
+        values: list[Artifact] = []
+        for row in self._conn.execute(
+            "SELECT id,task_id,run_id,kind,path,sha256,metadata_json,created_at "
+            "FROM workbench_artifacts WHERE task_id=? ORDER BY created_at,id",
+            (task_id,),
+        ):
+            run = self.execution.get_run(str(row[2]))
+            if run is None or run.task_id != task_id:
+                raise WorkspacePolicyError(
+                    "persisted artifact run does not belong to its Task",
+                )
+            metadata = _json_loads(row[6])
+            if not isinstance(metadata, Mapping):
+                raise WorkspacePolicyError("persisted artifact metadata is not an object")
+            values.append(Artifact(
                 id=row[0], task_id=row[1], run_id=row[2], kind=row[3],
-                path=row[4], sha256=row[5], metadata=json.loads(row[6]),
+                path=row[4], sha256=row[5], metadata=metadata,
                 created_at=row[7],
-            )
-            for row in self._conn.execute(
-                "SELECT id,task_id,run_id,kind,path,sha256,metadata_json,created_at "
-                "FROM workbench_artifacts WHERE task_id=? ORDER BY created_at,id",
-                (task_id,),
-            )
-        )
+            ))
+        return tuple(values)
 
     def workspace_tools(self, task_id: str, run_id: str) -> tuple[Tool, ...]:
+        self._ensure_open()
         task = self.execution.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
@@ -962,6 +1145,7 @@ class Workbench:
         self, task_id: str,
     ) -> Callable[[Tool, Mapping[str, Any]], Mapping[str, Any] | None]:
         """Return policy for direct or staged workspace execution."""
+        self._ensure_open()
         staged = self.change_set(task_id) is not None
 
         def decide(
@@ -976,6 +1160,7 @@ class Workbench:
         return decide
 
     def build_report(self, task_id: str, result: FinalResult | None = None) -> TaskReport:
+        self._ensure_open()
         task = self.execution.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
@@ -1004,7 +1189,9 @@ class Workbench:
             if change_set is not None
             else tuple(sorted({
                 value.path for value in artifacts
-                if value.kind == "file_write" and value.path is not None
+                if value.kind in {
+                    "file_write", "document_conversion", "archive_extraction",
+                } and value.path is not None
             }))
         )
         diff = (
@@ -1051,22 +1238,42 @@ class Workbench:
                 "VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
                 "run_id=excluded.run_id,report_json=excluded.report_json,"
                 "created_at=excluded.created_at",
-                (task.id, run.id, json.dumps(report.as_dict(), sort_keys=True), report.created_at),
+                (task.id, run.id, _json_dumps(report.as_dict()), report.created_at),
             )
         self.add_event(
             task_id=task.id,
             run_id=run.id,
             kind="report_created",
             data={"status": report.status, "verified": report.verified},
+            # Report generation is a projection and is safe to retry.  A
+            # stable identity prevents repeated CLI/API reads from appending
+            # an unbounded duplicate event stream.
+            event_id=f"run:{run.id}:report:created",
         )
         return report
 
     def get_report(self, task_id: str) -> Mapping[str, Any] | None:
+        self._ensure_open()
         row = self._conn.execute(
             "SELECT report_json FROM workbench_reports WHERE task_id=?",
             (task_id,),
         ).fetchone()
-        return json.loads(row[0]) if row is not None else None
+        if row is None:
+            return None
+        report = _json_loads(row[0])
+        if not isinstance(report, Mapping):
+            raise WorkspacePolicyError("persisted report is not an object")
+        if report.get("task_id") != task_id:
+            raise WorkspacePolicyError(
+                "persisted report task identity does not match its lookup key",
+            )
+        run_id = report.get("run_id")
+        run = self.execution.get_run(str(run_id)) if isinstance(run_id, str) else None
+        if run is None or run.task_id != task_id:
+            raise WorkspacePolicyError(
+                "persisted report run does not belong to its Task",
+            )
+        return report
 
 
 class _WorkspaceCapabilities:
@@ -1074,6 +1281,13 @@ class _WorkspaceCapabilities:
     _MAX_OUTPUT_BYTES = 64_000
     _MAX_FILES = 500
     _MAX_TIMEOUT = 300
+    # Keep this within the ChangeSet per-file snapshot limit so an isolated
+    # task can always read a document that the tool advertises as supported.
+    _MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+    _MAX_DOCUMENT_CHARS = 120_000
+    _MAX_CODE_SOURCE_BYTES = 100_000
+    _MAX_CODE_OUTPUT_BYTES = 64_000
+    _MAX_CODE_TIMEOUT = 300
     _COMMANDS = {
         "cargo", "cmake", "ctest", "dart", "flutter", "go", "make",
         "mypy", "npm", "pnpm", "pyright", "pytest", "python", "python3",
@@ -1096,7 +1310,12 @@ class _WorkspaceCapabilities:
         self._git_diff_provider = git_diff_provider
 
     def _path(self, relative_path: str) -> Path:
-        raw = Path(relative_path)
+        if not isinstance(relative_path, str):
+            raise WorkspacePolicyError("workspace path must be a string")
+        try:
+            raw = Path(relative_path)
+        except (TypeError, ValueError) as exc:
+            raise WorkspacePolicyError("workspace path is invalid") from exc
         if raw.is_absolute():
             raise WorkspacePolicyError("absolute workspace paths are denied")
         candidate = (self.root / raw).resolve(strict=False)
@@ -1109,8 +1328,98 @@ class _WorkspaceCapabilities:
             raise WorkspacePolicyError("access to likely secret material is denied")
         return candidate
 
+    def _relative(self, path: Path) -> str:
+        """Return a workspace-relative POSIX path for evidence and results."""
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError as exc:  # defensive: callers should use ``_path``
+            raise WorkspacePolicyError("path is outside the selected workspace") from exc
+
+    def _file(self, relative_path: str) -> Path:
+        """Resolve and require one regular workspace file."""
+        path = self._path(relative_path)
+        if not path.is_file():
+            raise WorkspacePolicyError(f"not a file: {relative_path}")
+        return path
+
+    @staticmethod
+    def _digest(path: Path) -> tuple[bytes, str]:
+        """Read a file once and return bytes plus its SHA-256 digest."""
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise WorkspacePolicyError(f"could not read file: {exc}") from exc
+        return data, hashlib.sha256(data).hexdigest()
+
+    def _record_file_evidence(
+        self,
+        *,
+        kind: str,
+        path: Path,
+        metadata: Mapping[str, Any] | None = None,
+        data: bytes | None = None,
+    ) -> str:
+        """Record a file-backed artifact and return its digest.
+
+        Passing ``data`` avoids a second read when a parser already consumed
+        the bytes.  Evidence always stores the workspace-relative path.
+        """
+        if data is None:
+            _, digest = self._digest(path)
+        else:
+            digest = hashlib.sha256(data).hexdigest()
+        self._evidence(
+            kind=kind,
+            path=self._relative(path),
+            sha256=digest,
+            metadata=dict(metadata or {}),
+        )
+        return digest
+
+    @staticmethod
+    def _atomic_write(path: Path, data: bytes) -> None:
+        """Atomically replace ``path`` while keeping temporary files local."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(data)
+            try:
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            raise WorkspacePolicyError(f"could not write file: {exc}") from exc
+
     def tools(self) -> tuple[Tool, ...]:
         owner = self
+
+        @tool(side_effect="read_only")
+        def get_workspace_info() -> dict[str, object]:
+            """Return the exact task workspace and its write boundary."""
+            staged = owner._git_status_provider is not None
+            return {
+                "current_working_directory": str(owner.root),
+                "selected_workspace": str(owner.root),
+                "filesystem_capability": "read_write",
+                "available_capabilities": {
+                    "document_read": True,
+                    "document_conversion": True,
+                    "archive_inspection": True,
+                    "archive_extraction": True,
+                    "data_analysis": True,
+                    "arithmetic": True,
+                    "python_execution": True,
+                },
+                "write_target": "staging_workspace" if staged else "selected_workspace",
+                "writes_staged": staged,
+                "write_requires": (
+                    "finish the Run, review the ChangeSet, then explicitly apply it"
+                    if staged else "the configured Workbench approval policy"
+                ),
+                "shell_capability": "approved_bounded_commands",
+                "network_capability": "sandbox policy",
+            }
 
         @tool(side_effect="read_only")
         def list_workspace_files(relative_path: str = ".") -> list[str]:
@@ -1133,10 +1442,8 @@ class _WorkspaceCapabilities:
         @tool(side_effect="read_only")
         def read_workspace_file(relative_path: str) -> str:
             """Read one UTF-8 text file inside the selected workspace."""
-            path = owner._path(relative_path)
-            if not path.is_file():
-                raise WorkspacePolicyError(f"not a file: {relative_path}")
-            data = path.read_bytes()
+            path = owner._file(relative_path)
+            data, _ = owner._digest(path)
             if len(data) > owner._MAX_FILE_BYTES:
                 raise WorkspacePolicyError("file exceeds the 1 MB read limit")
             try:
@@ -1144,32 +1451,312 @@ class _WorkspaceCapabilities:
             except UnicodeDecodeError as exc:
                 raise WorkspacePolicyError("binary/non-UTF-8 files are not readable") from exc
 
+        @tool(side_effect="read_only")
+        def search_workspace(
+            query: str,
+            relative_path: str = ".",
+            max_results: int = 100,
+        ) -> list[dict[str, object]]:
+            """Find a literal string in bounded UTF-8 workspace files."""
+            if not isinstance(query, str) or not query:
+                raise WorkspacePolicyError("query must be a non-empty string")
+            if (
+                isinstance(max_results, bool)
+                or not isinstance(max_results, int)
+                or not 1 <= max_results <= 500
+            ):
+                raise WorkspacePolicyError("max_results must be between 1 and 500")
+            base = owner._path(relative_path)
+            if not base.is_dir():
+                raise WorkspacePolicyError(f"not a directory: {relative_path}")
+            matches: list[dict[str, object]] = []
+            files_seen = 0
+            for path in sorted(base.rglob("*")):
+                if len(matches) >= max_results:
+                    break
+                if ".git" in path.relative_to(owner.root).parts:
+                    continue
+                if path.is_symlink() or _sensitive_path(path.relative_to(owner.root)):
+                    continue
+                if not path.is_file():
+                    continue
+                files_seen += 1
+                if files_seen > owner._MAX_FILES:
+                    break
+                try:
+                    too_large = path.stat().st_size > owner._MAX_FILE_BYTES
+                except OSError:
+                    continue
+                if too_large:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for line_number, line in enumerate(text.splitlines(), 1):
+                    if query not in line:
+                        continue
+                    matches.append({
+                        "path": path.relative_to(owner.root).as_posix(),
+                        "line": line_number,
+                        "text": _redact_text(line[:500]),
+                    })
+                    if len(matches) >= max_results:
+                        break
+            return matches
+
+        @tool(side_effect="read_only")
+        def read_pdf(
+            relative_path: str,
+            max_pages: int = 200,
+            max_chars: int = 120_000,
+        ) -> dict[str, object]:
+            """Extract bounded text and page metadata from a workspace PDF."""
+            path = owner._file(relative_path)
+            try:
+                text, metadata = read_pdf_text(
+                    path,
+                    max_bytes=owner._MAX_DOCUMENT_BYTES,
+                    max_pages=max_pages,
+                    max_chars=max_chars,
+                )
+            except DocumentToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            owner._record_file_evidence(
+                kind="document_read",
+                path=path,
+                metadata={"format": "pdf", **dict(metadata)},
+            )
+            return {
+                "path": owner._relative(path),
+                "text": text,
+                **dict(metadata),
+            }
+
+        @tool(side_effect="read_only")
+        def calculate(expression: str) -> dict[str, object]:
+            """Evaluate a bounded arithmetic expression without code or I/O."""
+            try:
+                result = calculate_expression(expression)
+            except CodeToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            return {
+                "expression": expression,
+                "result": result,
+                "result_type": type(result).__name__,
+            }
+
+        @tool(side_effect="read_only")
+        def analyze_csv(
+            relative_path: str,
+            max_rows: int = 100_000,
+        ) -> dict[str, object]:
+            """Profile a bounded UTF-8 CSV without exposing row contents."""
+            path = owner._file(relative_path)
+            if path.suffix.lower() != ".csv":
+                raise WorkspacePolicyError("analyze_csv requires a .csv file")
+            try:
+                profile = analyze_csv_file(
+                    path,
+                    max_bytes=owner._MAX_DOCUMENT_BYTES,
+                    max_rows=max_rows,
+                )
+            except CodeToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            owner._record_file_evidence(
+                kind="data_analysis",
+                path=path,
+                metadata={"format": "csv", **profile.as_dict()},
+            )
+            return {
+                "path": owner._relative(path),
+                **profile.as_dict(),
+            }
+
+        @tool(side_effect="read_only")
+        def inspect_archive(
+            relative_path: str,
+            max_members: int = 10_000,
+        ) -> dict[str, object]:
+            """Inspect a ZIP/TAR without extracting untrusted members."""
+            path = owner._file(relative_path)
+            try:
+                summary = inspect_archive_file(
+                    path,
+                    max_bytes=owner._MAX_DOCUMENT_BYTES,
+                    max_members=max_members,
+                    max_expanded_bytes=owner._MAX_DOCUMENT_BYTES,
+                )
+            except ArchiveToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            owner._record_file_evidence(
+                kind="archive_inspection",
+                path=path,
+                metadata=summary.as_dict(),
+            )
+            return {"path": owner._relative(path), **summary.as_dict()}
+
+        @tool(name="extract_archive", side_effect="idempotent_write")
+        async def extract_archive_tool(
+            relative_path: str,
+            destination_path: str,
+            max_members: int = 10_000,
+        ) -> dict[str, object]:
+            """Extract a validated ZIP/TAR into a new workspace directory."""
+            source = owner._file(relative_path)
+            destination = owner._path(destination_path)
+            try:
+                summary = extract_archive_file(
+                    source,
+                    destination,
+                    max_bytes=owner._MAX_DOCUMENT_BYTES,
+                    max_members=max_members,
+                    max_expanded_bytes=owner._MAX_DOCUMENT_BYTES,
+                )
+            except ArchiveToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            relative = owner._relative(destination)
+            source_relative = owner._relative(source)
+            digest = owner._digest(source)[1]
+            owner._evidence(
+                kind="archive_extraction",
+                path=relative,
+                sha256=digest,
+                metadata={
+                    "source_path": source_relative,
+                    **summary.as_dict(),
+                },
+            )
+            return {
+                "source_path": source_relative,
+                "destination_path": relative,
+                **summary.as_dict(),
+            }
+
+        @tool(side_effect="external_write")
+        async def python_exec(
+            source: str,
+            timeout_seconds: int = 30,
+            max_output_bytes: int = 64_000,
+        ) -> dict[str, object]:
+            """Run bounded Python in a temporary sandbox, never the project root.
+
+            The code receives no implicit workspace files.  Use the explicit
+            file tools for project data and keep generated changes reviewable.
+            The Tool is classified as an external write because arbitrary
+            Python may have effects when the Workbench is configured with the
+            explicitly unsafe ``local`` sandbox; normal execution therefore
+            remains behind the Workbench approval policy.
+            """
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, int)
+                or timeout_seconds < 1
+            ):
+                raise WorkspacePolicyError("timeout_seconds must be a positive integer")
+            if (
+                isinstance(max_output_bytes, bool)
+                or not isinstance(max_output_bytes, int)
+                or max_output_bytes < 1
+            ):
+                raise WorkspacePolicyError("max_output_bytes must be a positive integer")
+            if timeout_seconds > owner._MAX_CODE_TIMEOUT:
+                raise WorkspacePolicyError(
+                    f"timeout_seconds must be at most {owner._MAX_CODE_TIMEOUT}",
+                )
+            if max_output_bytes > owner._MAX_CODE_OUTPUT_BYTES:
+                raise WorkspacePolicyError(
+                    f"max_output_bytes must be at most {owner._MAX_CODE_OUTPUT_BYTES}",
+                )
+            try:
+                result = await execute_python(
+                    source,
+                    sandbox=owner.sandbox,
+                    timeout_seconds=timeout_seconds,
+                    max_output_bytes=max_output_bytes,
+                    max_source_bytes=owner._MAX_CODE_SOURCE_BYTES,
+                )
+            except CodeToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            metadata = result.as_dict()
+            owner._evidence(
+                kind="code_execution",
+                metadata={
+                    key: value for key, value in metadata.items()
+                    if key not in {"stdout", "stderr"}
+                },
+            )
+            return metadata
+
         @tool(side_effect="idempotent_write")
         async def write_workspace_file(
             relative_path: str, content: str,
         ) -> dict[str, object]:
             """Atomically replace one UTF-8 file inside the selected workspace."""
+            if not isinstance(content, str):
+                raise WorkspacePolicyError("content must be a string")
             encoded = content.encode("utf-8")
             if len(encoded) > owner._MAX_FILE_BYTES:
                 raise WorkspacePolicyError("file exceeds the 1 MB write limit")
             path = owner._path(relative_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            before = path.read_bytes() if path.is_file() else None
-            before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
-            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-                temporary = Path(handle.name)
-                handle.write(encoded)
-            try:
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            before_hash = owner._digest(path)[1] if path.is_file() else None
+            owner._atomic_write(path, encoded)
             after_hash = hashlib.sha256(encoded).hexdigest()
-            relative = path.relative_to(owner.root).as_posix()
+            relative = owner._relative(path)
             owner._evidence(
                 kind="file_write", path=relative, sha256=after_hash,
                 metadata={"before_sha256": before_hash, "bytes": len(encoded)},
             )
             return {"path": relative, "sha256": after_hash, "bytes": len(encoded)}
+
+        @tool(side_effect="idempotent_write")
+        async def convert_workspace_file(
+            source_path: str,
+            destination_path: str,
+            target_format: str | None = None,
+        ) -> dict[str, object]:
+            """Convert a bounded document into a new workspace file.
+
+            The source is never replaced.  The destination remains inside the
+            task workspace and is staged when the task uses a ChangeSet.
+            """
+            source = owner._file(source_path)
+            destination = owner._path(destination_path)
+            if source == destination:
+                raise WorkspacePolicyError("source and destination must differ")
+            selected_format = target_format or destination.suffix
+            try:
+                converted = convert_document(
+                    source,
+                    target_format=selected_format,
+                    max_bytes=owner._MAX_DOCUMENT_BYTES,
+                    max_chars=owner._MAX_DOCUMENT_CHARS,
+                )
+            except DocumentToolError as exc:
+                raise WorkspacePolicyError(str(exc)) from exc
+            owner._atomic_write(destination, converted.content)
+            relative = owner._relative(destination)
+            source_relative = owner._relative(source)
+            digest = owner._record_file_evidence(
+                kind="document_conversion",
+                path=destination,
+                metadata={
+                    "source_path": source_relative,
+                    "source_format": converted.source_format,
+                    "target_format": converted.target_format,
+                    **dict(converted.metadata),
+                },
+                data=converted.content,
+            )
+            return {
+                "source_path": source_relative,
+                "destination_path": relative,
+                "source_format": converted.source_format,
+                "target_format": converted.target_format,
+                "sha256": digest,
+                "bytes": len(converted.content),
+                **dict(converted.metadata),
+            }
 
         @tool(side_effect="external_write")
         async def run_workspace_command(
@@ -1193,7 +1780,10 @@ class _WorkspaceCapabilities:
             return _git_capture(owner.root, ["diff", "--no-ext-diff"])
 
         return (
-            list_workspace_files, read_workspace_file, write_workspace_file,
+            get_workspace_info, list_workspace_files, read_workspace_file, search_workspace,
+            read_pdf,
+            calculate, analyze_csv, inspect_archive, extract_archive_tool, python_exec,
+            write_workspace_file, convert_workspace_file,
             run_workspace_command, git_status, git_diff,
         )
 

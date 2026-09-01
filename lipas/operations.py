@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -156,6 +157,10 @@ class OperationJournal:
                 result_json TEXT, provider_reference TEXT, error_json TEXT,
                 effect_id TEXT, provider_request_id TEXT,
                 created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_provider_request_id "
+                "ON operations(provider_request_id)",
+            )
             self._conn.execute("""CREATE TABLE IF NOT EXISTS operation_audit_events (
                 claim_id TEXT PRIMARY KEY, tag TEXT NOT NULL,
                 fields_json TEXT NOT NULL, created_at REAL NOT NULL)""")
@@ -192,13 +197,29 @@ class OperationJournal:
     def __exit__(self, *_: Any) -> None: self.close()
 
     def get(self, key: str) -> Operation | None:
+        self._ensure_open()
+        key = _operation_text(key, "operation key")
         row = self._conn.execute("SELECT key,kind,request_json,state,result_json,provider_reference,error_json,effect_id,provider_request_id FROM operations WHERE key=?", (key,)).fetchone()
         if row is None:
             return None
+        if row[3] not in {"pending", "succeeded", "failed", "uncertain"}:
+            raise OperationStateError(
+                f"operation {key!r} has invalid persisted state {row[3]!r}",
+            )
+        request = _loads_strict(row[2])
+        if not isinstance(request, Mapping):
+            raise OperationStateError(
+                f"operation {key!r} request is not a JSON object",
+            )
+        result = _loads_strict(row[4]) if row[4] else None
+        error = _loads_strict(row[6]) if row[6] else None
+        if error is not None and not isinstance(error, Mapping):
+            raise OperationStateError(
+                f"operation {key!r} error is not a JSON object",
+            )
         return Operation(
-            row[0], row[1], json.loads(row[2]), row[3],
-            json.loads(row[4]) if row[4] else None, row[5],
-            json.loads(row[6]) if row[6] else None, row[7], row[8],
+            row[0], row[1], dict(request), row[3],
+            result, row[5], error, row[7], row[8],
         )
 
     def prepare(
@@ -226,20 +247,23 @@ class OperationJournal:
         provider_request_id: str | None,
     ) -> tuple[Operation, bool]:
         """Atomically return both the journal row and submission ownership."""
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("idempotency key must be a non-empty string")
-        if not isinstance(kind, str) or not kind.strip():
-            raise ValueError("operation kind must be a non-empty string")
+        self._ensure_open()
+        key = _operation_text(key, "idempotency key")
+        kind = _operation_text(kind, "operation kind")
         if not isinstance(request, Mapping):
             raise TypeError("operation request must be a mapping")
         if effect_id is not None and (
             not isinstance(effect_id, str) or not effect_id.strip()
         ):
             raise ValueError("effect_id must be a non-empty string or None")
+        if effect_id is not None:
+            effect_id = effect_id.strip()
         if provider_request_id is not None and (
             not isinstance(provider_request_id, str) or not provider_request_id.strip()
         ):
             raise ValueError("provider_request_id must be a non-empty string or None")
+        if provider_request_id is not None:
+            provider_request_id = provider_request_id.strip()
         embedded_provider_id = request.get("provider_request_id")
         if embedded_provider_id is not None and (
             not isinstance(embedded_provider_id, str) or not embedded_provider_id.strip()
@@ -247,6 +271,8 @@ class OperationJournal:
             raise ValueError(
                 "request provider_request_id must be a non-empty string or absent",
             )
+        if embedded_provider_id is not None:
+            embedded_provider_id = embedded_provider_id.strip()
         if (
             provider_request_id is not None
             and embedded_provider_id is not None
@@ -256,10 +282,38 @@ class OperationJournal:
                 "provider_request_id conflicts with request provider_request_id",
             )
         provider_request_id = provider_request_id or embedded_provider_id or key
-        payload = json.dumps(dict(request), sort_keys=True, separators=(",", ":"))
+        request_data = dict(request)
+        if embedded_provider_id is not None:
+            # Provider identity is canonicalized independently of the
+            # operation key; persist the normalized value so equivalent
+            # retries differing only by surrounding whitespace converge.
+            request_data["provider_request_id"] = embedded_provider_id
+        canonical_request = _strict_json_copy(request_data, "operation request")
+        if not isinstance(canonical_request, Mapping):
+            raise ValueError("operation request must be a JSON object")
+        payload = json.dumps(
+            canonical_request, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+        # Keep the returned Operation detached from caller-owned nested
+        # mappings. The JSON round-trip is also the exact comparison payload
+        # used for idempotency conflicts.
+        canonical_request = _loads_strict(payload)
         now = time.time()
         try:
             with immediate_transaction(self._conn):
+                # A provider request identity is globally unique within one
+                # journal. Reusing it under another LIPAS operation key would
+                # defeat provider-side idempotency and can duplicate an
+                # external write after a retry.
+                existing_provider = self._conn.execute(
+                    "SELECT key FROM operations WHERE provider_request_id=? AND key<>?",
+                    (provider_request_id, key),
+                ).fetchone()
+                if existing_provider is not None:
+                    raise ValueError(
+                        "provider_request_id is already bound to another operation",
+                    )
                 self._conn.execute(
                     "INSERT INTO operations"
                     "(key,kind,request_json,state,effect_id,provider_request_id,"
@@ -268,17 +322,17 @@ class OperationJournal:
                 )
                 self._record_audit_event(
                     TAG_OPERATION_PREPARED,
-                Operation(
-                    key, kind, dict(request), "pending", effect_id=effect_id,
-                    provider_request_id=provider_request_id,
-                ),
+                    Operation(
+                        key, kind, canonical_request, "pending", effect_id=effect_id,
+                        provider_request_id=provider_request_id,
+                    ),
                 )
         except sqlite3.IntegrityError:
             existing = self.get(key)
             assert existing is not None
             if (
                 existing.kind != kind
-                or dict(existing.request) != dict(request)
+                or dict(existing.request) != canonical_request
                 or (effect_id is not None and existing.effect_id != effect_id)
                 or (
                     provider_request_id is not None
@@ -312,18 +366,35 @@ class OperationJournal:
         success into a failure.  The conditional SQL update also prevents two
         processes from both treating the same pending row as theirs to settle.
         """
+        key = _operation_text(key, "operation key")
         if state not in {"uncertain", "succeeded", "failed"}:
             raise ValueError("operation state must be uncertain, succeeded, or failed")
+        if provider_reference is not None and (
+            not isinstance(provider_reference, str) or not provider_reference.strip()
+        ):
+            raise ValueError(
+                "provider_reference must be a non-empty string or None",
+            )
+        if provider_reference is not None:
+            provider_reference = provider_reference.strip()
+        if error is not None and not isinstance(error, Mapping):
+            raise TypeError("error must be a mapping or None")
         current = self.get(key)
         if current is None:
             raise KeyError(key)
 
-        new_error = dict(error) if error else None
+        new_error = (
+            _strict_json_copy(dict(error), "operation error")
+            if error is not None else None
+        )
+        if new_error is not None and not isinstance(new_error, Mapping):
+            raise ValueError("operation error must be a JSON object")
+        normalized_result = _strict_json_copy(result, "operation result")
         same_outcome = (
             current.state == state
-            and current.result == result
+            and current.result == normalized_result
             and current.provider_reference == provider_reference
-            and (dict(current.error) if current.error else None) == new_error
+            and (dict(current.error) if current.error is not None else None) == new_error
         )
         if same_outcome:
             self._repair_audit_batch()
@@ -345,9 +416,11 @@ class OperationJournal:
                 f"error_json=?,updated_at=? WHERE key=? AND state IN ({placeholders})",
                 (
                     state,
-                    json.dumps(result, sort_keys=True) if result is not None else None,
+                    json.dumps(normalized_result, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                    if normalized_result is not None else None,
                     provider_reference,
-                    json.dumps(new_error, sort_keys=True) if new_error else None,
+                    json.dumps(new_error, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                    if new_error is not None else None,
                     time.time(),
                     key,
                     *allowed_from,
@@ -359,7 +432,7 @@ class OperationJournal:
                     current.kind,
                     current.request,
                     state,
-                    result,
+                    normalized_result,
                     provider_reference,
                     new_error,
                     current.effect_id,
@@ -379,9 +452,9 @@ class OperationJournal:
             assert latest is not None
             latest_matches = (
                 latest.state == state
-                and latest.result == result
+                and latest.result == normalized_result
                 and latest.provider_reference == provider_reference
-                and (dict(latest.error) if latest.error else None) == new_error
+                and (dict(latest.error) if latest.error is not None else None) == new_error
             )
             if latest_matches:
                 self._repair_audit_batch()
@@ -459,7 +532,14 @@ class OperationJournal:
                 raise
 
     def pending(self) -> tuple[Operation, ...]:
-        return tuple(op for (key,) in self._conn.execute("SELECT key FROM operations WHERE state IN ('pending','uncertain') ORDER BY created_at") if (op := self.get(key)) is not None)
+        self._ensure_open()
+        return tuple(
+            op for (key,) in self._conn.execute(
+                "SELECT key FROM operations WHERE state IN ('pending','uncertain') "
+                "ORDER BY created_at,key",
+            )
+            if (op := self.get(key)) is not None
+        )
 
     def reconcile(
         self,
@@ -473,6 +553,8 @@ class OperationJournal:
         If the provider proves no operation exists, the row becomes ``failed``;
         only application code may choose a new idempotency key and resubmit.
         """
+        self._ensure_open()
+        key = _operation_text(key, "operation key")
         if observation is not None and (
             not isinstance(observation, str) or not observation.strip()
         ):
@@ -542,6 +624,9 @@ class OperationJournal:
         gives the CLI/operator one uniform reconciliation boundary for HTTP,
         email, MCP and future connectors.
         """
+        self._ensure_open()
+        if not isinstance(include_pending, bool):
+            raise TypeError("include_pending must be bool")
         states = ("pending", "uncertain") if include_pending else ("uncertain",)
         placeholders = ",".join("?" for _ in states)
         keys = [
@@ -615,7 +700,7 @@ class OperationJournal:
             "effect_id": operation.effect_id,
             "provider_request_id": operation.provider_request_id,
             "provider_reference": operation.provider_reference,
-            "error": dict(operation.error) if operation.error else None,
+            "error": dict(operation.error) if operation.error is not None else None,
         }
 
     def _record_audit_event(
@@ -639,6 +724,8 @@ class OperationJournal:
                     fields,
                     sort_keys=True,
                     separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
                 ),
                 time.time(),
             ),
@@ -699,6 +786,7 @@ class OperationJournal:
         back an already committed operation transition; reopening or calling
         this method again resumes from the stable Claim ids.
         """
+        self._ensure_open()
         if self.rowset is None:
             return 0
         if (
@@ -742,7 +830,7 @@ class OperationJournal:
         for rowid, claim_id, tag, fields_json in events:
             claim = Claim(
                 tag=tag,
-                fields=json.loads(fields_json),
+                fields=_loads_strict(fields_json),
                 source="operations.journal",
                 claim_id=claim_id,
             )
@@ -766,3 +854,65 @@ class OperationJournal:
                 mirrored_payloads.add(signature)
             self._audit_cursor = rowid
         return repaired
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("OperationJournal is closed")
+
+
+def _operation_text(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _loads_strict(value: str) -> Any:
+    """Decode journal JSON while rejecting non-standard numeric constants."""
+    def reject_constant(raw: str) -> None:
+        raise ValueError(f"non-JSON numeric constant {raw!r}")
+
+    return json.loads(value, parse_constant=reject_constant)
+
+
+def _strict_json_copy(value: Any, name: str) -> Any:
+    """Copy a journal value while rejecting non-standard JSON shapes."""
+    active: set[int] = set()
+
+    def validate(item: Any, path: str) -> None:
+        if item is None or isinstance(item, (bool, int, str)):
+            return
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(f"{path} contains a non-finite number")
+            return
+        if not isinstance(item, (list, tuple, Mapping)):
+            raise TypeError(f"{path} contains unsupported {type(item).__name__}")
+        marker = id(item)
+        if marker in active:
+            raise ValueError(f"{path} contains a reference cycle")
+        active.add(marker)
+        try:
+            if isinstance(item, Mapping):
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise ValueError(f"{path} must use string object keys")
+                    validate(child, f"{path}.{key}")
+            else:
+                for index, child in enumerate(item):
+                    validate(child, f"{path}[{index}]")
+        finally:
+            active.remove(marker)
+
+    try:
+        validate(value, name)
+        return json.loads(json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ))
+    except TypeError:
+        # Preserve the public distinction between an unsupported shape and a
+        # malformed JSON value.  Callers (and in particular provider result
+        # handling) use TypeError to signal that serialization itself failed.
+        raise
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f"{name} must be strict JSON") from exc

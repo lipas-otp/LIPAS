@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import os
+import secrets
 import sys
 import tempfile
 from dataclasses import asdict
@@ -28,12 +29,21 @@ from .rows.effect import EffectRow
 from .session import open_session
 from .trace import render_trace, write_jsonl
 from .execution import InterruptState, RunState, RunSuspended
+from .events import AgentEventType
+from .document_tools import DocumentToolError, read_pdf_text
 from .dispatcher import DispatchOutcome, TaskDispatcher
 from .runtime import LIPASRuntime
 from .workbench import TaskReport, Workbench
 from .workspace_storage import WorkspaceStorage
+from .security import TLSConfig
+from .deployment import (
+    install_workspace,
+    release_check,
+    upgrade_workspace,
+)
 from .sandbox import sandbox_from_name
 from .gateway import ActionGateway, result_json
+from .performance import run_execution_soak
 from .integrations import MCPActionServer, OpenClawActionBackend
 from .skills import SkillRegistry, builtin_skills, load_builtin_skill
 from .scenarios import (
@@ -42,17 +52,57 @@ from .scenarios import (
     builtin_scenarios,
     load_builtin_scenario,
 )
-from .tools import Tool, ToolRegistry
+from .tools import Tool, ToolRegistry, tool
 
 __all__ = ["main"]
 
 _DEFAULT_MODEL = "gemma4:12b"
 _DEFAULT_MODEL_CHECK_PROMPT = "Reply with exactly: OK"
 _DEFAULT_INSTRUCTIONS = (
-    "You are a concise local LIPAS demo. You have no web, weather, or other "
-    "live-data tools unless the user supplied them through an Agent factory. "
-    "Say that limitation plainly instead of implying that you can fetch data."
+    "You are the LIPAS assistant running through the local-first LIPAS "
+    "runtime. LIPAS is this open-source Python agent platform: it records "
+    "conversation and execution evidence, keeps risky actions behind explicit "
+    "tools and approval. It is not a traffic or map service and has no "
+    "official acronym expansion. Do not "
+    "claim that you are Microsoft Phi or invent an expansion for LIPAS. If "
+    "asked who you are, identify yourself as an AI assistant powered by the "
+    "configured model and hosted by LIPAS. Answer in the user's language, "
+    "prefer concise useful replies, and use earlier turns as context. "
+    "Context and memory policy is important: every turn in this CLI session "
+    "is sent to you as the `messages` list, including earlier user messages, "
+    "your earlier replies, and tool results. Treat those messages as the "
+    "authoritative current conversation. If the user asks what you remember "
+    "from this conversation, inspect the messages and answer directly with "
+    "the relevant topic; do not give a generic claim that you have no memory "
+    "or cannot access previous turns when they are present. Distinguish this "
+    "current-session context (which LIPAS can persist in SQLite and restore) "
+    "from unrelated sessions or personal data that were not supplied. If no "
+    "earlier messages are present, say that this session has no earlier turns. "
+    "Earlier assistant messages may be mistaken; correct them when they "
+    "conflict with this runtime policy. "
+    "在中文提问时也请遵守这条规则：当前会话中已经提供的历史消息可以 "
+    "记住并引用，不要笼统地声称自己完全没有记忆。 Be "
+    "familiar with the core vocabulary: an Agent reasons, a Tool is an "
+    "explicit capability, a Session remembers conversation, and a Task/Run "
+    "records durable work with Effects, Approvals, Artifacts, and Reports. "
+    "Be honest about limits: web, weather, shell, and other live data are "
+    "unavailable unless an explicit tool is supplied; never imply that you "
+    "performed an action without a tool result. If tools are supplied, use "
+    "them only when they materially help answer the request."
 )
+
+_DEFAULT_CHAT_SESSION = Path.home() / ".lipas" / "runs" / "chat.db"
+_DEFAULT_CHAT_SESSION_ID = "cli-chat"
+_CHAT_MAX_LIST_FILES = 200
+_CHAT_MAX_SEARCH_FILES = 500
+_CHAT_MAX_READ_CHARS = 120_000
+_CHAT_MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
+_CHAT_MAX_PDF_PAGES = 200
+_CHAT_SENSITIVE_NAMES = frozenset({
+    ".env", ".env.local", ".env.production", "credentials", "secrets",
+    "id_rsa", "id_ed25519",
+})
+_CHAT_SENSITIVE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx"})
 
 
 def _configured_scenarios(args: argparse.Namespace) -> ScenarioRegistry:
@@ -84,6 +134,236 @@ def _prompt_session() -> Any | None:
         return None
 
 
+def _chat_runtime_tool(
+    *,
+    workspace: Path | None,
+    session_path: str | Path | None,
+    session_id: str,
+) -> Tool:
+    """Expose factual runtime state without granting filesystem authority.
+
+    The model should not have to infer the process directory, memory scope,
+    or tool boundary from prose.  This read-only tool gives it one auditable
+    source of truth for questions such as ``pwd`` and ``what do you remember``.
+    """
+    cwd = Path.cwd().resolve()
+    workspace_value = None if workspace is None else str(workspace)
+    if session_path is None:
+        memory = {"mode": "ephemeral", "path": None}
+    else:
+        memory = {"mode": "sqlite", "path": str(session_path)}
+
+    @tool(side_effect="read_only")
+    def get_runtime_info() -> dict[str, Any]:
+        """Return the current directory, memory scope, and available authority."""
+        return {
+            "current_working_directory": str(cwd),
+            "selected_workspace": workspace_value,
+            "session_id": session_id,
+            "memory": dict(memory),
+            "capabilities": {
+                "runtime_info": True,
+                "filesystem": "read_only" if workspace is not None else "none",
+                "write": False,
+                "shell": False,
+                "network": False,
+            },
+        }
+
+    return get_runtime_info
+
+
+def _chat_workspace_tools(root: str | Path) -> ToolRegistry:
+    """Build bounded, read-only tools for one explicitly selected directory.
+
+    The interactive chat intentionally does not expose a shell or write
+    capability.  This small bundle is enough for a model to inspect a project
+    when the user opts in with ``--workspace``; mutations remain in the
+    first-party Task Workbench where staging and approval are enforced.
+    """
+    workspace = Path(root).expanduser().resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"chat workspace is not a directory: {workspace}")
+
+    def _resolve(relative_path: str) -> Path:
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            raise ValueError("relative_path must be a non-empty string")
+        candidate = (workspace / relative_path).resolve()
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("path escapes the selected chat workspace") from exc
+        return candidate
+
+    def _sensitive(path: Path) -> bool:
+        name = path.name.lower()
+        return (
+            name in _CHAT_SENSITIVE_NAMES
+            or name.startswith(".env.")
+            or path.suffix.lower() in _CHAT_SENSITIVE_SUFFIXES
+        )
+
+    @tool(side_effect="read_only")
+    def list_workspace_files(relative_path: str = ".") -> list[str]:
+        """List up to 200 files below a workspace-relative directory."""
+        base = _resolve(relative_path)
+        if not base.is_dir():
+            raise ValueError(f"not a directory: {relative_path}")
+        files: list[str] = []
+        for path in sorted(base.rglob("*")):
+            if ".git" in path.relative_to(workspace).parts:
+                continue
+            if path.is_symlink():
+                continue
+            if _sensitive(path):
+                continue
+            if path.is_file():
+                files.append(path.relative_to(workspace).as_posix())
+                if len(files) >= _CHAT_MAX_LIST_FILES:
+                    break
+        return files
+
+    @tool(side_effect="read_only")
+    def read_workspace_file(
+        relative_path: str,
+        max_chars: int = _CHAT_MAX_READ_CHARS,
+    ) -> str:
+        """Read a UTF-8 text file inside the selected chat workspace."""
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or not 1 <= max_chars <= _CHAT_MAX_READ_CHARS
+        ):
+            raise ValueError(
+                f"max_chars must be an integer between 1 and {_CHAT_MAX_READ_CHARS}"
+            )
+        path = _resolve(relative_path)
+        if _sensitive(path):
+            raise ValueError("sensitive files are not readable by chat tools")
+        if not path.is_file():
+            raise ValueError(f"not a file: {relative_path}")
+        try:
+            return path.read_text(encoding="utf-8")[:max_chars]
+        except UnicodeDecodeError as exc:
+            raise ValueError("binary/non-UTF-8 files are not readable") from exc
+
+    @tool(side_effect="read_only")
+    def search_workspace(
+        query: str,
+        relative_path: str = ".",
+        max_results: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Find a literal string in bounded UTF-8 workspace files."""
+        if not isinstance(query, str) or not query:
+            raise ValueError("query must be a non-empty string")
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or not 1 <= max_results <= 500
+        ):
+            raise ValueError("max_results must be between 1 and 500")
+        base = _resolve(relative_path)
+        if not base.is_dir():
+            raise ValueError(f"not a directory: {relative_path}")
+        matches: list[dict[str, Any]] = []
+        files_seen = 0
+        for path in sorted(base.rglob("*")):
+            if len(matches) >= max_results:
+                break
+            if ".git" in path.relative_to(workspace).parts or path.is_symlink():
+                continue
+            if _sensitive(path) or not path.is_file():
+                continue
+            files_seen += 1
+            if files_seen > _CHAT_MAX_SEARCH_FILES:
+                break
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line_number, line in enumerate(text.splitlines(), 1):
+                if query not in line:
+                    continue
+                matches.append({
+                    "path": path.relative_to(workspace).as_posix(),
+                    "line": line_number,
+                    "text": line[:500],
+                })
+                if len(matches) >= max_results:
+                    break
+        return matches
+
+    @tool(side_effect="read_only")
+    def read_pdf(
+        relative_path: str,
+        max_pages: int = _CHAT_MAX_PDF_PAGES,
+        max_chars: int = _CHAT_MAX_READ_CHARS,
+    ) -> dict[str, Any]:
+        """Extract bounded text from an unencrypted workspace PDF."""
+        path = _resolve(relative_path)
+        if _sensitive(path):
+            raise ValueError("sensitive files are not readable by chat tools")
+        if not path.is_file():
+            raise ValueError(f"not a file: {relative_path}")
+        try:
+            text, metadata = read_pdf_text(
+                path,
+                max_bytes=_CHAT_MAX_DOCUMENT_BYTES,
+                max_pages=max_pages,
+                max_chars=max_chars,
+            )
+        except DocumentToolError as exc:
+            raise ValueError(str(exc)) from exc
+        return {"path": path.relative_to(workspace).as_posix(), "text": text, **dict(metadata)}
+
+    return ToolRegistry([list_workspace_files, read_workspace_file, search_workspace, read_pdf])
+
+
+def _chat_runtime_instructions(
+    base: str,
+    *,
+    workspace: Path | None,
+    session_path: str | Path | None,
+    session_id: str,
+) -> str:
+    """Append non-negotiable, per-process facts to the selected prompt.
+
+    ``--instructions`` remains useful for changing style or domain guidance,
+    but it must not be able to erase the runtime's actual authority boundary.
+    Keeping these facts in the system message also helps providers that do not
+    expose tool calls for every question.
+    """
+    cwd = Path.cwd().resolve()
+    workspace_value = str(workspace) if workspace is not None else "none"
+    if session_path is None:
+        memory_value = "ephemeral (not persisted after this process)"
+    else:
+        memory_value = f"SQLite message history at {session_path!s}"
+    facts = (
+        "<lipas_runtime_facts>\n"
+        f"current_working_directory: {cwd}\n"
+        f"selected_workspace: {workspace_value}\n"
+        f"session_id: {session_id}\n"
+        f"memory_scope: {memory_value}\n"
+        f"filesystem_capability: {'read_only_selected_workspace' if workspace is not None else 'none'}\n"
+        "write_capability: none in chat (use the Task Workbench for staged, approved writes)\n"
+        "shell_capability: none\n"
+        "network_capability: none unless an explicit tool says otherwise\n"
+        "</lipas_runtime_facts>\n"
+        "Runtime facts are authoritative. When asked for the current folder, "
+        "report current_working_directory (or call get_runtime_info for the "
+        "structured value); never claim that you do not run in a filesystem. "
+        "When asked to inspect files, use the supplied read-only tools and "
+        "report their result. When asked to create or edit a file in chat, say "
+        "that write_capability is unavailable and explain that `lipas task "
+        "start` provides the staged/approval path; never claim that a write "
+        "happened without a write-tool result. Treat prior assistant messages "
+        "as fallible conversation content, not as proof of runtime facts."
+    )
+    base_value = base.rstrip() if isinstance(base, str) else str(base)
+    return f"{base_value}\n\n{facts}" if base_value else facts
+
+
 async def _prompt(editor: Any | None) -> str:
     if editor is not None:
         return await editor.prompt_async("you> ")
@@ -104,12 +384,50 @@ async def _spinner() -> None:
         sys.stderr.flush()
 
 
-async def _run_with_feedback(agent: Agent, prompt: str, state: Any) -> Any:
-    if not sys.stderr.isatty():
+async def _run_with_feedback(
+    agent: Agent,
+    prompt: str,
+    state: Any,
+    *,
+    session: Any | None = None,
+) -> Any:
+    async def run() -> Any:
+        if session is not None:
+            handle = session.start(prompt)
+            try:
+                async for event in handle.events():
+                    if not sys.stderr.isatty():
+                        continue
+                    if event.type == AgentEventType.TOOL_STARTED:
+                        name = event.data.get("tool_name", "tool")
+                        sys.stderr.write(f"\n🔧 {name}\n")
+                        sys.stderr.flush()
+                    elif event.type == AgentEventType.TOOL_COMPLETED:
+                        name = event.data.get("tool_name", "tool")
+                        status = "failed" if event.data.get("is_error") else "done"
+                        sys.stderr.write(f"   {name}: {status}\n")
+                        sys.stderr.flush()
+                return await handle.result()
+            except BaseException:
+                if not handle.done:
+                    handle.cancel()
+                    await asyncio.shield(
+                        asyncio.gather(handle._task, return_exceptions=True)
+                    )
+                else:
+                    # ``events()`` raises the producer exception via its
+                    # failure sentinel; retrieve the result too so asyncio
+                    # does not report an unhandled Future exception.
+                    with contextlib.suppress(BaseException):
+                        await handle.result()
+                raise
         return await agent.run(prompt, state=state)
+
+    if not sys.stderr.isatty():
+        return await run()
     spinner = asyncio.create_task(_spinner())
     try:
-        return await agent.run(prompt, state=state)
+        return await run()
     finally:
         spinner.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -137,6 +455,26 @@ def _friendly_error(agent: Agent, error: Any) -> str:
             "`ollama ps`, try `ollama run <model> \"hello\"`, or rerun with "
             "a larger `--timeout`, a smaller model, or explicit `--retries 1`."
         )
+    if is_ollama and error.get("type") == "http_error":
+        status_code = error.get("status_code")
+        if status_code == 404:
+            model = str(getattr(agent, "model", "the selected model"))
+            return (
+                f"Ollama does not have model `{model}` yet. Pull it with "
+                f"`ollama pull {model}`, then try again. Run `lipas model list` "
+                "to see installed models."
+            )
+    if is_ollama and error.get("type") == "provider_error":
+        detail = error.get("provider_error")
+        detail = detail if isinstance(detail, dict) else {}
+        message = str(detail.get("message", ""))
+        if "Unknown scheme for proxy URL" in message:
+            return (
+                "Ollama could not start because the configured proxy URL is "
+                "unsupported. Local Ollama ignores proxy environment variables "
+                "by default; for a remote Ollama use `--trust-env` with a "
+                "supported HTTP(S)/SOCKS5 proxy."
+            )
     return f"error: {error}"
 
 
@@ -342,12 +680,16 @@ def _cmd_mcp_serve(args: argparse.Namespace) -> int:
 
 
 _WORKBENCH_INSTRUCTIONS = """You are operating one explicitly selected local workspace.
-Inspect before editing. Use only the supplied workspace tools. Keep changes scoped to
-the user's goal. File writes stay in a staging workspace; commands require approval.
-The user applies or discards the complete ChangeSet after your Run. After editing,
-run the most relevant available verification command. In the final answer state what
-was staged, what was verified, and any remaining uncertainty. Never claim delivery
-to the original workspace or verification that a tool result does not show."""
+Inspect before editing. Use only the supplied workspace tools. Call
+get_workspace_info when an exact workspace path or authority fact is needed. Keep
+changes scoped to the user's goal. File writes stay in a staging workspace; commands
+require approval. The user applies or discards the complete ChangeSet after your Run.
+For documents, use read_pdf for bounded extraction and convert_workspace_file for
+explicit source/destination conversions; preserve the source and verify the output.
+After editing, run the most relevant available verification command. In the final
+answer state what was staged, what was verified, and any remaining uncertainty. Never
+claim delivery to the original workspace or verification that a tool result does not
+show."""
 
 
 def _workbench_home(value: str | None) -> Path:
@@ -1206,12 +1548,27 @@ def _cmd_task_events(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _chat(agent: Agent, *, once: str | None) -> None:
+async def _chat(
+    agent: Agent,
+    *,
+    once: str | None,
+    session_id: str = _DEFAULT_CHAT_SESSION_ID,
+) -> None:
+    conversation = agent.session(session_id=session_id)
     state = None
     prompt = once
     editor = _prompt_session() if once is None else None
+    if once is None and sys.stdout.isatty():
+        restored = len(conversation.state.messages)
+        memory = f"restored {restored} message(s)" if restored else "new memory"
+        store_path = getattr(conversation.store, "path", None)
+        memory_path = f" · memory={store_path}" if store_path is not None else ""
+        print(f"LIPAS chat · model={agent.model} · {memory}{memory_path}")
+        print("Type :help for commands; :quit exits.")
     while True:
         if prompt is None:
+            if once is not None:
+                return
             try:
                 prompt = (await _prompt(editor)).strip()
             except (EOFError, KeyboardInterrupt):
@@ -1219,6 +1576,75 @@ async def _chat(agent: Agent, *, once: str | None) -> None:
                 return
         if prompt in {":q", ":quit", ":exit"}:
             return
+        if prompt in {":h", ":help"}:
+            print(
+                ":help                 show this help\n"
+                ":memory               show remembered turns\n"
+                ":runtime              show current directory and capabilities\n"
+                ":about                explain LIPAS and its safety boundary\n"
+                ":reset                clear this conversation\n"
+                ":tools                list available tools\n"
+                ":model                show the active model/provider\n"
+                ":trace                render the claim tape\n"
+                ":effects              show effect diagnostics\n"
+                ":quit                 exit chat",
+            )
+            prompt = None
+            continue
+        if prompt == ":about":
+            print(
+                "LIPAS is a local-first Python agent runtime. It keeps chat and "
+                "execution evidence durable, exposes only explicit tools, and "
+                "requires approval for risky actions. The model provides the "
+                "language ability; LIPAS provides the runtime, memory, tools, "
+                "and safety boundary."
+            )
+            prompt = None
+            continue
+        if prompt == ":memory":
+            store_path = getattr(conversation.store, "path", None)
+            memory_path = f" · path: {store_path}" if store_path is not None else ""
+            print(
+                f"session: {conversation.id} · messages: "
+                f"{len(conversation.state.messages)} · version: {conversation.version}"
+                f"{memory_path}"
+            )
+            prompt = None
+            continue
+        if prompt in {":runtime", ":where"}:
+            runtime_tool = next(
+                (
+                    value for value in agent.tool_harness.tools
+                    if value.name == "get_runtime_info"
+                ),
+                None,
+            )
+            if runtime_tool is None:
+                print("runtime facts: unavailable")
+            else:
+                print(json.dumps(runtime_tool.invoke(), ensure_ascii=False, indent=2))
+            prompt = None
+            continue
+        if prompt in {":reset", ":clear"}:
+            conversation.reset()
+            state = None
+            print("conversation memory cleared")
+            prompt = None
+            continue
+        if prompt == ":model":
+            print(f"model: {agent.model} · provider: {getattr(agent.adapter, 'name', 'unknown')}")
+            prompt = None
+            continue
+        if prompt == ":tools":
+            tools = tuple(agent.tool_harness.tools)
+            if not tools:
+                print("tools: none")
+            else:
+                print("tools:")
+                for value in tools:
+                    print(f"- {value.name} [{value.side_effect.value}] — {value.description}")
+            prompt = None
+            continue
         if prompt == ":trace":
             print(render_trace(agent.rowset.store))
             prompt = None
@@ -1231,9 +1657,15 @@ async def _chat(agent: Agent, *, once: str | None) -> None:
         if not prompt:
             prompt = None
             continue
-        result = await _run_with_feedback(agent, prompt, state)
+        result = await _run_with_feedback(
+            agent,
+            prompt,
+            state,
+            session=conversation,
+        )
         state = result.state
-        print(f"agent> {result.text}")
+        if not result.is_error or result.text:
+            print(f"agent> {result.text}")
         if result.is_error:
             print(_friendly_error(agent, result.error), file=sys.stderr)
         if once is not None:
@@ -1246,6 +1678,66 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         raise ValueError("--timeout must be positive")
     if args.retries < 0:
         raise ValueError("--retries must be zero or greater")
+    positional_model = getattr(args, "model_positional", None)
+    option_model = getattr(args, "model", None)
+    if positional_model and option_model:
+        raise ValueError("pass the model either positionally or with --model, not both")
+    if (
+        positional_model == "list"
+        and not option_model
+        and not args.base_url
+        and args.once is None
+        and not args.factory
+        and not getattr(args, "workspace", None)
+        and not getattr(args, "tool_factory", None)
+        and not getattr(args, "session", None)
+        and not getattr(args, "no_memory", False)
+    ):
+        return _cmd_model_list(
+            argparse.Namespace(
+                host=args.host,
+                timeout=min(args.timeout, 5.0),
+                trust_env=getattr(args, "trust_env", False),
+                json=False,
+            )
+        )
+    model = (
+        positional_model
+        or option_model
+        or os.environ.get("LIPAS_OLLAMA_MODEL")
+        or _DEFAULT_MODEL
+    )
+    if args.factory and (
+        getattr(args, "tool_factory", None)
+        or getattr(args, "workspace", None)
+    ):
+        raise ValueError("--workspace/--tool-factory configure the built-in Agent, not --factory")
+    if getattr(args, "tool_factory", None) and getattr(args, "workspace", None):
+        raise ValueError("pass either --workspace or --tool-factory, not both")
+    workspace_root = None
+    selected_tools = ToolRegistry()
+    if getattr(args, "tool_factory", None):
+        selected_tools = _tool_factory(args.tool_factory)
+    elif getattr(args, "workspace", None):
+        selected_tools = _chat_workspace_tools(args.workspace)
+        workspace_root = Path(args.workspace).expanduser().resolve()
+    if getattr(args, "no_memory", False) and getattr(args, "session", None):
+        raise ValueError("pass either --session or --no-memory, not both")
+    session_path = (
+        None
+        if getattr(args, "no_memory", False)
+        else getattr(args, "session", None) or str(_DEFAULT_CHAT_SESSION)
+    )
+    # Even a tool-less chat gets a read-only, auditable source of truth for
+    # cwd, session scope, and capability boundaries.  User-selected tools are
+    # additive; they never replace this runtime fact tool.
+    runtime_tool = _chat_runtime_tool(
+        workspace=workspace_root,
+        session_path=session_path,
+        session_id=getattr(args, "session_id", _DEFAULT_CHAT_SESSION_ID),
+    )
+    if "get_runtime_info" not in selected_tools:
+        selected_tools = ToolRegistry([runtime_tool, *tuple(selected_tools)])
     scenarios = _configured_scenarios(args)
     skills = _configured_skills(args)
     if args.factory:
@@ -1263,16 +1755,27 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 base_delay_s=1.0,
                 max_attempts=args.retries + 1,
             )
-        common = {
-            "instructions": args.instructions,
-            "session": args.session,
+        # Factories intentionally accept a broad set of Agent kwargs.  Keep
+        # this staging dictionary typed as ``Any`` so the two explicit
+        # constructors below remain checked for their named parameters while
+        # optional passthrough values are not widened to ``object``.
+        common: dict[str, Any] = {
+            "instructions": _chat_runtime_instructions(
+                args.instructions,
+                workspace=workspace_root,
+                session_path=session_path,
+                session_id=getattr(args, "session_id", _DEFAULT_CHAT_SESSION_ID),
+            ),
             "skills": skills,
             "harness_kwargs": {"retry_policy": retry_policy},
         }
+        if session_path is not None:
+            common["session"] = session_path
+        common["tools"] = selected_tools
         if args.base_url:
             credential_options = _compatible_credential_options(args)
             agent = Agent.openai_compatible(
-                args.model,
+                model,
                 base_url=args.base_url,
                 timeout_s=args.timeout,
                 streaming=args.model_streaming,
@@ -1282,16 +1785,85 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             )
         else:
             agent = Agent.ollama(
-                args.model,
+                model,
                 host=args.host,
                 timeout_s=args.timeout,
+                trust_env=getattr(args, "trust_env", False),
                 **common,
             )
     try:
         with _chat_transport_logs(args.verbose):
-            asyncio.run(_chat(agent, once=args.once))
+            asyncio.run(
+                _chat(
+                    agent,
+                    once=args.once,
+                    session_id=getattr(args, "session_id", _DEFAULT_CHAT_SESSION_ID),
+                )
+            )
     finally:
         agent.close()
+    return 0
+
+
+def _cmd_model_list(args: argparse.Namespace) -> int:
+    """List models from a local Ollama daemon without opening a chat session."""
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be positive")
+    endpoint = str(
+        getattr(args, "host", None)
+        or os.environ.get("OLLAMA_HOST")
+        or "http://localhost:11434"
+    ).rstrip("/")
+    try:
+        import httpx
+        from .adapter.ollama import OllamaAdapter
+
+        adapter = OllamaAdapter(
+            host=args.host,
+            timeout_s=args.timeout,
+            trust_env=getattr(args, "trust_env", False),
+        )
+
+        async def fetch() -> list[dict[str, Any]]:
+            async with httpx.AsyncClient(
+                timeout=args.timeout,
+                trust_env=adapter.trust_env,
+            ) as client:
+                response = await client.get(f"{adapter.host}/api/tags")
+                response.raise_for_status()
+                payload = response.json()
+            models = payload.get("models", []) if isinstance(payload, dict) else []
+            if not isinstance(models, list):
+                raise ValueError("Ollama returned an invalid model list")
+            return [value for value in models if isinstance(value, dict)]
+
+        models = asyncio.run(fetch())
+    except Exception as exc:
+        detail = str(exc) or type(exc).__name__
+        print(
+            f"Could not list Ollama models at {endpoint}: {detail}. "
+            "Check `ollama ps` and the configured host.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(models, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if not models:
+        print("No Ollama models found. Pull one with `ollama pull <model>`.")
+        return 0
+    print("name\tsize\tmodified")
+    for model in models:
+        print(
+            "\t".join(
+                (
+                    str(model.get("name", "")),
+                    str(model.get("size", "")),
+                    str(model.get("modified_at", "")),
+                )
+            )
+        )
     return 0
 
 
@@ -1569,7 +2141,11 @@ def _validate_model_endpoint_args(args: argparse.Namespace) -> None:
         raise ValueError("pass either --base-url or --host, not both")
     if args.factory and args.base_url:
         raise ValueError("--base-url configures the built-in Agent, not --factory")
+    if getattr(args, "trust_env", False) and args.factory:
+        raise ValueError("--trust-env configures the built-in Ollama Agent, not --factory")
     if args.base_url:
+        if getattr(args, "trust_env", False):
+            raise ValueError("--trust-env configures Ollama, not --base-url")
         return
     if args.model_streaming:
         raise ValueError("--model-streaming requires --base-url")
@@ -1586,6 +2162,147 @@ def _compatible_credential_options(args: argparse.Namespace) -> dict[str, Any]:
     if args.no_api_key:
         return {"api_key_env": None, "require_api_key": False}
     return {"api_key_env": args.api_key_env, "require_api_key": True}
+
+
+def _cmd_install(args: argparse.Namespace) -> int:
+    manifest = install_workspace(
+        _workbench_home(args.home), sandbox=args.sandbox, force=args.force,
+    )
+    payload = manifest.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"installed LIPAS {manifest.package_version} at {manifest.home}")
+        print(f"schema: {manifest.schema_version}; sandbox: {manifest.sandbox}")
+        print(f"database: {manifest.home / 'workspace.db'}")
+    return 0
+
+
+def _cmd_upgrade(args: argparse.Namespace) -> int:
+    manifest = upgrade_workspace(
+        _workbench_home(args.home), sandbox=args.sandbox, force=True,
+    )
+    payload = manifest.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"upgraded LIPAS workspace at {manifest.home}")
+        print(f"schema: {manifest.schema_version}; sandbox: {manifest.sandbox}")
+    return 0
+
+
+def _cmd_release_check(args: argparse.Namespace) -> int:
+    report = release_check(_workbench_home(args.home))
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"workspace: {report.home}")
+        for check in report.checks:
+            print(f"{'ok' if check.passed else 'FAIL'}: {check.name}: {check.detail}")
+        print(f"result: {'ready' if report.ready else 'not ready'}")
+    return 0 if report.ready else 1
+
+
+def _cmd_operator_serve(args: argparse.Namespace) -> int:
+    home = _workbench_home(args.home)
+    token = os.environ.get(args.token_env)
+    generated = token is None
+    if token is None:
+        # An ephemeral token is convenient for a loopback first run and is
+        # never persisted. Non-loopback binds still require an operator to
+        # supply a stable secret through the environment.
+        normalized_host = args.host.strip().lower().strip("[]")
+        if normalized_host not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError(
+                f"{args.token_env} must be set for a non-loopback operator bind",
+            )
+        token = secrets.token_urlsafe(24)
+    if len(token.encode("utf-8")) < 16:
+        raise ValueError(f"{args.token_env} must contain at least 16 bytes")
+    tls = None
+    if args.certfile or args.keyfile or args.cafile:
+        if not args.certfile or not args.keyfile:
+            raise ValueError("--certfile and --keyfile must be provided together")
+        tls = TLSConfig(
+            args.certfile,
+            args.keyfile,
+            cafile=args.cafile,
+            require_client_certificate=args.require_client_certificate,
+        )
+    with LIPASRuntime.open(home, sandbox=args.sandbox) as runtime:
+        operator = runtime.operator(
+            operator_token=token,
+            require_authentication=True,
+        )
+        if generated:
+            print(f"operator token (ephemeral): {token}", file=sys.stderr)
+        scheme = "https" if tls is not None else "http"
+        print(f"operator listening: {scheme}://{args.host}:{args.port}")
+        operator.serve_forever(args.host, args.port, tls=tls)
+    return 0
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    storage = WorkspaceStorage(_workbench_home(args.home))
+    result = (
+        storage.backup_bundle(args.destination)
+        if args.include_evidence
+        else storage.backup(args.destination)
+    )
+    print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ValueError("restore replaces workspace.db; pass --yes after inspecting the backup")
+    storage = WorkspaceStorage(_workbench_home(args.home))
+    source = Path(args.source).expanduser()
+    result = (
+        storage.restore_bundle(source, keep_backup=not args.no_backup)
+        if source.is_dir()
+        else storage.restore(source, keep_backup=not args.no_backup)
+    )
+    print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_verify_bundle(args: argparse.Namespace) -> int:
+    """Verify an evidence bundle without touching the target workspace."""
+    storage = WorkspaceStorage(_workbench_home(args.home))
+    result = storage.verify_bundle(Path(args.source).expanduser())
+    payload = result.as_dict()
+    payload["verified"] = True
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"verified bundle: {result.bundle_path}")
+        print(f"files: {len(result.files)}")
+    return 0
+
+
+def _cmd_soak(args: argparse.Namespace) -> int:
+    """Run a bounded local durability soak and emit its evidence report."""
+    home = _workbench_home(args.home)
+    with LIPASRuntime.open(home, sandbox=args.sandbox) as runtime:
+        report = run_execution_soak(
+            runtime.execution,
+            iterations=args.iterations,
+            duration_s=args.duration,
+            workspace=home,
+            task_prefix=args.task_prefix,
+        )
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"soak: {'healthy' if report.healthy else 'FAILED'} "
+            f"{report.executed_iterations}/{report.requested_iterations} iterations, "
+            f"p95={report.p95_latency_ms:.2f}ms",
+        )
+        for issue in report.invariant_failures:
+            print(f"failure: {issue}")
+    return 0 if report.healthy else 1
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -1663,11 +2380,138 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=_cmd_init)
 
+    install = sub.add_parser(
+        "install", help="initialize a local workspace and harden its layout",
+    )
+    install.add_argument(
+        "--home", help="workspace directory (default: LIPAS_HOME or ~/.lipas)",
+    )
+    install.add_argument(
+        "--sandbox", choices=("auto", "bwrap", "local"),
+        default=os.environ.get("LIPAS_SANDBOX", "auto"),
+    )
+    install.add_argument("--force", action="store_true", help="refresh the manifest")
+    install.add_argument("--json", action="store_true")
+    install.set_defaults(func=_cmd_install)
+
+    upgrade = sub.add_parser(
+        "upgrade", help="migrate a legacy workspace and refresh its manifest",
+    )
+    upgrade.add_argument(
+        "--home", help="workspace directory (default: LIPAS_HOME or ~/.lipas)",
+    )
+    upgrade.add_argument(
+        "--sandbox", choices=("auto", "bwrap", "local"),
+        default=os.environ.get("LIPAS_SANDBOX", "auto"),
+    )
+    upgrade.add_argument("--json", action="store_true")
+    upgrade.set_defaults(func=_cmd_upgrade)
+
+    release = sub.add_parser(
+        "release", help="run local single-workspace release readiness checks",
+    )
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+    release_check_parser = release_sub.add_parser(
+        "check", help="check installation, schema, integrity, and permissions",
+    )
+    release_check_parser.add_argument(
+        "--home", help="workspace directory (default: LIPAS_HOME or ~/.lipas)",
+    )
+    release_check_parser.add_argument("--json", action="store_true")
+    release_check_parser.set_defaults(func=_cmd_release_check)
+
+    operator = sub.add_parser(
+        "operator", help="serve the authenticated local Web operator",
+    )
+    operator_sub = operator.add_subparsers(dest="operator_command", required=True)
+    operator_serve = operator_sub.add_parser(
+        "serve", help="serve Tasks, Conversations, approvals, and evidence",
+    )
+    operator_serve.add_argument("--home", help="workspace directory")
+    operator_serve.add_argument(
+        "--host", default="127.0.0.1",
+        help="bind host; non-loopback requires TLS and an environment token",
+    )
+    operator_serve.add_argument("--port", type=int, default=8787)
+    operator_serve.add_argument(
+        "--token-env", default="LIPAS_OPERATOR_TOKEN",
+        help="environment variable containing the bearer token",
+    )
+    operator_serve.add_argument(
+        "--certfile", help="PEM certificate; required for non-loopback binds",
+    )
+    operator_serve.add_argument("--keyfile", help="PEM private key")
+    operator_serve.add_argument("--cafile", help="optional CA for mutual TLS")
+    operator_serve.add_argument(
+        "--require-client-certificate", action="store_true",
+        help="require client certificates when --cafile is supplied",
+    )
+    operator_serve.add_argument(
+        "--sandbox", choices=("auto", "bwrap", "local"),
+        default=os.environ.get("LIPAS_SANDBOX", "auto"),
+    )
+    operator_serve.set_defaults(func=_cmd_operator_serve)
+
+    backup = sub.add_parser("backup", help="create an integrity-checked workspace backup")
+    backup.add_argument("--home", help="workspace directory")
+    backup.add_argument("--destination", required=True, help="backup SQLite path or bundle directory")
+    backup.add_argument(
+        "--include-evidence", action="store_true",
+        help="include runs/<run-id> evidence in a manifest- and hash-verified bundle",
+    )
+    backup.set_defaults(func=_cmd_backup)
+
+    restore = sub.add_parser("restore", help="restore an integrity-checked workspace backup")
+    restore.add_argument("--home", help="workspace directory")
+    restore.add_argument("--source", required=True, help="backup SQLite path or evidence bundle directory")
+    restore.add_argument("--yes", action="store_true")
+    restore.add_argument("--no-backup", action="store_true", help="do not preserve pre-restore state")
+    restore.set_defaults(func=_cmd_restore)
+
+    verify_bundle = sub.add_parser(
+        "verify-bundle", help="verify a complete workspace/evidence bundle",
+    )
+    verify_bundle.add_argument("--home", help="workspace directory (used for schema context)")
+    verify_bundle.add_argument("--source", required=True, help="evidence bundle directory")
+    verify_bundle.add_argument("--json", action="store_true")
+    verify_bundle.set_defaults(func=_cmd_verify_bundle)
+
+    soak = sub.add_parser(
+        "soak", help="run a bounded local Task/Run durability soak",
+    )
+    soak.add_argument("--home", help="workspace directory")
+    soak.add_argument("--iterations", type=int, default=100)
+    soak.add_argument(
+        "--duration", type=float,
+        help="optional wall-clock cap in seconds (iterations remains the hard cap)",
+    )
+    soak.add_argument("--task-prefix", default="soak")
+    soak.add_argument(
+        "--sandbox", choices=("auto", "bwrap", "local"),
+        default=os.environ.get("LIPAS_SANDBOX", "auto"),
+    )
+    soak.add_argument("--json", action="store_true")
+    soak.set_defaults(func=_cmd_soak)
+
     chat = sub.add_parser("chat", help="try an Agent interactively")
-    chat.add_argument("--model", default=os.environ.get("LIPAS_OLLAMA_MODEL", _DEFAULT_MODEL))
+    chat.add_argument(
+        "model_positional", nargs="?", metavar="MODEL",
+        help="model name (shortcut for --model)",
+    )
+    chat.add_argument(
+        "--model", default=None,
+        help=(
+            "model name (default: LIPAS_OLLAMA_MODEL or "
+            f"{_DEFAULT_MODEL})"
+        ),
+    )
     chat_endpoint = chat.add_mutually_exclusive_group()
     chat_endpoint.add_argument(
-        "--host", help="Ollama host; defaults to OLLAMA_HOST or localhost:11434",
+        "--host",
+        help=(
+            "Ollama host (http:// is optional); defaults to OLLAMA_HOST or "
+            "localhost:11434"
+        ),
     )
     chat_endpoint.add_argument(
         "--base-url",
@@ -1692,9 +2536,32 @@ def _parser() -> argparse.ArgumentParser:
         "--retries", type=int, default=0,
         help="extra timeout/network retries (default: 0)",
     )
+    chat.add_argument(
+        "--trust-env", action="store_true",
+        help="honor HTTP(S)_PROXY/ALL_PROXY when connecting to Ollama",
+    )
     chat.add_argument("--verbose", action="store_true", help="show adapter retry diagnostics")
     chat.add_argument("--instructions", default=_DEFAULT_INSTRUCTIONS)
-    chat.add_argument("--session", help="optional SQLite claim-session path")
+    chat_session = chat.add_mutually_exclusive_group()
+    chat_session.add_argument(
+        "--session", help="SQLite claim/conversation path (default: ~/.lipas/runs/chat.db)",
+    )
+    chat_session.add_argument(
+        "--no-memory", action="store_true",
+        help="keep this chat in memory only; do not persist conversation context",
+    )
+    chat.add_argument(
+        "--session-id", default=_DEFAULT_CHAT_SESSION_ID,
+        help="conversation identity inside --session (default: cli-chat)",
+    )
+    chat.add_argument(
+        "--workspace", metavar="PATH",
+        help="opt in to bounded read-only file tools for this directory",
+    )
+    chat.add_argument(
+        "--tool-factory", metavar="MODULE:CALLABLE",
+        help="load additional tools from a Python factory returning Tool(s)",
+    )
     chat.add_argument("--factory", help="ordinary Python factory: module:callable")
     add_skill_options(chat)
     chat.add_argument("--once", help="send one prompt instead of opening a REPL")
@@ -1742,9 +2609,23 @@ def _parser() -> argparse.ArgumentParser:
     scenario_check.set_defaults(func=_cmd_scenario_check)
 
     model = sub.add_parser(
-        "model", help="validate model endpoint configuration and contracts",
+        "model", help="list local models or validate endpoint configuration",
     )
     model_sub = model.add_subparsers(dest="model_command", required=True)
+    model_list = model_sub.add_parser(
+        "list", help="list models available from the local Ollama daemon",
+    )
+    model_list.add_argument(
+        "--host",
+        help="Ollama host (http:// is optional; default: OLLAMA_HOST or localhost:11434)",
+    )
+    model_list.add_argument("--timeout", type=float, default=5.0)
+    model_list.add_argument(
+        "--trust-env", action="store_true",
+        help="honor HTTP(S)_PROXY/ALL_PROXY when connecting to Ollama",
+    )
+    model_list.add_argument("--json", action="store_true")
+    model_list.set_defaults(func=_cmd_model_list)
     model_check = model_sub.add_parser(
         "check", help="check a compatible endpoint without calling it by default",
     )

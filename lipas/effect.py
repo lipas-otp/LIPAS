@@ -39,8 +39,12 @@ are ``TAG_EFFECT_*`` because one lifecycle covers model and tool effects.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from copy import deepcopy
+import hashlib
+import json
+import math
 from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Union
 
 if TYPE_CHECKING:
@@ -58,6 +62,16 @@ __all__ = [
     "LLMTarget",
     "ToolTarget",
     "EffectTarget",
+    "EffectProposal",
+    "EffectDecision",
+    "EffectObservation",
+    "F_PROPOSAL_ID",
+    "F_PROPOSAL_KIND",
+    "F_ACTOR",
+    "F_CAPABILITIES",
+    "F_RISK",
+    "F_ESTIMATE",
+    "F_PROPOSAL_METADATA",
     # Shared field-name constants — re-exported by lipas.rows.effect
     # for convenience; canonical home is here.
     "F_EFFECT_ID",
@@ -128,6 +142,12 @@ class LLMTarget:
     kind: ClassVar[EffectKind] = EffectKind.LLM_CALL
     request: "Request"
 
+    def __post_init__(self) -> None:
+        from .adapter import Request
+
+        if not isinstance(self.request, Request):
+            raise TypeError("LLMTarget.request must be an adapter Request")
+
 
 @dataclass(frozen=True)
 class ToolTarget:
@@ -143,11 +163,228 @@ class ToolTarget:
     tool: "Tool"
     arguments: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        from .tools import Tool
+
+        if not isinstance(self.tool, Tool):
+            raise TypeError("ToolTarget.tool must be a Tool")
+        if not isinstance(self.arguments, Mapping):
+            raise TypeError("ToolTarget.arguments must be a mapping")
+        object.__setattr__(self, "arguments", deepcopy(dict(self.arguments)))
+
 
 # A discriminated union.  Static type checkers (pyright/mypy) can
 # narrow on ``isinstance(target, LLMTarget)`` / ``ToolTarget`` after
 # matching; the runtime ``kind`` ClassVar is for human/serializer use.
 EffectTarget = Union[LLMTarget, ToolTarget]
+
+
+@dataclass(frozen=True)
+class EffectProposal:
+    """A request for change in the world, before Runtime policy admits it.
+
+    Agents and orchestration layers may construct proposals, but a proposal
+    is not an execution and grants no authority.  The host Runtime decides
+    whether the declared capabilities, budget, risk, and causal context are
+    acceptable before an existing Harness/connector performs the effect.
+    """
+
+    effect_id: str
+    kind: str
+    actor: str
+    capabilities: frozenset[str] = frozenset()
+    estimate: Mapping[str, float] = field(default_factory=dict)
+    risk: str = "none"
+    caused_by: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("effect_id", "kind", "actor", "risk"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"EffectProposal.{name} must be non-empty")
+            object.__setattr__(self, name, value.strip())
+        if not isinstance(self.capabilities, frozenset):
+            raise TypeError("EffectProposal.capabilities must be a frozenset")
+        if any(not isinstance(value, str) or not value.strip() for value in self.capabilities):
+            raise ValueError("EffectProposal.capabilities must contain non-empty strings")
+        normalized_capabilities = tuple(value.strip() for value in self.capabilities)
+        if len(set(normalized_capabilities)) != len(normalized_capabilities):
+            raise ValueError(
+                "EffectProposal.capabilities contains duplicate values after normalization",
+            )
+        object.__setattr__(self, "capabilities", frozenset(normalized_capabilities))
+        if not isinstance(self.estimate, Mapping):
+            raise TypeError("EffectProposal.estimate must be a mapping")
+        estimate = dict(self.estimate)
+        normalized_estimate: dict[str, float] = {}
+        for bucket, amount in estimate.items():
+            if not isinstance(bucket, str) or not bucket.strip():
+                raise ValueError("EffectProposal.estimate must contain finite non-negative numbers")
+            try:
+                valid_amount = (
+                    not isinstance(amount, bool)
+                    and isinstance(amount, (int, float))
+                    and math.isfinite(float(amount))
+                    and amount >= 0
+                )
+            except (OverflowError, ValueError, TypeError):
+                valid_amount = False
+            if not valid_amount:
+                raise ValueError("EffectProposal.estimate must contain finite non-negative numbers")
+            normalized_bucket = bucket.strip()
+            if normalized_bucket in normalized_estimate:
+                raise ValueError(
+                    "EffectProposal.estimate contains duplicate bucket names after normalization",
+                )
+            normalized_estimate[normalized_bucket] = float(amount)
+        object.__setattr__(self, "estimate", normalized_estimate)
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("EffectProposal.metadata must be a mapping")
+        metadata = _strict_json_copy(dict(self.metadata), "EffectProposal.metadata")
+        object.__setattr__(self, "metadata", metadata)
+        if self.caused_by is not None and (
+            not isinstance(self.caused_by, str) or not self.caused_by.strip()
+        ):
+            raise ValueError("EffectProposal.caused_by must be non-empty or None")
+        if self.caused_by is not None:
+            object.__setattr__(self, "caused_by", self.caused_by.strip())
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a redaction-free structural view for host-side auditing.
+
+        Metadata is intentionally copied, not interpreted: hosts must redact
+        secrets before constructing a proposal and must apply their own export
+        policy before sending this view outside the trusted process.
+        """
+        return {
+            "effect_id": self.effect_id,
+            "kind": self.kind,
+            "actor": self.actor,
+            "capabilities": sorted(self.capabilities),
+            "estimate": dict(self.estimate),
+            "risk": self.risk,
+            "caused_by": self.caused_by,
+            "metadata": deepcopy(dict(self.metadata)),
+        }
+
+    def claim_id(self, kind: EffectKind) -> str:
+        """Return the stable EffectRow id used by a concrete Harness.
+
+        Proposal ids are product identities and may be names such as
+        ``email-send-42``.  The historical EffectRow schema intentionally
+        uses ``call_<12 hex>`` / ``tool_<12 hex>`` ids, so non-conforming
+        proposal ids are mapped deterministically rather than silently
+        discarded or used as an invalid claim.
+        """
+        if not isinstance(kind, EffectKind):
+            raise TypeError("kind must be EffectKind")
+        prefix = "call" if kind is EffectKind.LLM_CALL else "tool"
+        candidate = self.effect_id
+        suffix = candidate[len(prefix) + 1:] if candidate.startswith(f"{prefix}_") else ""
+        if len(suffix) == 12 and all(char in "0123456789abcdef" for char in suffix):
+            return candidate
+        digest = hashlib.sha256(
+            f"lipas-effect:{kind.value}:{candidate}".encode("utf-8"),
+        ).hexdigest()[:12]
+        return f"{prefix}_{digest}"
+
+    def claim_fields(self) -> dict[str, Any]:
+        """Return proposal provenance fields carried by an Effect intent."""
+        # Keep product metadata namespaced.  Flattening it into the intent
+        # makes caller keys collide with reserved audit fields and creates
+        # two representations of the same data.  The intent is a durable
+        # evidence record, so reserved fields must be owned by the contract.
+        fields: dict[str, Any] = {
+            F_PROPOSAL_ID: self.effect_id,
+            F_PROPOSAL_KIND: self.kind,
+            F_ACTOR: self.actor,
+            F_CAPABILITIES: sorted(self.capabilities),
+            F_RISK: self.risk,
+            F_ESTIMATE: dict(self.estimate),
+            F_PROPOSAL_METADATA: deepcopy(dict(self.metadata)),
+        }
+        if self.caused_by is not None:
+            fields[F_CAUSED_BY] = self.caused_by
+        return fields
+
+
+@dataclass(frozen=True)
+class EffectDecision:
+    """The Runtime's explicit admission result for an EffectProposal."""
+
+    allowed: bool
+    reason: str = "allowed"
+    policy: str = "runtime"
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed, bool):
+            raise TypeError("EffectDecision.allowed must be bool")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("EffectDecision.reason must be non-empty")
+        if not isinstance(self.policy, str) or not self.policy.strip():
+            raise ValueError("EffectDecision.policy must be non-empty")
+        if not isinstance(self.detail, Mapping):
+            raise TypeError("EffectDecision.detail must be a mapping")
+        object.__setattr__(
+            self,
+            "detail",
+            _strict_json_copy(dict(self.detail), "EffectDecision.detail"),
+        )
+        object.__setattr__(self, "reason", self.reason.strip())
+        object.__setattr__(self, "policy", self.policy.strip())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "policy": self.policy,
+            "detail": deepcopy(dict(self.detail)),
+        }
+
+
+@dataclass(frozen=True)
+class EffectObservation:
+    """What the world reported after an admitted effect was attempted."""
+
+    effect_id: str
+    status: str
+    result: Any = None
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+    claim_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.effect_id, str) or not self.effect_id.strip():
+            raise ValueError("EffectObservation.effect_id must be non-empty")
+        if not isinstance(self.status, str) or self.status not in {
+            "succeeded", "failed", "uncertain", "rejected",
+        }:
+            raise ValueError("EffectObservation.status is invalid")
+        object.__setattr__(self, "result", deepcopy(self.result))
+        object.__setattr__(self, "effect_id", self.effect_id.strip())
+        if not isinstance(self.evidence, Mapping):
+            raise TypeError("EffectObservation.evidence must be a mapping")
+        object.__setattr__(
+            self,
+            "evidence",
+            _strict_json_copy(dict(self.evidence), "EffectObservation.evidence"),
+        )
+        if self.claim_id is not None and (
+            not isinstance(self.claim_id, str) or not self.claim_id.strip()
+        ):
+            raise ValueError("EffectObservation.claim_id must be non-empty or None")
+        if self.claim_id is not None:
+            object.__setattr__(self, "claim_id", self.claim_id.strip())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "effect_id": self.effect_id,
+            "status": self.status,
+            "result": self.result,
+            "evidence": deepcopy(dict(self.evidence)),
+            "claim_id": self.claim_id,
+        }
 
 
 # =====================================================================
@@ -160,12 +397,64 @@ TAG_EFFECT_RESULT   = "call_result"
 TAG_EFFECT_REJECTED = "call_rejected"
 
 
+def _strict_json_copy(value: Any, name: str) -> Any:
+    """Detach a structural value while rejecting non-JSON numbers/objects."""
+    _validate_json_shape(value, name)
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"{name} must be strict JSON") from exc
+    return json.loads(encoded)
+
+
+def _validate_json_shape(value: Any, path: str, *, _active: set[int] | None = None) -> None:
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite numbers")
+        return
+    if _active is None:
+        _active = set()
+    if isinstance(value, (list, tuple, Mapping)):
+        identity = id(value)
+        if identity in _active:
+            raise ValueError(f"{path} must not contain reference cycles")
+        _active.add(identity)
+        try:
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        raise ValueError(f"{path} must use string object keys")
+                    _validate_json_shape(item, f"{path}.{key}", _active=_active)
+            else:
+                for index, item in enumerate(value):
+                    _validate_json_shape(item, f"{path}[{index}]", _active=_active)
+        finally:
+            _active.remove(identity)
+        return
+    raise TypeError(f"{path} contains unsupported {type(value).__name__}")
+
+
 # =====================================================================
 # Field-name constants
 # =====================================================================
 #
 # Shared (intent / result / rejected) ─────────────────────────────────
 F_EFFECT_ID    = "call_id"          # historical; opaque str
+F_PROPOSAL_ID = "proposal_id"       # product-facing EffectProposal identity
+F_PROPOSAL_KIND = "proposal_kind"   # host semantic kind, e.g. email_send
+F_ACTOR = "actor"
+F_CAPABILITIES = "capabilities"
+F_RISK = "risk"
+F_ESTIMATE = "estimate"
+F_PROPOSAL_METADATA = "proposal_metadata"
 F_PROVIDER_REQUEST_ID = "provider_request_id"
 F_KIND         = "kind"             # value: EffectKind member's str
 F_COMPENSATES  = "compensates"      # str | absent

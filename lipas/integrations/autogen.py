@@ -35,6 +35,7 @@ class AutoGenHandoffHandler:
             raise ValueError("AutoGen handoff requires conversation_id")
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("AutoGen handoff requires stable request_id")
+        request_id = request_id.strip()
         outcome = await self.coordinator.handoff(
             self.recipient,
             message,
@@ -42,8 +43,11 @@ class AutoGenHandoffHandler:
             coordination_id=conversation_id,
             handoff_id=request_id,
             metadata={
-                "framework": "autogen",
                 **dict(metadata or {}),
+                # Framework identity is an adapter invariant, not caller
+                # metadata. Prevent caller metadata from disguising origin
+                # in audit and replay projections.
+                "framework": "autogen",
             },
         )
         return {
@@ -86,6 +90,7 @@ class AutoGenToolAdapter:
     ) -> dict[str, Any]:
         if not isinstance(arguments, Mapping):
             raise TypeError("AutoGen tool arguments must be a mapping")
+        request_id = _require_request_id(request_id)
         return (
             await self.gateway.call(
                 self.tool_name,
@@ -104,6 +109,7 @@ class AutoGenToolAdapter:
         request_id: str,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        request_id = _require_request_id(request_id)
         return self.gateway.call_sync(
             self.tool_name,
             arguments,
@@ -120,3 +126,9 @@ class AutoGenToolAdapter:
                 "AutoGen tool calls require _lipas_request_id for safe replay",
             )
         return self.run(kwargs, request_id=request_id)
+
+
+def _require_request_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("AutoGen tool calls require a non-empty request_id")
+    return value.strip()

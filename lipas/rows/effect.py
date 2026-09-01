@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..calculus import Claim, StrategyRegistry
@@ -51,7 +51,9 @@ from ..store    import ClaimStore
 from ..effect import (
     EffectKind,
     F_ARGUMENTS, F_ATTEMPTS, F_CAUSED_BY, F_COMPENSATES, F_DECLARED_SIDE_EFFECT,
-    F_DETAIL, F_EFFECT_ID, F_ERROR, F_KIND, F_MODEL, F_OUTPUT, F_SPEND,
+    F_ACTOR, F_CAPABILITIES, F_DETAIL, F_EFFECT_ID, F_ERROR, F_ESTIMATE,
+    F_KIND, F_MODEL, F_OUTPUT, F_PROPOSAL_ID,
+    F_PROPOSAL_KIND, F_PROPOSAL_METADATA, F_RISK, F_SPEND,
     F_PROVIDER_REQUEST_ID,
     F_REASON, F_REPLY, F_REQUEST, F_SIDE_EFFECT, F_STATUS,
     F_TOOL_NAME, F_TOTAL_USAGE,
@@ -64,6 +66,9 @@ __all__ = [
     # Re-exports for convenience (canonical home: lipas.effect):
     "TAG_EFFECT_INTENT", "TAG_EFFECT_RESULT", "TAG_EFFECT_REJECTED",
     "F_EFFECT_ID", "F_KIND", "F_COMPENSATES", "F_CAUSED_BY",
+    "F_PROPOSAL_ID", "F_PROPOSAL_KIND", "F_ACTOR", "F_CAPABILITIES",
+    "F_RISK", "F_ESTIMATE",
+    "F_PROPOSAL_METADATA",
     "F_PROVIDER_REQUEST_ID",
     "F_STATUS", "F_ATTEMPTS", "F_TOTAL_USAGE", "F_SPEND",
     "F_ERROR", "F_REASON", "F_DETAIL",
@@ -86,6 +91,12 @@ _VALID_KINDS  = frozenset({k.value for k in EffectKind})
 _VALID_SIDE_EFFECTS = frozenset({
     "pure", "read_only", "idempotent_write", "external_write",
 })
+_SIDE_EFFECT_RANK = {
+    "pure": 0,
+    "read_only": 1,
+    "idempotent_write": 2,
+    "external_write": 3,
+}
 
 
 # =====================================================================
@@ -200,6 +211,19 @@ class EffectRow:
             if c.claim_id == claim.claim_id:
                 return []
 
+        # Claim.fields is intentionally an untyped dict at the calculus
+        # layer.  Effect claims cross a durable JSON boundary, so reject
+        # coercive object keys before kind-specific validation can overlook
+        # an unrelated field (``json.dumps`` would otherwise turn ``1`` into
+        # ``"1"`` and make two distinct claims indistinguishable).
+        key_errors = [
+            f"{claim.tag}: fields must use string object keys (got {key!r})"
+            for key in claim.fields
+            if not isinstance(key, str)
+        ]
+        if key_errors:
+            return key_errors
+
         if claim.tag == TAG_EFFECT_INTENT:
             return self._check_intent(claim, store)
         if claim.tag == TAG_EFFECT_RESULT:
@@ -242,6 +266,10 @@ class EffectRow:
                     f"str | None, got {type(comp).__name__}"
                 )
             else:
+                if not comp.strip():
+                    msgs.append(
+                        f"{TAG_EFFECT_INTENT}: {F_COMPENSATES} must be non-empty when present",
+                    )
                 known = {
                     c.fields.get(F_EFFECT_ID)
                     for c in store.filter(tag=TAG_EFFECT_INTENT)
@@ -251,6 +279,86 @@ class EffectRow:
                         f"{TAG_EFFECT_INTENT}: {F_COMPENSATES}={comp!r} "
                         f"does not reference any known intent {F_EFFECT_ID}"
                     )
+
+        provider_request_id = f.get(F_PROVIDER_REQUEST_ID)
+        if provider_request_id is not None and (
+            not isinstance(provider_request_id, str) or not provider_request_id.strip()
+        ):
+            msgs.append(
+                f"{TAG_EFFECT_INTENT}: {F_PROVIDER_REQUEST_ID} must be a non-empty str"
+            )
+        caused_by = f.get(F_CAUSED_BY)
+        if caused_by is not None and (
+            not isinstance(caused_by, str) or not caused_by.strip()
+        ):
+            msgs.append(
+                f"{TAG_EFFECT_INTENT}: {F_CAUSED_BY} must be a non-empty str"
+            )
+
+        # Proposal provenance is namespaced. Validate it here as well as in
+        # EffectProposal so a hand-crafted Claim cannot smuggle an
+        # un-auditable proposal onto the evidence tape.
+        proposal_keys = {
+            F_PROPOSAL_KIND, F_ACTOR, F_CAPABILITIES, F_RISK,
+            F_ESTIMATE, F_PROPOSAL_METADATA,
+        }
+        proposal_id = f.get(F_PROPOSAL_ID)
+        if proposal_id is None:
+            if proposal_keys.intersection(f):
+                msgs.append(
+                    f"{TAG_EFFECT_INTENT}: proposal fields require {F_PROPOSAL_ID!r}"
+                )
+        elif not isinstance(proposal_id, str) or not proposal_id.strip():
+            msgs.append(
+                f"{TAG_EFFECT_INTENT}: {F_PROPOSAL_ID} must be a non-empty str"
+            )
+        else:
+            for key in (F_PROPOSAL_KIND, F_ACTOR, F_RISK):
+                value = f.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    msgs.append(
+                        f"{TAG_EFFECT_INTENT}: proposal {key!r} must be a non-empty str"
+                    )
+            capabilities = f.get(F_CAPABILITIES)
+            if (
+                isinstance(capabilities, (str, bytes))
+                or not isinstance(capabilities, Sequence)
+                or any(not isinstance(item, str) or not item.strip() for item in capabilities)
+                or len({item.strip() for item in capabilities}) != len(capabilities)
+            ):
+                msgs.append(
+                    f"{TAG_EFFECT_INTENT}: proposal {F_CAPABILITIES!r} must be a sequence of unique strings"
+                )
+            estimate = f.get(F_ESTIMATE)
+            if not isinstance(estimate, Mapping):
+                msgs.append(
+                    f"{TAG_EFFECT_INTENT}: proposal {F_ESTIMATE!r} must be a mapping"
+                )
+            else:
+                normalized_buckets: set[str] = set()
+                for bucket, amount in estimate.items():
+                    valid = (
+                        isinstance(bucket, str)
+                        and bool(bucket.strip())
+                        and bucket.strip() not in normalized_buckets
+                        and not isinstance(amount, bool)
+                        and _finite_nonnegative(amount)
+                    )
+                    if not valid:
+                        msgs.append(
+                            f"{TAG_EFFECT_INTENT}: proposal {F_ESTIMATE!r} contains invalid values"
+                        )
+                        break
+                    normalized_buckets.add(bucket.strip())
+            if not isinstance(f.get(F_PROPOSAL_METADATA), Mapping):
+                msgs.append(
+                    f"{TAG_EFFECT_INTENT}: proposal {F_PROPOSAL_METADATA!r} must be a mapping"
+                )
+            else:
+                msgs.extend(_json_shape_errors(
+                    f[F_PROPOSAL_METADATA],
+                    f"{TAG_EFFECT_INTENT}.{F_PROPOSAL_METADATA}",
+                ))
 
         # Kind discriminator + kind-specific field checks.
         kind = f.get(F_KIND)
@@ -269,7 +377,7 @@ class EffectRow:
 
     def _check_intent_llm(self, f: Mapping) -> list[str]:
         msgs: list[str] = []
-        if F_MODEL not in f or not isinstance(f[F_MODEL], str):
+        if F_MODEL not in f or not isinstance(f[F_MODEL], str) or not f[F_MODEL].strip():
             msgs.append(
                 f"{TAG_EFFECT_INTENT}[llm_call]: {F_MODEL!r} required (str)"
             )
@@ -277,22 +385,39 @@ class EffectRow:
             msgs.append(
                 f"{TAG_EFFECT_INTENT}[llm_call]: {F_REQUEST!r} required"
             )
+        else:
+            # Request is normally a typed adapter value.  If a hand-crafted
+            # Claim supplies a plain mapping/list instead, still enforce the
+            # strict JSON container rules without rejecting registered opaque
+            # application values that the Claim codec can persist.
+            msgs.extend(_container_shape_errors(
+                f[F_REQUEST], f"{TAG_EFFECT_INTENT}[llm_call].{F_REQUEST}",
+            ))
         return msgs
 
     def _check_intent_tool(self, f: Mapping) -> list[str]:
         msgs: list[str] = []
         name = f.get(F_TOOL_NAME)
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name.strip():
             msgs.append(
                 f"{TAG_EFFECT_INTENT}[tool_call]: {F_TOOL_NAME!r} required "
                 f"(non-empty str)"
             )
+        if F_ARGUMENTS not in f:
+            msgs.append(
+                f"{TAG_EFFECT_INTENT}[tool_call]: {F_ARGUMENTS!r} required "
+                "(mapping; use {} when there are no arguments)"
+            )
         args = f.get(F_ARGUMENTS)
-        if args is not None and not isinstance(args, Mapping):
+        if not isinstance(args, Mapping):
             msgs.append(
                 f"{TAG_EFFECT_INTENT}[tool_call]: {F_ARGUMENTS!r} must be "
-                f"Mapping | None, got {type(args).__name__}"
+                f"a mapping, got {type(args).__name__}"
             )
+        else:
+            msgs.extend(_json_shape_errors(
+                args, f"{TAG_EFFECT_INTENT}[tool_call].{F_ARGUMENTS}",
+            ))
         decl = f.get(F_DECLARED_SIDE_EFFECT)
         if decl not in _VALID_SIDE_EFFECTS:
             msgs.append(
@@ -384,6 +509,16 @@ class EffectRow:
             msgs.append(
                 f"{TAG_EFFECT_RESULT}: status='error' requires {F_ERROR!r}"
             )
+        if has_error:
+            error = f.get(F_ERROR)
+            if not isinstance(error, Mapping):
+                msgs.append(
+                    f"{TAG_EFFECT_RESULT}: {F_ERROR!r} must be a mapping",
+                )
+            else:
+                msgs.extend(_json_shape_errors(
+                    error, f"{TAG_EFFECT_RESULT}.{F_ERROR}",
+                ))
 
         attempts = f.get(F_ATTEMPTS)
         if attempts is not None and (
@@ -399,7 +534,7 @@ class EffectRow:
         if kind == EffectKind.LLM_CALL.value:
             msgs.extend(self._check_result_llm(f))
         elif kind == EffectKind.TOOL_CALL.value:
-            msgs.extend(self._check_result_tool(f))
+            msgs.extend(self._check_result_tool(f, intent))
 
         return msgs
 
@@ -408,6 +543,10 @@ class EffectRow:
         msgs: list[str] = []
         if F_REPLY not in f:
             msgs.append(f"{TAG_EFFECT_RESULT}[llm_call]: {F_REPLY!r} required")
+        else:
+            msgs.extend(_container_shape_errors(
+                f[F_REPLY], f"{TAG_EFFECT_RESULT}[llm_call].{F_REPLY}",
+            ))
         total_usage = f.get(F_TOTAL_USAGE)
         if total_usage is not None and not isinstance(total_usage, Usage):
             msgs.append(
@@ -415,7 +554,7 @@ class EffectRow:
             )
         return msgs
 
-    def _check_result_tool(self, f: Mapping) -> list[str]:
+    def _check_result_tool(self, f: Mapping, intent: Claim | None) -> list[str]:
         msgs: list[str] = []
         # F_OUTPUT required regardless of status (parallel to F_REPLY).
         # Empty / None is allowed; absent is not.
@@ -424,6 +563,10 @@ class EffectRow:
                 f"{TAG_EFFECT_RESULT}[tool_call]: {F_OUTPUT!r} required "
                 f"(use None or empty value if the tool body returned nothing)"
             )
+        else:
+            msgs.extend(_container_shape_errors(
+                f[F_OUTPUT], f"{TAG_EFFECT_RESULT}[tool_call].{F_OUTPUT}",
+            ))
         # F_SIDE_EFFECT required: the actual class observed.
         actual = f.get(F_SIDE_EFFECT)
         if actual not in _VALID_SIDE_EFFECTS:
@@ -439,20 +582,32 @@ class EffectRow:
                     f"{TAG_EFFECT_RESULT}[tool_call]: {F_SPEND!r} must be a mapping"
                 )
             else:
+                normalized_buckets: set[str] = set()
                 for bucket, amount in spend.items():
                     if (
                         not isinstance(bucket, str)
-                        or not bucket
+                        or not bucket.strip()
+                        or bucket.strip() in normalized_buckets
                         or isinstance(amount, bool)
-                        or not isinstance(amount, (int, float))
-                        or not math.isfinite(float(amount))
-                        or amount < 0
-                    ):
+                        or not _finite_nonnegative(amount)
+                        ):
                         msgs.append(
                             f"{TAG_EFFECT_RESULT}[tool_call]: invalid "
                             f"{F_SPEND} entry {bucket!r}={amount!r}"
                         )
                         break
+                    normalized_buckets.add(bucket.strip())
+        if intent is not None:
+            declared = intent.fields.get(F_DECLARED_SIDE_EFFECT)
+            if (
+                declared in _SIDE_EFFECT_RANK
+                and actual in _SIDE_EFFECT_RANK
+                and _SIDE_EFFECT_RANK[actual] > _SIDE_EFFECT_RANK[declared]
+            ):
+                msgs.append(
+                    f"{TAG_EFFECT_RESULT}[tool_call]: actual side effect {actual!r} "
+                    f"exceeds declared {declared!r}"
+                )
         return msgs
 
     # ── invariants: rejection ─────────────────────────────────
@@ -509,19 +664,29 @@ class EffectRow:
                 f"{TAG_EFFECT_REJECTED}: {F_KIND}={kind!r} not in "
                 f"{sorted(_VALID_KINDS)}"
             )
+        elif intents and intents[0].fields.get(F_KIND) != kind:
+            msgs.append(
+                f"{TAG_EFFECT_REJECTED}: {F_KIND}={kind!r} does not match "
+                f"intent {F_KIND}={intents[0].fields.get(F_KIND)!r} for "
+                f"{F_EFFECT_ID}={eid!r}"
+            )
 
         reason = f.get(F_REASON)
-        if not isinstance(reason, str) or not reason:
+        if not isinstance(reason, str) or not reason.strip():
             msgs.append(
                 f"{TAG_EFFECT_REJECTED}: {F_REASON} must be a non-empty str"
             )
 
         detail = f.get(F_DETAIL)
-        if detail is not None and not isinstance(detail, dict):
+        if detail is not None and not isinstance(detail, Mapping):
             msgs.append(
-                f"{TAG_EFFECT_REJECTED}: {F_DETAIL} must be dict | None, "
+                f"{TAG_EFFECT_REJECTED}: {F_DETAIL} must be mapping | None, "
                 f"got {type(detail).__name__}"
             )
+        elif detail is not None:
+            msgs.extend(_json_shape_errors(
+                detail, f"{TAG_EFFECT_REJECTED}.{F_DETAIL}",
+            ))
 
         return msgs
 
@@ -606,3 +771,96 @@ class EffectRow:
 
     def __repr__(self) -> str:
         return f"EffectRow(namespace={sorted(self.namespace)})"
+
+
+def _finite_nonnegative(value: object) -> bool:
+    """Check numeric amounts without leaking conversion OverflowError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0
+
+
+def _json_shape_errors(value: object, path: str, *, _active: set[int] | None = None) -> list[str]:
+    """Validate a mapping payload without requiring typed Claim values.
+
+    Effect intents may legitimately carry typed ``Request``/``Reply`` objects
+    through the codec.  Their mapping-shaped companion fields (arguments,
+    error/detail/proposal metadata) still need strict JSON semantics so a
+    hand-crafted Claim cannot smuggle NaN, cycles, or coercive object keys.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return []
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [f"{path} contains a non-finite number"]
+    if not isinstance(value, (list, tuple, Mapping)):
+        return [f"{path} contains unsupported {type(value).__name__}"]
+    active = set() if _active is None else _active
+    marker = id(value)
+    if marker in active:
+        return [f"{path} contains a reference cycle"]
+    active.add(marker)
+    errors: list[str] = []
+    try:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    errors.append(f"{path} must use string object keys")
+                    continue
+                errors.extend(_json_shape_errors(child, f"{path}.{key}", _active=active))
+        else:
+            for index, child in enumerate(value):
+                errors.extend(_json_shape_errors(child, f"{path}[{index}]", _active=active))
+    finally:
+        active.remove(marker)
+    return errors
+
+
+def _container_shape_errors(
+    value: object,
+    path: str,
+    *,
+    _active: set[int] | None = None,
+) -> list[str]:
+    """Check JSON container hazards while allowing registered opaque leaves.
+
+    Effect replies and tool outputs are application values (and may be typed
+    objects handled by the Claim codec), unlike proposal metadata and error
+    details which must be JSON objects all the way down.  We still need to
+    reject the three coercions that would make a durable projection unsafe:
+    non-finite floats, non-string mapping keys, and reference cycles.  An
+    otherwise opaque leaf is left to the codec layer rather than being
+    rejected here.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return []
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [f"{path} contains a non-finite number"]
+    if not isinstance(value, (list, tuple, Mapping)):
+        return []
+    active = set() if _active is None else _active
+    marker = id(value)
+    if marker in active:
+        return [f"{path} contains a reference cycle"]
+    active.add(marker)
+    errors: list[str] = []
+    try:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    errors.append(f"{path} must use string object keys")
+                    continue
+                errors.extend(
+                    _container_shape_errors(child, f"{path}.{key}", _active=active),
+                )
+        else:
+            for index, child in enumerate(value):
+                errors.extend(
+                    _container_shape_errors(child, f"{path}[{index}]", _active=active),
+                )
+    finally:
+        active.remove(marker)
+    return errors

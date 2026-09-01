@@ -226,17 +226,25 @@ class SqliteClaimStore(ClaimStore):
         row = cur.fetchone()
 
         if row is None:
-            # Fresh store. Stamp meta.
+            # Fresh store. Stamp meta. Multiple independent Store instances
+            # may bootstrap the same file concurrently; idempotent inserts
+            # avoid turning that harmless race into a UNIQUE violation.
             with self._conn:
                 self._conn.executemany(
-                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
                     [
                         ("lipas_schema_version", str(SCHEMA_VERSION)),
                         ("store_id",   uuid.uuid4().hex),
                         ("created_at", repr(time.time())),
                     ],
                 )
-            return
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'lipas_schema_version'",
+            ).fetchone()
+            if row is None:
+                raise SchemaVersionMismatch(
+                    "meta.lipas_schema_version is missing after bootstrap",
+                )
 
         try:
             existing = int(row[0])
@@ -309,7 +317,12 @@ class SqliteClaimStore(ClaimStore):
                 f"claim seq={seq} written under schema {schema_v}; "
                 f"runtime is {SCHEMA_VERSION}",
             )
-        encoded_fields = json.loads(fields_json)
+        encoded_fields = json.loads(
+            fields_json,
+            parse_constant=lambda raw: (_ for _ in ()).throw(
+                ValueError(f"non-JSON numeric constant {raw!r}")
+            ),
+        )
         fields = decode(encoded_fields, self._codecs)
         if not isinstance(fields, dict):
             raise LipasError(
@@ -366,6 +379,7 @@ class SqliteClaimStore(ClaimStore):
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
+            allow_nan=False,
         )
 
         admitted: Claim | None = None
@@ -577,6 +591,7 @@ class SqliteClaimStore(ClaimStore):
         encoded = encode(self._merged.fields, self._codecs)
         fields_json = json.dumps(
             encoded, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False,
         )
         with immediate_transaction(self._conn):
             checksum = _snapshot_digest(
@@ -708,7 +723,9 @@ def _projection_fingerprint(
             "caution_threshold": ctx.caution_threshold,
         },
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -726,5 +743,6 @@ def _snapshot_digest(
         [snapshot_seq, claim_id, tag, kind, priority, source, fields_json],
         ensure_ascii=False,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

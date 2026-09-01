@@ -252,8 +252,14 @@ class Tool:
             raise TypeError("Tool._handler must be callable")
         if not isinstance(self.declared_buckets, frozenset) or not self.declared_buckets:
             raise ValueError("Tool.declared_buckets must be a non-empty frozenset")
-        if any(not isinstance(bucket, str) or not bucket for bucket in self.declared_buckets):
+        if any(not isinstance(bucket, str) or not bucket.strip() for bucket in self.declared_buckets):
             raise ValueError("Tool.declared_buckets must contain non-empty strings")
+        normalized_buckets = frozenset(bucket.strip() for bucket in self.declared_buckets)
+        if len(normalized_buckets) != len(self.declared_buckets):
+            raise ValueError(
+                "Tool.declared_buckets contain duplicate values after normalization",
+            )
+        object.__setattr__(self, "declared_buckets", normalized_buckets)
         if self.estimate_fn is not None and not callable(self.estimate_fn):
             raise TypeError("Tool.estimate_fn must be callable or None")
         if not isinstance(self.observability_only, bool):

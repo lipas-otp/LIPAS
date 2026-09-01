@@ -63,18 +63,19 @@ class CapabilityRow:
         """Reject budget shapes that would turn a hard gate into a no-op."""
         normalized: dict[str, float] = {}
         for bucket, limit in self.budgets.items():
-            if not isinstance(bucket, str) or not bucket:
+            if not isinstance(bucket, str) or not bucket.strip():
                 raise ValueError(f"budget name must be a non-empty string, got {bucket!r}")
-            if (
-                isinstance(limit, bool)
-                or not isinstance(limit, (int, float))
-                or not math.isfinite(float(limit))
-                or limit < 0
-            ):
+            numeric_limit = _finite_float(limit)
+            if numeric_limit is None or numeric_limit < 0:
                 raise ValueError(
                     f"budget {bucket!r} must be a finite non-negative number, got {limit!r}"
                 )
-            normalized[bucket] = float(limit)
+            bucket_name = bucket.strip()
+            if bucket_name in normalized:
+                raise ValueError(
+                    f"budget names contain duplicate values after normalization: {bucket!r}",
+                )
+            normalized[bucket_name] = numeric_limit
         self.budgets = normalized
 
     def register_strategies(self, registry: StrategyRegistry) -> None:
@@ -131,13 +132,13 @@ class CapabilityRow:
 
     @staticmethod
     def _valid_amount(bucket: object, amount: object) -> bool:
+        numeric_amount = _finite_float(amount)
         return (
             isinstance(bucket, str)
             and bool(bucket)
-            and isinstance(amount, (int, float))
-            and not isinstance(amount, bool)
-            and math.isfinite(float(amount))
-            and amount >= 0
+            and bucket == bucket.strip()
+            and numeric_amount is not None
+            and numeric_amount >= 0
         )
 
     # ── projection helpers ────────────────────────────────────
@@ -152,7 +153,7 @@ class CapabilityRow:
             if c.claim_id in seen:
                 continue
             seen.add(c.claim_id)
-            total += float(c.fields.get(F_AMOUNT, 0))
+            total = _finite_sum(total, float(c.fields.get(F_AMOUNT, 0)))
         return total
 
     def _overrun(self, store: ClaimStore, bucket: str) -> float:
@@ -165,7 +166,7 @@ class CapabilityRow:
             if c.claim_id in seen:
                 continue
             seen.add(c.claim_id)
-            total += float(c.fields.get(F_AMOUNT, 0))
+            total = _finite_sum(total, float(c.fields.get(F_AMOUNT, 0)))
         return total
 
     def project(self, store: ClaimStore) -> dict:
@@ -179,10 +180,28 @@ class CapabilityRow:
                 "remaining":  limit - spent,
                 "exhausted":  spent >= limit,
                 "overrun":    overrun,               # off-ledger reality
-                "true_spent": spent + overrun,       # for billing/monitoring
+                "true_spent": _finite_sum(spent, overrun),  # for billing/monitoring
             }
         return out
 
     def __repr__(self) -> str:
         return (f"CapabilityRow(budgets={list(self.budgets)}, "
                 f"namespace={sorted(self.namespace)})")
+
+
+def _finite_sum(left: float, right: float) -> float:
+    total = left + right
+    if not math.isfinite(total):
+        raise ValueError("capability spend aggregate overflowed to a non-finite value")
+    return total
+
+
+def _finite_float(value: object) -> float | None:
+    """Convert numeric input safely, treating huge integers as invalid."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None

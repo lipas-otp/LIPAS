@@ -116,7 +116,18 @@ class ActionGateway:
             raise TypeError("allow_writes must be bool")
         self.allow_writes = allow_writes
         self.default_timeout_s = self._timeout(default_timeout_s)
-        self.secret_policy = secret_policy or SecretPolicy()
+        if secret_policy is None:
+            # Keep the ingress policy in lock-step with a managed resolver's
+            # namespace.  Otherwise a perfectly valid ``vault://`` reference
+            # would either be rejected as a raw sensitive value or bypass the
+            # resolver and reach the tool unchanged.
+            prefixes = getattr(secret_resolver, "allowed_prefixes", None)
+            self.secret_policy = (
+                SecretPolicy(reference_prefixes=tuple(sorted(prefixes)))
+                if prefixes is not None else SecretPolicy()
+            )
+        else:
+            self.secret_policy = secret_policy
         self._lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Task[Any]] = {}
 
@@ -141,9 +152,18 @@ class ActionGateway:
         timeout_s: float | None = None,
         caused_by: str | None = None,
     ) -> ActionResult:
-        request_id = request_id or f"request_{uuid.uuid4().hex}"
-        if not isinstance(request_id, str) or not request_id.strip():
+        if request_id is None:
+            request_id = f"request_{uuid.uuid4().hex}"
+        elif not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("request_id must be a non-empty string")
+        else:
+            request_id = request_id.strip()
+        if caused_by is not None and (
+            not isinstance(caused_by, str) or not caused_by.strip()
+        ):
+            raise ValueError("caused_by must be a non-empty string or None")
+        if caused_by is not None:
+            caused_by = caused_by.strip()
         if not isinstance(arguments, Mapping):
             raise TypeError("arguments must be a mapping")
         # This must happen before approval/audit Claims so a rejected raw
@@ -156,6 +176,17 @@ class ActionGateway:
             )
         effect_id = self.effect_id(request_id)
         tool = self.tools.get(tool_name)
+        # Approval is itself a durable fact. Bind it to the complete request
+        # shape so a caller cannot approve one payload and then reuse the same
+        # request id for a different write (especially across a process
+        # restart, where an in-memory idempotency map would be insufficient).
+        request_fingerprint = self._request_fingerprint(tool_name, arguments)
+        self._check_prior_approval(
+            effect_id,
+            tool_name=tool_name,
+            request_fingerprint=request_fingerprint,
+            caused_by=caused_by if caused_by is not None else request_id,
+        )
         if (
             tool.side_effect in {
                 SideEffectClass.IDEMPOTENT_WRITE,
@@ -168,6 +199,8 @@ class ActionGateway:
                 "effect_id": effect_id,
                 "tool_name": tool_name,
                 "side_effect": tool.side_effect.value,
+                "arguments_sha256": request_fingerprint,
+                "caused_by": caused_by if caused_by is not None else request_id,
             }
             self.rowset.fold(Claim(
                 tag="gateway_approval_required",
@@ -196,7 +229,7 @@ class ActionGateway:
                     arguments=arguments,
                     effect_id=effect_id,
                     tool_use_id=effect_id,
-                    caused_by=caused_by or request_id,
+                    caused_by=caused_by if caused_by is not None else request_id,
                 ))
                 self._inflight[effect_id] = task
 
@@ -256,13 +289,17 @@ class ActionGateway:
             error=error,
             wall_seconds=wall_seconds,
         )
-        tool = self.tools.get(
-            next(
-                node.intent.fields["tool_name"]
+        tool_name = next(
+            (
+                node.intent.fields.get("tool_name")
                 for node in self._effect_nodes()
                 if node.effect_id == effect_id and node.intent is not None
-            )
+            ),
+            None,
         )
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise KeyError(request_id)
+        tool = self.tools.get(tool_name)
         return self._result_from_effect(request_id, effect_id, tool.name, result)
 
     def _effect_nodes(self):
@@ -271,6 +308,53 @@ class ActionGateway:
         )
         return effect_row.project(self.rowset.store).nodes.values()
 
+    def _check_prior_approval(
+        self,
+        effect_id: str,
+        *,
+        tool_name: str,
+        request_fingerprint: str,
+        caused_by: str,
+    ) -> None:
+        claim_id = f"approval_{effect_id}"
+        for claim in self.rowset.store.filter(tag="gateway_approval_required"):
+            if claim.claim_id != claim_id:
+                continue
+            fields = claim.fields
+            if fields.get("tool_name") != tool_name:
+                raise ValueError(
+                    f"request id {effect_id!r} was reused for a different tool",
+                )
+            recorded = fields.get("arguments_sha256")
+            # Legacy approval claims predate the payload binding. They are
+            # still safe to read, but cannot be safely approved for a changed
+            # payload; require a fresh request identity instead.
+            if recorded != request_fingerprint:
+                raise ValueError(
+                    f"request id {effect_id!r} was reused for different arguments",
+                )
+            if fields.get("caused_by") != caused_by:
+                raise ValueError(
+                    f"request id {effect_id!r} was reused with different causation",
+                )
+            return
+
+    @staticmethod
+    def _request_fingerprint(
+        tool_name: str, arguments: Mapping[str, Any],
+    ) -> str:
+        _validate_json_shape(arguments, "action arguments")
+        try:
+            payload = json.dumps(
+                {"tool_name": tool_name, "arguments": dict(arguments)},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("action arguments must be strict JSON") from exc
+        return hashlib.sha256(payload).hexdigest()
     def close(self) -> None:
         close = getattr(self.rowset.store, "close", None)
         if callable(close):
@@ -291,12 +375,16 @@ class ActionGateway:
     def _timeout(value: float | None) -> float | None:
         if value is None:
             return None
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or value <= 0
-        ):
+        try:
+            valid = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and value > 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
             raise ValueError("timeout must be a positive finite number or None")
         return float(value)
 
@@ -336,6 +424,45 @@ class ActionGateway:
             output=output,
             detail=dict(detail) if isinstance(detail, Mapping) else None,
         )
+
+
+def _validate_json_shape(
+    value: Any,
+    path: str,
+    *,
+    active: set[int] | None = None,
+) -> None:
+    """Validate the complete argument tree before deriving replay identity.
+
+    Python's JSON encoder silently stringifies integer mapping keys.  A
+    request fingerprint must instead describe exactly one canonical payload,
+    so nested keys, finite numbers, and reference cycles are checked before
+    serialization.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite numbers")
+        return
+    if not isinstance(value, (list, tuple, Mapping)):
+        raise TypeError(f"{path} contains unsupported {type(value).__name__}")
+    active = set() if active is None else active
+    marker = id(value)
+    if marker in active:
+        raise ValueError(f"{path} must not contain reference cycles")
+    active.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{path} must use string object keys")
+                _validate_json_shape(child, f"{path}.{key}", active=active)
+        else:
+            for index, child in enumerate(value):
+                _validate_json_shape(child, f"{path}[{index}]", active=active)
+    finally:
+        active.remove(marker)
 
 
 def result_json(result: ActionResult) -> str:

@@ -227,7 +227,24 @@ async def _run_process(
         timed_out = True
         if process.returncode is None:
             process.kill()
-        stdout, stderr = await communication
+        # On Python versions where a pipe reader is still waiting while the
+        # child is being reaped, awaiting ``communicate`` here can block
+        # forever even after SIGKILL has taken effect.  Give the already
+        # exiting child a short grace period to flush output, then cancel the
+        # reader task explicitly.  A timeout result is intentionally allowed
+        # to omit partial output; the important contract is that the worker
+        # cannot outlive its bound.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(communication), timeout=min(0.25, timeout_s),
+            )
+        if communication.done() and not communication.cancelled():
+            stdout, stderr = communication.result()
+        else:
+            communication.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await communication
+            stdout, stderr = b"", b""
         # A process that crossed the timeout boundary while already exiting is
         # still reported with its real exit code; callers can inspect
         # ``timed_out`` separately.  If it had to be killed, returncode is the

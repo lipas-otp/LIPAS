@@ -10,6 +10,7 @@ from .session import open_session, replay
 from .trace import render_trace, write_jsonl
 from .agent import Agent
 from .events import AgentEvent, AgentEventType, EventEmitter, EventSink
+from .effect import EffectDecision, EffectObservation, EffectProposal
 from .context import (
     CancellationToken,
     RunCancelled,
@@ -19,6 +20,11 @@ from .context import (
 )
 from .conversation import RunHandle, Session
 from .conversation_store import (
+    Attachment,
+    Conversation,
+    ConversationEvent,
+    ConversationEventPage,
+    Message,
     SessionConflictError, SessionSnapshot, SessionStore, SQLiteSessionStore,
 )
 from .models import (
@@ -70,13 +76,32 @@ from .coordination import (
     HandoffFailure,
     HandoffOutcome,
     MemberInfo,
+    AgentPlan,
+    PlanStep,
     Transfer,
+    ExternalRunAdapter,
+    ExternalRunEnvelope,
+    ExternalRunResult,
 )
-from .coordination_policy import CapabilityPolicy, SharedBudgetPolicy
+from .coordination_policy import (
+    ApprovalDelegation, CapabilityPolicy, SharedBudgetPolicy, WorkspaceIdentity,
+    WorkspacePolicyStore,
+)
+from .workflow import (
+    AutonomousWorkflowCompiler, CompiledPlan, CompiledWorkflow, MixedPlan,
+    PlanCompiler, StepMode, WorkflowCompiler, WorkflowConstraint, WorkflowGoal,
+    WorkflowStep, WorkflowStepResult, WorkflowExecutionResult,
+    compile_goal, compile_workflow, execute_compiled_workflow, execute_workflow,
+)
 from .extensions import (
     ConformanceCheck,
     ConformanceReport,
+    ExtensionCertification,
     ExtensionManifest,
+    ExtensionRegistry,
+    ExtensionRegistryService,
+    ExtensionSigner,
+    ExtensionTrustPolicy,
     run_conformance,
     scaffold_extension,
 )
@@ -104,7 +129,7 @@ from .durable import (
     writes_require_approval,
 )
 from .runtime import (
-    ArtifactRepository, LIPASRuntime, RuntimeAuditReport, RuntimeClaimIssue,
+    AgentRuntime, ArtifactRepository, LIPASRuntime, RuntimeAuditReport, RuntimeClaimIssue,
 )
 from .workspace_storage import (
     WORKSPACE_DATABASE_NAME,
@@ -113,6 +138,9 @@ from .workspace_storage import (
     WorkspaceMigrationPlan,
     WorkspaceMigrationRequired,
     WorkspaceMigrationResult,
+    WorkspaceBackup,
+    WorkspaceBundle,
+    WorkspaceBackupBundle,
     WorkspaceSchemaMismatch,
     WorkspaceStatus,
     WorkspaceStorage,
@@ -129,12 +157,52 @@ from .workbench import (
     WorkspacePolicyError,
     workbench_approval_policy,
 )
+from .document_tools import (
+    ConvertedDocument,
+    DocumentToolError,
+    MissingDocumentDependency,
+    UnsupportedDocumentFormat,
+    convert_document,
+    read_pdf_text,
+)
+from .code_tools import (
+    CodeExecutionResult,
+    CodeToolError,
+    CsvAnalysis,
+    analyze_csv,
+    calculate_expression,
+    execute_python,
+)
+from .web_tools import (
+    FetchedPage,
+    WebToolError,
+    extract_page_text,
+    fetch_url,
+    fetch_url_tool,
+)
+from .archive_tools import (
+    ArchiveEntry,
+    ArchiveSummary,
+    ArchiveToolError,
+    extract_archive,
+    inspect_archive,
+)
+from .knowledge import (
+    KnowledgeDocument,
+    KnowledgeError,
+    KnowledgeHit,
+    KnowledgeStore,
+    knowledge_search_tool,
+)
 from .gateway import ActionGateway, ActionResult, ActionSpec
-from .http_client import EgressPolicy, HttpClient, HttpClientError, HttpOperationUncertain, HttpResponse
+from .http_client import (
+    ConnectorRegistry, ConnectorSpec, EgressPolicy, HttpClient, HttpClientError,
+    HttpOperationUncertain, HttpResponse, RateLimitExceeded, RateLimitPolicy,
+)
 from .email import (
     EmailApprovalRequired, EmailConnector, EmailDelivery, EmailMessage, EmailProvider,
 )
-from .operator import LocalWebOperator, OperatorServer
+from .operator import LocalWebOperator, OperatorAuthenticator, OperatorServer
 from .faults import (
     FaultCampaign,
     FaultCampaignResult,
@@ -144,13 +212,41 @@ from .faults import (
     FaultPlan,
     run_fault_matrix,
 )
-from .performance import ExecutionBenchmark, benchmark_execution_store
+from .performance import (
+    CostEntry, CostLedger, EvaluationCase, EvaluationReport, ExecutionBenchmark,
+    ExecutionMetrics, ExecutionSoakReport, IncidentRecord, SLOReport,
+    benchmark_execution_store,
+    DesignPartnerCase, DesignPartnerReport, DesignPartnerRun, DesignPartnerSignoff,
+    evaluate_execution, measure_execution, project_cost_ledger, project_incidents,
+    run_design_partner_validation, run_execution_soak, run_soak,
+)
+from .provider_workflow import ProviderWorkflowEvidence, run_provider_workflow
 from .dispatcher import DispatchOutcome, TaskDispatcher
+from .dispatcher import (
+    HybridWorker, RemoteCheckpoint, RemoteEffectObservation,
+    RemoteExecutionResult, RemoteWorkerEvent, RemoteWorkerLease,
+    RemoteWorkerRunner, RemoteWorkerHTTPClient, RemoteWorkerHTTPServer,
+    WorkerAttestation, WorkerCapabilities,
+)
 from .security import (
     EnvironmentSecretResolver,
+    FileSecretResolver,
+    ManagedSecretResolver,
     SecretDetected,
     SecretPolicy,
     SecretResolutionError,
+    TLSConfig,
+)
+from .deployment import (
+    INSTALLATION_MANIFEST_NAME,
+    INSTALLATION_MANIFEST_VERSION,
+    DeploymentCheck,
+    DeploymentReport,
+    InstallationManifest,
+    install_workspace,
+    release_check,
+    upgrade_workspace,
+    verify_installation,
 )
 
 __all__ = [
@@ -162,13 +258,24 @@ __all__ = [
     "CoordinationFailed", "CoordinationIdentityConflict",
     "CoordinationRecoveryRequired", "CoordinationResultError",
     "CoordinationResult", "HandoffEnvelope", "HandoffExecutionError",
-    "HandoffFailure", "HandoffOutcome", "MemberInfo", "Transfer",
-    "SharedBudgetPolicy", "CapabilityPolicy",
-    "ExtensionManifest", "ConformanceCheck", "ConformanceReport",
+    "HandoffFailure", "HandoffOutcome", "MemberInfo", "AgentPlan", "PlanStep",
+    "Transfer", "ExternalRunEnvelope", "ExternalRunResult", "ExternalRunAdapter",
+    "SharedBudgetPolicy", "CapabilityPolicy", "WorkspaceIdentity",
+    "ApprovalDelegation", "WorkspacePolicyStore",
+    "WorkflowGoal", "WorkflowConstraint", "WorkflowStep", "CompiledWorkflow",
+    "StepMode", "CompiledPlan", "MixedPlan", "AutonomousWorkflowCompiler", "WorkflowCompiler",
+    "PlanCompiler",
+    "compile_workflow", "compile_goal", "WorkflowStepResult",
+    "WorkflowExecutionResult", "execute_compiled_workflow", "execute_workflow",
+    "ExtensionManifest", "ExtensionRegistry", "ExtensionRegistryService",
+    "ExtensionSigner", "ExtensionCertification", "ExtensionTrustPolicy",
+    "ConformanceCheck", "ConformanceReport",
     "run_conformance", "scaffold_extension",
     "AgentEvent", "AgentEventType", "EventEmitter", "EventSink",
+    "EffectProposal", "EffectDecision", "EffectObservation",
     "Session", "RunHandle", "SessionStore", "SessionSnapshot",
     "SessionConflictError", "SQLiteSessionStore",
+    "Conversation", "Message", "Attachment", "ConversationEvent", "ConversationEventPage",
     "RunContext", "CancellationToken", "RunCancelled",
     "RunDeadlineExceeded", "current_run_context",
     "ModelCapabilities", "ModelRequirements", "ModelRegistry",
@@ -196,22 +303,49 @@ __all__ = [
     "Workbench", "Workspace", "Approval", "Artifact", "ChangeSet", "Verification",
     "TaskReport", "WorkspacePolicyError",
     "RunEvent",
-    "LIPASRuntime", "RuntimeAuditReport", "RuntimeClaimIssue",
+    "LIPASRuntime", "AgentRuntime", "RuntimeAuditReport", "RuntimeClaimIssue",
     "ArtifactRepository",
     "WorkspaceStorage", "WorkspaceStatus", "WorkspaceMigrationPlan",
     "WorkspaceMigrationResult", "RuntimeStorageIssue",
-    "WorkspaceMigrationRequired", "WorkspaceSchemaMismatch",
+    "WorkspaceMigrationRequired", "WorkspaceSchemaMismatch", "WorkspaceBackup",
+    "WorkspaceBundle",
+    "WorkspaceBackupBundle",
     "WORKSPACE_SCHEMA_VERSION", "WORKSPACE_DATABASE_NAME",
     "workbench_approval_policy",
+    "ConvertedDocument", "DocumentToolError", "MissingDocumentDependency",
+    "UnsupportedDocumentFormat", "convert_document", "read_pdf_text",
+    "CodeExecutionResult", "CodeToolError", "CsvAnalysis", "analyze_csv",
+    "calculate_expression", "execute_python",
+    "FetchedPage", "WebToolError", "extract_page_text", "fetch_url",
+    "fetch_url_tool",
+    "ArchiveEntry", "ArchiveSummary", "ArchiveToolError", "extract_archive",
+    "inspect_archive",
+    "KnowledgeDocument", "KnowledgeError", "KnowledgeHit", "KnowledgeStore",
+    "knowledge_search_tool",
     "ActionGateway", "ActionResult", "ActionSpec",
     "HttpClient", "HttpResponse", "HttpClientError", "HttpOperationUncertain",
-    "EgressPolicy", "EmailApprovalRequired", "EmailConnector", "EmailMessage",
+    "EgressPolicy", "RateLimitPolicy", "RateLimitExceeded", "ConnectorSpec",
+    "ConnectorRegistry", "EmailApprovalRequired", "EmailConnector", "EmailMessage",
     "EmailDelivery", "EmailProvider",
-    "LocalWebOperator", "OperatorServer",
+    "LocalWebOperator", "OperatorAuthenticator", "OperatorServer",
     "FaultCampaign", "FaultCampaignResult", "FaultInjected", "FaultInjector",
     "FaultMatrixResult", "FaultPlan", "run_fault_matrix",
-    "ExecutionBenchmark", "benchmark_execution_store",
+    "ExecutionBenchmark", "ExecutionMetrics", "ExecutionSoakReport", "SLOReport", "CostEntry", "CostLedger",
+    "IncidentRecord", "EvaluationCase", "EvaluationReport",
+    "benchmark_execution_store", "measure_execution", "project_cost_ledger",
+    "project_incidents", "evaluate_execution",
+    "DesignPartnerCase", "DesignPartnerRun", "DesignPartnerSignoff", "DesignPartnerReport",
+    "run_design_partner_validation", "run_execution_soak", "run_soak",
+    "ProviderWorkflowEvidence", "run_provider_workflow",
     "DispatchOutcome", "TaskDispatcher",
+    "HybridWorker", "WorkerCapabilities", "RemoteWorkerLease", "RemoteWorkerRunner",
+    "RemoteWorkerEvent", "RemoteCheckpoint", "RemoteEffectObservation",
+    "RemoteExecutionResult", "WorkerAttestation", "RemoteWorkerHTTPClient",
+    "RemoteWorkerHTTPServer",
     "SecretDetected", "SecretPolicy",
     "SecretResolutionError", "EnvironmentSecretResolver",
+    "FileSecretResolver", "ManagedSecretResolver", "TLSConfig",
+    "INSTALLATION_MANIFEST_NAME", "INSTALLATION_MANIFEST_VERSION",
+    "DeploymentCheck", "DeploymentReport", "InstallationManifest",
+    "install_workspace", "upgrade_workspace", "verify_installation", "release_check",
 ]

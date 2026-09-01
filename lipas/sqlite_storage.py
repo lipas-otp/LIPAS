@@ -8,6 +8,8 @@ connection policy without creating another authority or generic database ORM.
 from __future__ import annotations
 
 import contextlib
+import math
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -44,9 +46,17 @@ class SQLitePolicy:
     synchronous: str = "FULL"
 
     def __post_init__(self) -> None:
-        if self.busy_timeout_ms < 0:
+        if (
+            isinstance(self.busy_timeout_ms, bool)
+            or not isinstance(self.busy_timeout_ms, int)
+            or self.busy_timeout_ms < 0
+        ):
             raise ValueError("busy_timeout_ms must be non-negative")
-        if self.wal_autocheckpoint_pages < 1:
+        if (
+            isinstance(self.wal_autocheckpoint_pages, bool)
+            or not isinstance(self.wal_autocheckpoint_pages, int)
+            or self.wal_autocheckpoint_pages < 1
+        ):
             raise ValueError("wal_autocheckpoint_pages must be positive")
         if self.synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
             raise ValueError("unsupported SQLite synchronous policy")
@@ -97,12 +107,20 @@ def connect_sqlite(
         if read_only_uri:
             connection.execute("PRAGMA query_only = ON")
         if path != ":memory:" and not read_only_uri:
-            connection.execute("PRAGMA journal_mode = WAL")
+            _enable_wal_with_retry(connection, policy)
             connection.execute(f"PRAGMA synchronous = {policy.synchronous}")
             connection.execute(
                 "PRAGMA wal_autocheckpoint = "
                 f"{policy.wal_autocheckpoint_pages}",
             )
+            if os.name == "posix":
+                # Durable claims/evidence may contain prompts and provider
+                # payloads; keep newly-created SQLite files private by
+                # default. Callers can still opt into a wider policy later.
+                try:
+                    os.chmod(Path(path), 0o600)
+                except (OSError, TypeError):
+                    pass
         return connection
     except BaseException:
         connection.close()
@@ -135,6 +153,32 @@ def classify_sqlite_failure(error: sqlite3.Error) -> SQLiteFailureKind:
     return SQLiteFailureKind.OTHER
 
 
+def _enable_wal_with_retry(
+    connection: sqlite3.Connection,
+    policy: SQLitePolicy,
+) -> None:
+    """Enable WAL while tolerating concurrent first opens of one database.
+
+    SQLite changes the journal mode through a short schema-level write. Two
+    processes opening a fresh file can therefore race before either store has
+    reached its normal transaction retry boundary. Retrying this pragma is
+    safe because it has no application-visible side effect beyond selecting
+    the same configured mode; no caller body is replayed here.
+    """
+    attempts = 8
+    for attempt in range(attempts):
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if (
+                classify_sqlite_failure(exc) is not SQLiteFailureKind.BUSY
+                or attempt + 1 == attempts
+            ):
+                raise
+            time.sleep(min(0.05 * (2**attempt), policy.busy_timeout_ms / 1_000))
+
+
 @contextlib.contextmanager
 def immediate_transaction(
     connection: sqlite3.Connection,
@@ -148,9 +192,22 @@ def immediate_transaction(
     prevents a database helper from duplicating an external side effect hidden
     in caller code.
     """
-    if begin_attempts < 1:
+    if (
+        isinstance(begin_attempts, bool)
+        or not isinstance(begin_attempts, int)
+        or begin_attempts < 1
+    ):
         raise ValueError("begin_attempts must be positive")
-    if retry_delay_s < 0:
+    try:
+        valid_retry_delay = (
+            not isinstance(retry_delay_s, bool)
+            and isinstance(retry_delay_s, (int, float))
+            and math.isfinite(float(retry_delay_s))
+            and retry_delay_s >= 0
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid_retry_delay = False
+    if not valid_retry_delay:
         raise ValueError("retry_delay_s must be non-negative")
     for attempt in range(begin_attempts):
         try:

@@ -16,4 +16,11 @@ Work from evidence in the repository rather than generic assumptions.
 6. Run the narrowest useful checks first, then broader checks in proportion to risk. Never describe an unrun check as passing.
 7. Report what changed, what was verified, and any residual uncertainty or migration impact.
 
+The first-party Workbench also provides bounded `calculate`, `analyze_csv`, and
+`python_exec` Tools.  `calculate` is a pure arithmetic evaluator; `analyze_csv`
+returns a size-limited profile without row contents; `python_exec` runs source in
+a temporary worker and records its isolation flags.  Python execution is an
+external-write capability and therefore remains approval-gated; it must not be
+treated as a substitute for the staged file-write Tool.
+
 This Skill supplies engineering method only. It grants no shell, filesystem, network, release, or deployment authority.

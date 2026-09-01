@@ -1329,11 +1329,15 @@ class DurableReActRunner:
 
     @staticmethod
     def _positive_seconds(value: float, name: str) -> float:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or value <= 0
-        ):
+        try:
+            valid = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and value > 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
             raise ValueError(f"{name} must be a positive finite number")
         return float(value)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
 from .operations import (
@@ -30,13 +31,19 @@ class EmailMessage:
     headers: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sender, str) or "@" not in self.sender:
+        if not isinstance(self.sender, str) or not _valid_address(self.sender):
             raise ValueError("sender must be an email address")
+        object.__setattr__(self, "sender", self.sender.strip())
         self._validate_header_text(self.sender, "sender")
         if not self.recipients or any(
-            not isinstance(value, str) or "@" not in value for value in self.recipients
+            not isinstance(value, str) or not _valid_address(value)
+            for value in self.recipients
         ):
             raise ValueError("recipients must contain email addresses")
+        normalized_recipients = tuple(value.strip() for value in self.recipients)
+        if len(set(normalized_recipients)) != len(normalized_recipients):
+            raise ValueError("recipients must not contain duplicates")
+        object.__setattr__(self, "recipients", normalized_recipients)
         for recipient in self.recipients:
             self._validate_header_text(recipient, "recipient")
         if not isinstance(self.subject, str) or not self.subject.strip():
@@ -53,6 +60,7 @@ class EmailMessage:
                 raise TypeError("email headers must map strings to strings")
             self._validate_header_text(key, "header name")
             self._validate_header_text(value, "header value")
+        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
 
     @staticmethod
     def _validate_header_text(value: str, field_name: str) -> None:
@@ -77,6 +85,20 @@ class EmailDelivery:
     accepted: bool = True
     provider_request_id: str | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_reference, str) or not self.provider_reference.strip():
+            raise ValueError("provider_reference must be non-empty")
+        if not isinstance(self.accepted, bool):
+            raise TypeError("accepted must be bool")
+        if self.provider_request_id is not None and (
+            not isinstance(self.provider_request_id, str)
+            or not self.provider_request_id.strip()
+        ):
+            raise ValueError("provider_request_id must be non-empty or None")
+        object.__setattr__(self, "provider_reference", self.provider_reference.strip())
+        if self.provider_request_id is not None:
+            object.__setattr__(self, "provider_request_id", self.provider_request_id.strip())
+
 
 class EmailProvider(Protocol):
     def send(self, message: EmailMessage, *, idempotency_key: str) -> EmailDelivery | Mapping[str, Any]: ...
@@ -87,6 +109,10 @@ class EmailConnector:
     """One approval/reconciliation boundary for all email providers."""
 
     def __init__(self, provider: EmailProvider, journal: OperationJournal) -> None:
+        if provider is None:
+            raise TypeError("provider must not be None")
+        if not isinstance(journal, OperationJournal):
+            raise TypeError("journal must be OperationJournal")
         self.provider = provider
         self.journal = journal
 
@@ -98,8 +124,11 @@ class EmailConnector:
         effect_id: str | None = None,
         approved: bool = False,
     ) -> Operation:
+        if not isinstance(message, EmailMessage):
+            raise TypeError("message must be an EmailMessage")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("email idempotency_key must be non-empty")
+        idempotency_key = idempotency_key.strip()
         if not isinstance(approved, bool):
             raise TypeError("approved must be bool")
         if not approved:
@@ -109,7 +138,10 @@ class EmailConnector:
         request = message.as_request()
         content = message.as_request(include_content=True)
         request["content_sha256"] = hashlib.sha256(
-            json.dumps(content, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(
+                content, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
         ).hexdigest()
         operation, owns = self.journal._prepare(
             key=idempotency_key,
@@ -128,14 +160,8 @@ class EmailConnector:
             )
         try:
             raw = self.provider.send(message, idempotency_key=idempotency_key)
+            reference: str | None
             if isinstance(raw, EmailDelivery):
-                if (
-                    not isinstance(raw.provider_reference, str)
-                    or not raw.provider_reference.strip()
-                ):
-                    raise ValueError(
-                        "email provider must return a non-empty provider_reference",
-                    )
                 result: Mapping[str, Any] = {
                     "accepted": raw.accepted,
                     "provider_reference": raw.provider_reference,
@@ -145,14 +171,7 @@ class EmailConnector:
             elif isinstance(raw, Mapping):
                 result = dict(raw)
                 reference_value = raw.get("provider_reference") or raw.get("id")
-                if (
-                    not isinstance(reference_value, str)
-                    or not reference_value.strip()
-                ):
-                    raise ValueError(
-                        "email provider must return provider_reference or id",
-                    )
-                reference = reference_value
+                reference = reference_value if isinstance(reference_value, str) else None
             else:
                 raise TypeError("email provider must return EmailDelivery or mapping")
             accepted = result.get("accepted", True)
@@ -166,6 +185,10 @@ class EmailConnector:
                         "provider_reference": reference,
                         "result": dict(result),
                     },
+                )
+            if reference is None or not reference.strip():
+                raise ValueError(
+                    "email provider must return a non-empty provider_reference",
                 )
             return self.journal.settle(
                 idempotency_key, result=result, provider_reference=reference,
@@ -183,9 +206,25 @@ class EmailConnector:
             raise
 
     def reconcile(self, idempotency_key: str) -> Operation:
+        def lookup(key: str) -> tuple[bool, Any, str | None]:
+            found, result, reference = self.provider.lookup(idempotency_key=key)
+            if not isinstance(found, bool):
+                raise ValueError("email provider lookup found flag must be bool")
+            if found and (
+                not isinstance(reference, str) or not reference.strip()
+            ):
+                # An accepted email without a provider reference cannot be
+                # safely distinguished from an incomplete lookup. Keep the
+                # operation uncertain rather than manufacturing success.
+                raise ValueError(
+                    "email provider lookup must return a non-empty "
+                    "provider_reference when found",
+                )
+            return found, result, reference
+
         return self.journal.reconcile(
             idempotency_key,
-            lambda key: self.provider.lookup(idempotency_key=key),
+            lookup,
         )
 
     def _mark_uncertain(self, key: str, cause: BaseException) -> Operation:
@@ -199,3 +238,13 @@ class EmailConnector:
             if latest is None:
                 raise
             return latest
+
+
+def _valid_address(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate or any(char.isspace() for char in candidate):
+        return False
+    local, separator, domain = candidate.partition("@")
+    return bool(separator and local and domain and "@" not in domain)

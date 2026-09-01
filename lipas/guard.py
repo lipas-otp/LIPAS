@@ -234,14 +234,18 @@ class HumanApprovalGuard:
             raise ValueError("HumanApprovalGuard.name must be a non-empty string")
         if self.resolver is not None and not callable(self.resolver):
             raise TypeError("HumanApprovalGuard.resolver must be callable or None")
-        if self.timeout_s is not None and (
-            isinstance(self.timeout_s, bool)
-            or not isinstance(self.timeout_s, (int, float))
-            or not math.isfinite(float(self.timeout_s))
-            or self.timeout_s <= 0
-        ):
-            raise ValueError("HumanApprovalGuard.timeout_s must be a finite positive number")
         if self.timeout_s is not None:
+            try:
+                valid_timeout = (
+                    not isinstance(self.timeout_s, bool)
+                    and isinstance(self.timeout_s, (int, float))
+                    and math.isfinite(float(self.timeout_s))
+                    and self.timeout_s > 0
+                )
+            except (OverflowError, TypeError, ValueError):
+                valid_timeout = False
+            if not valid_timeout:
+                raise ValueError("HumanApprovalGuard.timeout_s must be a finite positive number")
             self.timeout_s = float(self.timeout_s)
 
     async def check(

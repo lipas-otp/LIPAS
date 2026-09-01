@@ -334,10 +334,41 @@ _READ_FILE = _requirement(
     "read_workspace_file", SideEffectClass.READ_ONLY,
     "read one bounded workspace text file", parameters=("relative_path",),
 )
+_READ_PDF = _requirement(
+    "read_pdf", SideEffectClass.READ_ONLY,
+    "extract bounded text from one unencrypted workspace PDF",
+    parameters=("relative_path",),
+)
+_SEARCH_FILES = _requirement(
+    "search_workspace", SideEffectClass.READ_ONLY,
+    "search literal text in bounded UTF-8 workspace files",
+    parameters=("query",),
+)
 _WRITE_FILE = _requirement(
     "write_workspace_file", SideEffectClass.IDEMPOTENT_WRITE,
     "stage one atomic workspace file replacement", approval="delivery",
     idempotency=True, parameters=("relative_path", "content"),
+)
+_CONVERT_FILE = _requirement(
+    "convert_workspace_file", SideEffectClass.IDEMPOTENT_WRITE,
+    "convert one bounded document into a new workspace file",
+    approval="delivery", idempotency=True,
+    parameters=("source_path", "destination_path"),
+)
+_CALCULATE = _requirement(
+    "calculate", SideEffectClass.READ_ONLY,
+    "evaluate a bounded arithmetic expression without code or I/O",
+    parameters=("expression",),
+)
+_ANALYZE_CSV = _requirement(
+    "analyze_csv", SideEffectClass.READ_ONLY,
+    "profile a bounded CSV file and summarize numeric columns",
+    parameters=("relative_path",),
+)
+_PYTHON_EXEC = _requirement(
+    "python_exec", SideEffectClass.EXTERNAL_WRITE,
+    "run bounded Python in a temporary sandbox",
+    approval="before-call", parameters=("source",),
 )
 _RUN_COMMAND = _requirement(
     "run_workspace_command", SideEffectClass.EXTERNAL_WRITE,
@@ -433,21 +464,25 @@ def _scenario_catalog() -> tuple[BusinessScenario, ...]:
             "Inspect a bounded change and produce evidence-linked findings.",
             "engineering", workspace, ("workspace-files", "code-review"),
             ("inspect scope", "read diff", "trace risks", "verify findings", "report"),
-            (_LIST_FILES, _READ_FILE, _GIT_STATUS, _GIT_DIFF),
+            (_LIST_FILES, _READ_FILE, _SEARCH_FILES, _GIT_STATUS, _GIT_DIFF),
         ),
         BusinessScenario(
             "coding-change", "Coding change",
             "Diagnose, implement, verify, and stage a bounded repository change.",
             "engineering", workspace, ("workspace-files", "coding-task"),
             ("diagnose", "inspect", "edit stage", "verify", "review diff", "deliver"),
-            (_LIST_FILES, _READ_FILE, _WRITE_FILE, _RUN_COMMAND, _GIT_STATUS, _GIT_DIFF),
+            (
+                _LIST_FILES, _READ_FILE, _SEARCH_FILES, _CALCULATE,
+                _ANALYZE_CSV, _PYTHON_EXEC, _WRITE_FILE, _RUN_COMMAND,
+                _GIT_STATUS, _GIT_DIFF,
+            ),
         ),
         BusinessScenario(
             "document-processing", "Document processing",
             "Extract, summarize, normalize, or convert bounded text documents.",
             "files", workspace, ("workspace-files", "document-processing"),
             ("inventory", "inspect format", "transform", "stage output", "verify"),
-            (_LIST_FILES, _READ_FILE, _WRITE_FILE),
+            (_LIST_FILES, _READ_FILE, _SEARCH_FILES, _READ_PDF, _WRITE_FILE, _CONVERT_FILE),
         ),
         BusinessScenario(
             "email-delivery", "Email delivery",

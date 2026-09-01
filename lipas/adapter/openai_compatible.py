@@ -38,6 +38,7 @@ from .types import (
     ToolUseDelta,
     Usage,
 )
+from ..security import SecretResolutionError, SecretResolver
 
 __all__ = ["OpenAICompatibleAdapter"]
 
@@ -89,6 +90,8 @@ class OpenAICompatibleAdapter:
         *,
         base_url: str,
         api_key: str | None = None,
+        api_key_reference: str | None = None,
+        secret_resolver: SecretResolver | None = None,
         api_key_env: str | None = "OPENAI_API_KEY",
         require_api_key: bool = True,
         prices: PriceTable | None = None,
@@ -101,6 +104,20 @@ class OpenAICompatibleAdapter:
         name: str | None = None,
     ) -> None:
         self.url = self._chat_completions_url(base_url)
+        if api_key is not None and api_key_reference is not None:
+            raise ValueError("pass either api_key or api_key_reference, not both")
+        if api_key_reference is not None:
+            if not isinstance(api_key_reference, str) or not api_key_reference.strip():
+                raise ValueError("api_key_reference must be a non-empty string or None")
+            if secret_resolver is None:
+                raise SecretResolutionError(
+                    "api_key_reference requires an explicit secret_resolver",
+                )
+            api_key = secret_resolver.resolve(api_key_reference.strip())
+        self.api_key_reference = (
+            None if api_key_reference is None else api_key_reference.strip()
+        )
+        self._secret_resolver = secret_resolver
         self.api_key_env = self._validate_api_key_env(api_key_env)
         self.api_key = self._resolve_api_key(api_key, self.api_key_env)
         if not isinstance(require_api_key, bool):
@@ -111,12 +128,16 @@ class OpenAICompatibleAdapter:
                 "OpenAI-compatible endpoint requires an API key; pass "
                 f"api_key=... or set {source}",
             )
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, (int, float))
-            or not math.isfinite(float(timeout_s))
-            or timeout_s <= 0
-        ):
+        try:
+            valid_timeout = (
+                not isinstance(timeout_s, bool)
+                and isinstance(timeout_s, (int, float))
+                and math.isfinite(float(timeout_s))
+                and timeout_s > 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_timeout = False
+        if not valid_timeout:
             raise ValueError("timeout_s must be a finite positive number")
         if not isinstance(streaming, bool):
             raise TypeError("streaming must be bool")
@@ -144,6 +165,17 @@ class OpenAICompatibleAdapter:
             raise ValueError("name must be a non-empty string or None")
         else:
             self.name = name.strip()
+
+    def reload_api_key(self) -> None:
+        """Resolve the configured key reference again after external rotation."""
+        if self.api_key_reference is None or self._secret_resolver is None:
+            raise ValueError("adapter has no managed api_key_reference to reload")
+        refreshed = self._secret_resolver.resolve(self.api_key_reference)
+        if not isinstance(refreshed, str) or not refreshed:
+            raise SecretResolutionError("managed provider key lookup returned no value")
+        # Assignment is atomic for this process; requests already building a
+        # header retain the old key while subsequent requests use the new one.
+        self.api_key = refreshed
 
     async def estimate_cost(self, request: Request) -> ResourceEstimate:
         """Estimate locally; admission never performs a provider call."""

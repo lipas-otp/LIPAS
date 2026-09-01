@@ -112,6 +112,7 @@ class Agent:
         session: str | Path | None = None,
         host: str | None = None,
         timeout_s: float = 500.0,
+        trust_env: bool = False,
         **kwargs: Any,
     ) -> "Agent":
         """Create a local Ollama-backed Agent with one short expression.
@@ -119,7 +120,9 @@ class Agent:
         ``session=`` is the friendly alias for ``session_path=``.  This
         convenience constructor changes no policy: tools still need an
         explicit side-effect declaration and all other ``Agent`` keywords
-        remain available through ``kwargs``.
+        remain available through ``kwargs``. Ambient HTTP proxy variables are
+        ignored by default for local Ollama; pass ``trust_env=True`` when a
+        remote Ollama host intentionally needs them.
         """
         if session is not None:
             if "session_path" in kwargs:
@@ -127,7 +130,11 @@ class Agent:
             kwargs["session_path"] = session
         from .adapter.ollama import OllamaAdapter
         return cls(
-            adapter=OllamaAdapter(host=host, timeout_s=timeout_s),
+            adapter=OllamaAdapter(
+                host=host,
+                timeout_s=timeout_s,
+                trust_env=trust_env,
+            ),
             model=model,
             **kwargs,
         )
@@ -139,6 +146,8 @@ class Agent:
         *,
         base_url: str,
         api_key: str | None = None,
+        api_key_reference: str | None = None,
+        secret_resolver: Any | None = None,
         api_key_env: str | None = "OPENAI_API_KEY",
         require_api_key: bool = True,
         session: str | Path | None = None,
@@ -154,9 +163,11 @@ class Agent:
     ) -> "Agent":
         """Build an Agent for an OpenAI-compatible Chat Completions API.
 
-        The endpoint, model, and credential are explicit.  Non-streaming is
-        the compatibility-first default; pass ``streaming=True`` only when the
-        selected provider/model route implements the SSE contract.  The
+        The endpoint and model are explicit. Pass either ``api_key``/``api_key_env``
+        or an opaque ``api_key_reference`` with a managed ``secret_resolver``;
+        the latter keeps credential custody outside the workspace. Non-streaming
+        is the compatibility-first default; pass ``streaming=True`` only when
+        the selected provider/model route implements the SSE contract. The
         adapter performs no silent provider or model fallback.
         """
         if session is not None:
@@ -168,6 +179,8 @@ class Agent:
             adapter=OpenAICompatibleAdapter(
                 base_url=base_url,
                 api_key=api_key,
+                api_key_reference=api_key_reference,
+                secret_resolver=secret_resolver,
                 api_key_env=api_key_env,
                 require_api_key=require_api_key,
                 prices=prices,

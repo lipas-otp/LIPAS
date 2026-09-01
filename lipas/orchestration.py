@@ -93,14 +93,37 @@ class Mailbox:
             "SELECT value FROM mailbox_meta WHERE key='schema_version'",
         ).fetchone()
         if row is None:
+            # A second process may be opening this file at the same time.  The
+            # metadata stamp is idempotent bootstrap state, not an ownership
+            # claim; INSERT OR IGNORE lets both processes converge on the
+            # same schema instead of surfacing a spurious UNIQUE violation.
             with immediate_transaction(self._conn):
                 self._conn.executemany(
-                    "INSERT INTO mailbox_meta(key,value) VALUES(?,?)",
+                    "INSERT OR IGNORE INTO mailbox_meta(key,value) VALUES(?,?)",
                     (
                         ("schema_version", str(MAILBOX_SCHEMA_VERSION)),
                         ("created_at", repr(time.time())),
                         ("adopted_legacy_schema", "1" if had_schema else "0"),
                     ),
+                )
+            row = self._conn.execute(
+                "SELECT value FROM mailbox_meta WHERE key='schema_version'",
+            ).fetchone()
+            if row is None:
+                raise MailboxSchemaVersionMismatch(
+                    "mailbox schema version is missing after bootstrap",
+                )
+            try:
+                existing = int(row[0])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MailboxSchemaVersionMismatch(
+                    f"mailbox schema version is not an int: {row[0]!r}",
+                ) from exc
+            if existing != MAILBOX_SCHEMA_VERSION:
+                raise MailboxSchemaVersionMismatch(
+                    f"mailbox at {self._path!r} is schema version {existing}; "
+                    f"this LIPAS release supports {MAILBOX_SCHEMA_VERSION}. "
+                    "No automatic migration is available.",
                 )
         else:
             try:
@@ -143,22 +166,40 @@ class Mailbox:
         self.close()
 
     def get(self, message_id: str) -> MailboxMessage | None:
+        self._ensure_open()
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id must be a non-empty string")
+        message_id = message_id.strip()
         row = self._conn.execute("SELECT id,sender,recipient,payload,status,attempts,lease_token FROM mailbox WHERE id=?", (message_id,)).fetchone()
-        return None if row is None else MailboxMessage(row[0], row[1], row[2], json.loads(row[3]), row[4], row[5], row[6])
+        if row is None:
+            return None
+        payload = _strict_json_loads(row[3], "mailbox payload")
+        if not isinstance(payload, Mapping):
+            raise ValueError("mailbox payload must be a JSON object")
+        return MailboxMessage(row[0], row[1], row[2], payload, row[4], row[5], row[6])
 
     def send(self, *, sender: str, recipient: str, payload: Mapping[str, Any], message_id: str | None = None) -> MailboxMessage:
-        if not isinstance(sender, str) or not sender:
+        self._ensure_open()
+        if not isinstance(sender, str) or not sender.strip():
             raise ValueError("sender must be a non-empty string")
-        if not isinstance(recipient, str) or not recipient:
+        if not isinstance(recipient, str) or not recipient.strip():
             raise ValueError("recipient must be a non-empty string")
+        sender = sender.strip()
+        recipient = recipient.strip()
         if not isinstance(payload, Mapping):
             raise TypeError("mailbox payload must be a mapping")
         if message_id is not None and (
-            not isinstance(message_id, str) or not message_id
+            not isinstance(message_id, str) or not message_id.strip()
         ):
             raise ValueError("message_id must be a non-empty string or None")
-        mid = message_id or f"msg_{uuid.uuid4().hex}"
-        encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
+        mid = message_id.strip() if isinstance(message_id, str) else f"msg_{uuid.uuid4().hex}"
+        normalized_payload = _strict_json_copy(dict(payload), "mailbox payload")
+        if not isinstance(normalized_payload, Mapping):
+            raise ValueError("mailbox payload must be a JSON object")
+        encoded = json.dumps(
+            normalized_payload, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
         try:
             with immediate_transaction(self._conn):
                 self._conn.execute("INSERT INTO mailbox(id,sender,recipient,payload,status,created_at) VALUES(?,?,?,?,'pending',?)", (mid, sender, recipient, encoded, time.time()))
@@ -169,13 +210,13 @@ class Mailbox:
                         "message_id": mid,
                         "sender": sender,
                         "recipient": recipient,
-                        "payload": dict(payload),
+                        "payload": normalized_payload,
                     },
                 )
         except sqlite3.IntegrityError:
             existing = self.get(mid)
             assert existing is not None
-            if (existing.sender, existing.recipient, dict(existing.payload)) != (sender, recipient, dict(payload)):
+            if (existing.sender, existing.recipient, dict(existing.payload)) != (sender, recipient, dict(normalized_payload)):
                 raise ValueError(
                     "message id was reused for a different handoff",
                 ) from None
@@ -185,12 +226,13 @@ class Mailbox:
         return self.get(mid)  # type: ignore[return-value]
 
     def recover_expired(self, *, now: float | None = None) -> int:
+        self._ensure_open()
         if now is None:
             now = time.time()
         elif (
             isinstance(now, bool)
             or not isinstance(now, (int, float))
-            or not math.isfinite(float(now))
+            or _finite_float(now) is None
         ):
             raise ValueError("now must be a finite number")
         else:
@@ -231,18 +273,26 @@ class Mailbox:
         lease_seconds: float = 60.0,
         message_id: str | None = None,
     ) -> tuple[MailboxMessage, ...]:
-        if not isinstance(recipient, str) or not recipient:
+        self._ensure_open()
+        if not isinstance(recipient, str) or not recipient.strip():
             raise ValueError("recipient must be a non-empty string")
+        recipient = recipient.strip()
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive int")
         if (
             isinstance(lease_seconds, bool)
             or not isinstance(lease_seconds, (int, float))
-            or not math.isfinite(float(lease_seconds))
+            or _finite_float(lease_seconds) is None
             or lease_seconds <= 0
         ):
             raise ValueError("lease_seconds must be a finite positive number")
         lease_seconds = float(lease_seconds)
+        if message_id is not None and (
+            not isinstance(message_id, str) or not message_id.strip()
+        ):
+            raise ValueError("message_id must be a non-empty string or None")
+        if isinstance(message_id, str):
+            message_id = message_id.strip()
         self.recover_expired()
         if message_id is None:
             rows = self._conn.execute(
@@ -280,6 +330,13 @@ class Mailbox:
         return tuple(claimed)
 
     def acknowledge(self, message_id: str, *, lease_token: str) -> None:
+        self._ensure_open()
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id must be a non-empty string")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise ValueError("lease_token must be a non-empty string")
+        message_id = message_id.strip()
+        lease_token = lease_token.strip()
         now = time.time()
         with immediate_transaction(self._conn):
             cur = self._conn.execute(
@@ -299,6 +356,13 @@ class Mailbox:
         self._repair_audit_batch()
 
     def release(self, message_id: str, *, lease_token: str) -> None:
+        self._ensure_open()
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id must be a non-empty string")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise ValueError("lease_token must be a non-empty string")
+        message_id = message_id.strip()
+        lease_token = lease_token.strip()
         now = time.time()
         with immediate_transaction(self._conn):
             row = self._conn.execute(
@@ -323,6 +387,12 @@ class Mailbox:
             raise MailboxLeaseError("message is not owned by this lease")
         self._repair_audit_batch()
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            # Preserve sqlite3's established closed-connection contract used
+            # by the lower-level stores and existing callers.
+            raise sqlite3.ProgrammingError("Cannot operate on a closed Mailbox")
+
     @staticmethod
     def _audit_claim_id(identity: str) -> str:
         encoded = f"mailbox\0{identity}".encode("utf-8")
@@ -342,7 +412,9 @@ class Mailbox:
                 self._audit_claim_id(identity),
                 tag,
                 json.dumps(
-                    dict(fields), sort_keys=True, separators=(",", ":"),
+                    _strict_json_copy(dict(fields), "mailbox audit fields"),
+                    sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
                 ),
                 time.time(),
             ),
@@ -362,7 +434,7 @@ class Mailbox:
                     "message_id": mid,
                     "sender": sender,
                     "recipient": recipient,
-                    "payload": json.loads(payload_json),
+                    "payload": _strict_json_loads(payload_json, "mailbox payload"),
                 },
             )
             for attempt in range(1, attempts + 1):
@@ -401,6 +473,7 @@ class Mailbox:
 
     def repair_audit(self, *, limit: int | None = None) -> int:
         """Idempotently mirror durable mailbox events into the Claim tape."""
+        self._ensure_open()
         if self.rowset is None:
             return 0
         if (
@@ -444,7 +517,7 @@ class Mailbox:
         for rowid, claim_id, tag, fields_json in events:
             claim = Claim(
                 tag=tag,
-                fields=json.loads(fields_json),
+                fields=_strict_json_loads(fields_json, "mailbox audit fields"),
                 source="orchestration.mailbox",
                 claim_id=claim_id,
             )
@@ -467,6 +540,79 @@ class Mailbox:
         return repaired
 
 
+def _strict_json_copy(value: Any, name: str) -> Any:
+    """Detach mailbox data and reject coercive/non-finite JSON values."""
+    _validate_json_shape(value, name)
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return json.loads(encoded)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"{name} must be strict JSON") from exc
+
+
+def _strict_json_loads(value: str, name: str) -> Any:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be strict JSON")
+    try:
+        parsed = json.loads(
+            value,
+            parse_constant=lambda raw: (_ for _ in ()).throw(
+                ValueError(f"non-JSON numeric constant {raw!r}")
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{name} must be strict JSON") from exc
+    return _strict_json_copy(parsed, name)
+
+
+def _validate_json_shape(
+    value: Any,
+    path: str,
+    *,
+    _active: set[int] | None = None,
+) -> None:
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain finite numbers")
+        return
+    if not isinstance(value, (list, tuple, Mapping)):
+        raise TypeError(f"{path} contains unsupported {type(value).__name__}")
+    active = set() if _active is None else _active
+    marker = id(value)
+    if marker in active:
+        raise ValueError(f"{path} must not contain reference cycles")
+    active.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{path} must use string object keys")
+                _validate_json_shape(item, f"{path}.{key}", _active=active)
+        else:
+            for index, item in enumerate(value):
+                _validate_json_shape(item, f"{path}[{index}]", _active=active)
+    finally:
+        active.remove(marker)
+
+
+def _finite_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
 AgentHandler = Callable[[MailboxMessage], Awaitable[Any]]
 
 
@@ -475,7 +621,7 @@ class AgentOrchestrator:
         if (
             isinstance(lease_seconds, bool)
             or not isinstance(lease_seconds, (int, float))
-            or not math.isfinite(float(lease_seconds))
+            or _finite_float(lease_seconds) is None
             or lease_seconds <= 0
         ):
             raise ValueError("lease_seconds must be a finite positive number")

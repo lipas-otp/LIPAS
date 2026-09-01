@@ -75,6 +75,7 @@ __all__ = [
 
 
 EXECUTION_SCHEMA_VERSION = 1
+_MAX_SQLITE_INT = 2**63 - 1
 
 TAG_EXECUTION_TASK_CREATED = "execution_task_created"
 TAG_EXECUTION_TASK_COMPLETED = "execution_task_completed"
@@ -305,15 +306,82 @@ def _json(value: Any) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _json_result(value: Any) -> str:
+    """Encode a terminal run result while keeping the audit row JSON-valid.
+
+    Provider output is not always under our control.  A provider that returns
+    ``NaN``/``Infinity`` must not make the state transition itself fail after
+    the work has already happened: the run should become terminal and the
+    observability projection should report the malformed usage.  We therefore
+    lower non-finite floats in *results only* to an explicit marker object.
+    All other execution payloads continue to use :func:`_json` and fail closed
+    on non-standard JSON values.
+    """
+
+    encoded = encode(value, _CODECS)
+
+    def lower(item: Any) -> Any:
+        if isinstance(item, float) and not math.isfinite(item):
+            marker = (
+                "nan" if math.isnan(item)
+                else "-inf" if item < 0
+                else "inf"
+            )
+            return {"__lipas_nonfinite__": marker}
+        if isinstance(item, list):
+            return [lower(child) for child in item]
+        if isinstance(item, dict):
+            # ``json.dumps`` silently stringifies integer object keys.  A
+            # provider result is evidence, so preserve malformed mappings in
+            # an explicit entry representation instead of allowing two
+            # distinct Python values to collapse to one durable payload.
+            if any(not isinstance(key, str) for key in item):
+                return {
+                    "__lipas_mapping__": [
+                        {"key": lower(key), "value": lower(child)}
+                        for key, child in item.items()
+                    ],
+                }
+            return {key: lower(child) for key, child in item.items()}
+        return item
+
+    return json.dumps(
+        lower(encoded),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
 
 
 def _from_json(value: str) -> Any:
-    return decode(json.loads(value), _CODECS)
+    return decode(
+        json.loads(
+            value,
+            parse_constant=lambda raw: (_ for _ in ()).throw(
+                ValueError(f"non-JSON numeric constant {raw!r}")
+            ),
+        ),
+        _CODECS,
+    )
 
 
 def _mapping_json(value: Mapping[str, Any]) -> str:
     return _json(dict(value))
+
+
+def _finite_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None
 
 
 def _non_empty_text(value: Any, name: str) -> str:
@@ -329,40 +397,34 @@ def _budget_mapping(value: Any, name: str) -> dict[str, float]:
     for bucket, amount in value.items():
         if not isinstance(bucket, str) or not bucket.strip():
             raise ValueError(f"{name} bucket names must be non-empty strings")
-        if (
-            isinstance(amount, bool)
-            or not isinstance(amount, (int, float))
-            or not math.isfinite(float(amount))
-            or amount < 0
-        ):
+        normalized_bucket = bucket.strip()
+        if normalized_bucket in normalized:
+            raise ValueError(
+                f"{name} contains duplicate bucket names after normalization",
+            )
+        numeric_amount = _finite_float(amount)
+        if numeric_amount is None or numeric_amount < 0:
             raise ValueError(
                 f"{name} value for {bucket!r} must be finite and non-negative",
             )
-        normalized[bucket] = float(amount)
+        normalized[normalized_bucket] = numeric_amount
     return normalized
 
 
 def _positive_duration(value: float, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        or value <= 0
-    ):
+    numeric = _finite_float(value)
+    if numeric is None or numeric <= 0:
         raise ValueError(f"{name} must be a finite positive number")
-    return float(value)
+    return numeric
 
 
 def _timestamp(value: float | None) -> float:
     if value is None:
         return time.time()
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
+    numeric = _finite_float(value)
+    if numeric is None:
         raise ValueError("now must be a finite number")
-    return float(value)
+    return numeric
 
 
 class ExecutionStore:
@@ -683,7 +745,12 @@ class ExecutionStore:
             return 0
         if (
             limit is not None
-            and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1)
+            and (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or limit > _MAX_SQLITE_INT
+            )
         ):
             raise ValueError("limit must be a positive int or None")
         limit_sql = "" if limit is None else " LIMIT ?"
@@ -781,6 +848,10 @@ class ExecutionStore:
         """Persist one idempotent event and assign its per-run cursor."""
         if not isinstance(identity, str) or not identity.strip():
             raise ValueError("AgentEvent identity must be a non-empty string")
+        run_id = _non_empty_text(run_id, "run_id")
+        identity = identity.strip()
+        if data is not None and not isinstance(data, Mapping):
+            raise TypeError("AgentEvent.data must be a mapping or None")
         # Validate the public shape before opening a write transaction.
         candidate = AgentEvent(
             type=event_type,
@@ -846,8 +917,13 @@ class ExecutionStore:
         """Return persisted events strictly after a per-run cursor."""
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after must be a non-negative int")
+        if after > _MAX_SQLITE_INT:
+            raise ValueError("after exceeds SQLite integer range")
         if limit is not None and (
-            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > _MAX_SQLITE_INT
         ):
             raise ValueError("limit must be a positive int or None")
         if self.get_run(run_id) is None:
@@ -1035,13 +1111,11 @@ class ExecutionStore:
         *,
         task_id: str | None = None,
     ) -> Task:
-        goal = goal.strip()
-        if not goal:
-            raise ValueError("task goal must be non-empty")
+        goal = _non_empty_text(goal, "task goal")
         root = Path(workspace).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"workspace is not a directory: {root}")
-        task_id = task_id or _id("task")
+        task_id = _id("task") if task_id is None else _non_empty_text(task_id, "task_id")
         now = time.time()
         try:
             with self._transaction():
@@ -1100,6 +1174,7 @@ class ExecutionStore:
     # -- runs and leases -----------------------------------------------
 
     def create_run(self, task_id: str, *, run_id: str | None = None) -> Run:
+        task_id = _non_empty_text(task_id, "task_id")
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
@@ -1107,10 +1182,20 @@ class ExecutionStore:
             raise ExecutionStateError(
                 f"task {task_id!r} is {task.state.value}, not open",
             )
-        run_id = run_id or _id("run")
+        run_id = _id("run") if run_id is None else _non_empty_text(run_id, "run_id")
         now = time.time()
         try:
             with self._transaction():
+                # Re-check under the writer transaction. A task can be
+                # cancelled between the fast-path read above and this insert;
+                # never create a pending Run for a task that is no longer open.
+                current_task = self.get_task(task_id)
+                if current_task is None:
+                    raise KeyError(task_id)
+                if current_task.state is not TaskState.OPEN:
+                    raise ExecutionStateError(
+                        f"task {task_id!r} is {current_task.state.value}, not open",
+                    )
                 self._conn.execute(
                     "INSERT INTO execution_runs"
                     "(id,task_id,state,created_at,updated_at) "
@@ -1273,12 +1358,15 @@ class ExecutionStore:
         now: float | None = None,
     ) -> Run:
         lease_seconds = _positive_duration(lease_seconds, "lease_seconds")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise ValueError("lease_token must be a non-empty string")
         now = _timestamp(now)
         with self._transaction():
             cursor = self._conn.execute(
                 "UPDATE execution_runs SET lease_expires=?,updated_at=? "
-                "WHERE id=? AND state='running' AND lease_token=?",
-                (now + lease_seconds, now, run_id, lease_token),
+                "WHERE id=? AND state='running' AND lease_token=? "
+                "AND lease_expires IS NOT NULL AND lease_expires>?",
+                (now + lease_seconds, now, run_id, lease_token, now),
             )
             if cursor.rowcount != 1:
                 self._raise_lease(run_id)
@@ -1340,10 +1428,17 @@ class ExecutionStore:
         state: Mapping[str, Any],
         now: float | None = None,
     ) -> Checkpoint:
-        if expected_version < 0:
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
             raise ValueError("expected_version must be non-negative")
-        if not phase:
+        if not isinstance(phase, str) or not phase.strip():
             raise ValueError("checkpoint phase must be non-empty")
+        phase = phase.strip()
+        if not isinstance(state, Mapping):
+            raise TypeError("checkpoint state must be a mapping")
         state_json = _mapping_json(state)
         now = _timestamp(now)
         with self._transaction():
@@ -1383,6 +1478,13 @@ class ExecutionStore:
         *,
         version: int | None = None,
     ) -> Checkpoint | None:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        run_id = run_id.strip()
+        if version is not None and (
+            isinstance(version, bool) or not isinstance(version, int) or version < 1
+        ):
+            raise ValueError("version must be a positive int or None")
         if version is None:
             row = self._conn.execute(
                 "SELECT run_id,version,phase,state_json,created_at "
@@ -1414,13 +1516,28 @@ class ExecutionStore:
         now: float | None = None,
     ) -> Interrupt:
         """Atomically checkpoint a run and suspend it for external input."""
-        if not kind:
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            raise ValueError("expected_version must be non-negative")
+        if not isinstance(kind, str) or not kind.strip():
             raise ValueError("interrupt kind must be non-empty")
-        if not phase:
+        if not isinstance(phase, str) or not phase.strip():
             raise ValueError("checkpoint phase must be non-empty")
+        kind = kind.strip()
+        phase = phase.strip()
+        if not isinstance(checkpoint_state, Mapping):
+            raise TypeError("checkpoint_state must be a mapping")
+        if not isinstance(request, Mapping):
+            raise TypeError("interrupt request must be a mapping")
         state_json = _mapping_json(checkpoint_state)
         request_json = _mapping_json(request)
-        interrupt_id = interrupt_id or _id("interrupt")
+        if interrupt_id is not None:
+            interrupt_id = _non_empty_text(interrupt_id, "interrupt_id")
+        else:
+            interrupt_id = _id("interrupt")
         now = _timestamp(now)
         try:
             with self._transaction():
@@ -1479,6 +1596,7 @@ class ExecutionStore:
         return interrupt
 
     def get_interrupt(self, interrupt_id: str) -> Interrupt | None:
+        interrupt_id = _non_empty_text(interrupt_id, "interrupt_id")
         row = self._conn.execute(
             "SELECT id,run_id,kind,request_json,state,response_json,"
             "created_at,resolved_at FROM execution_interrupts WHERE id=?",
@@ -1539,6 +1657,8 @@ class ExecutionStore:
         response: Any = None,
         now: float | None = None,
     ) -> Interrupt:
+        if not isinstance(allow, bool):
+            raise TypeError("allow must be bool")
         response_json = _json(response)
         target = InterruptState.ALLOWED if allow else InterruptState.DENIED
         run_state = RunState.PENDING if allow else RunState.CANCELLED
@@ -1619,7 +1739,7 @@ class ExecutionStore:
         result: Any,
         now: float | None = None,
     ) -> Run:
-        result_json = _json(result)
+        result_json = _json_result(result)
         now = _timestamp(now)
         with self._transaction():
             run = self._require_lease(run_id, lease_token, now=now)

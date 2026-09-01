@@ -1,7 +1,6 @@
 """Experimental dependency-light LangGraph node and tool adapters."""
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
@@ -46,14 +45,15 @@ class LangGraphActionNode:
         tool_name = action.get("tool_name")
         arguments = action.get("arguments", {})
         request_id = action.get("request_id")
-        if not isinstance(tool_name, str) or not tool_name:
+        if not isinstance(tool_name, str) or not tool_name.strip():
             raise ValueError("LangGraph action requires tool_name")
         if not isinstance(arguments, Mapping):
             raise TypeError("LangGraph action arguments must be a mapping")
-        if not isinstance(request_id, str) or not request_id:
+        if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError(
                 "LangGraph action requires a stable request_id for safe replay",
             )
+        request_id = request_id.strip()
         result = await self.gateway.call(
             tool_name,
             arguments,
@@ -91,16 +91,17 @@ class LangGraphToolAdapter:
         config: Mapping[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, Any]:
+        if not isinstance(input, Mapping):
+            raise TypeError("LangGraph tool input must be a mapping")
+        if config is not None and not isinstance(config, Mapping):
+            raise TypeError("LangGraph config must be a mapping or None")
         arguments: MutableMapping[str, Any] = dict(input)
-        request_id = arguments.pop("_lipas_request_id", None)
-        if request_id is None and config is not None:
-            request_id = config.get("run_id")
-        if request_id is None:
-            request_id = f"langgraph_{uuid.uuid4().hex}"
+        supplied_request_id = arguments.pop("_lipas_request_id", None)
+        request_id = _resolve_request_id(supplied_request_id, config)
         result = await self.gateway.call(
             self.tool_name,
             arguments,
-            request_id=str(request_id),
+            request_id=request_id,
             approved=self.approved,
             timeout_s=self.timeout_s,
             caused_by=_thread_id(config),
@@ -113,17 +114,19 @@ class LangGraphToolAdapter:
         config: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        if not isinstance(input, Mapping):
+            raise TypeError("LangGraph tool input must be a mapping")
+        if config is not None and not isinstance(config, Mapping):
+            raise TypeError("LangGraph config must be a mapping or None")
+        supplied_request_id = input.get("_lipas_request_id")
+        request_id = _resolve_request_id(supplied_request_id, config)
         return self.gateway.call_sync(
             self.tool_name,
             {
                 key: value for key, value in input.items()
                 if key != "_lipas_request_id"
             },
-            request_id=str(
-                input.get("_lipas_request_id")
-                or (config or {}).get("run_id")
-                or f"langgraph_{uuid.uuid4().hex}"
-            ),
+            request_id=request_id,
             approved=self.approved,
             timeout_s=self.timeout_s,
             caused_by=_thread_id(config),
@@ -172,28 +175,28 @@ class LangGraphHandoffNode:
     ) -> dict[str, Any]:
         if not isinstance(state, Mapping):
             raise TypeError("LangGraph state must be a mapping")
+        if config is not None and not isinstance(config, Mapping):
+            raise TypeError("LangGraph config must be a mapping or None")
         config = config or {}
         configurable = config.get("configurable")
         if not isinstance(configurable, Mapping):
             configurable = {}
-        coordination_id = (
-            state.get(self.coordination_id_key)
-            or configurable.get("thread_id")
-            or configurable.get("run_id")
+        coordination_id = _resolve_first_id(
+            (
+                state.get(self.coordination_id_key),
+                configurable.get("thread_id"),
+                configurable.get("run_id"),
+            ),
+            "coordination_id/thread_id",
         )
-        handoff_id = (
-            state.get("_lipas_handoff_id")
-            or configurable.get("checkpoint_id")
-            or configurable.get("run_id")
+        handoff_id = _resolve_first_id(
+            (
+                state.get("_lipas_handoff_id"),
+                configurable.get("checkpoint_id"),
+                configurable.get("run_id"),
+            ),
+            "checkpoint_id or handoff id",
         )
-        if not isinstance(coordination_id, str) or not coordination_id.strip():
-            raise ValueError(
-                "LangGraph handoff requires a stable coordination_id/thread_id",
-            )
-        if not isinstance(handoff_id, str) or not handoff_id.strip():
-            raise ValueError(
-                "LangGraph handoff requires a stable checkpoint_id or handoff id",
-            )
         envelope = HandoffEnvelope.create(
             coordination_id=coordination_id,
             sender=self.sender,
@@ -224,3 +227,36 @@ def _thread_id(config: Mapping[str, Any] | None) -> str | None:
             return str(value)
     value = config.get("run_id")
     return str(value) if value is not None else None
+
+
+def _resolve_request_id(
+    supplied: Any,
+    config: Mapping[str, Any] | None,
+) -> str:
+    """Choose one stable adapter identity without silently replacing blanks."""
+    if supplied is not None:
+        if not isinstance(supplied, str) or not supplied.strip():
+            raise ValueError("LangGraph request id must be a non-empty string")
+        return supplied.strip()
+    configured = config.get("run_id") if isinstance(config, Mapping) else None
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise ValueError("LangGraph config run_id must be a non-empty string")
+        return configured.strip()
+    # Never invent an identity at an orchestration boundary. A random value
+    # would make a graph retry look like a new external effect and defeat the
+    # durable gateway's replay contract.
+    raise ValueError(
+        "LangGraph tool calls require _lipas_request_id or config run_id "
+        "for safe replay",
+    )
+
+
+def _resolve_first_id(values: tuple[Any, ...], label: str) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"LangGraph handoff requires a non-empty {label}")
+        return value.strip()
+    raise ValueError(f"LangGraph handoff requires a stable {label}")

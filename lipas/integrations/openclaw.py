@@ -22,17 +22,24 @@ class OpenClawActionBackend:
     trust_caller_approval: bool = False
 
     async def execute(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise TypeError("OpenClaw action payload must be a mapping")
         tool_name = payload.get("tool_name")
         arguments = payload.get("arguments", {})
         request_id = payload.get("request_id")
-        if not isinstance(tool_name, str) or not tool_name:
+        if not isinstance(tool_name, str) or not tool_name.strip():
             raise ValueError("OpenClaw action requires tool_name")
         if not isinstance(arguments, Mapping):
             raise TypeError("OpenClaw action arguments must be a mapping")
-        if not isinstance(request_id, str) or not request_id:
+        if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError(
                 "OpenClaw action requires a stable request_id for redelivery",
             )
+        task_id = payload.get("task_id")
+        if task_id is not None and (
+            not isinstance(task_id, str) or not task_id.strip()
+        ):
+            raise ValueError("OpenClaw task_id must be a non-empty string or None")
         approved = (
             self.trust_caller_approval
             and payload.get("approved") is True
@@ -42,7 +49,7 @@ class OpenClawActionBackend:
             arguments,
             request_id=request_id,
             approved=approved,
-            caused_by=str(payload.get("task_id") or request_id),
+            caused_by=task_id if task_id is not None else request_id,
         )
         return {
             **result.as_dict(),

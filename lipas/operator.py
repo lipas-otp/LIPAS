@@ -15,15 +15,32 @@ need a background server should open a dedicated store in that thread.
 from __future__ import annotations
 
 import hmac
+import base64
+import binascii
+import hashlib
 import json
+import math
+import secrets
+import ipaddress
+import socket
+import ssl
+import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ._version import __version__
 from .coordination import AgentCoordinator, CoordinationEventPage
+from .conversation_store import (
+    Conversation,
+    ConversationEventPage,
+    Message,
+    SessionConflictError,
+    SQLiteSessionStore,
+)
 from .execution import (
     ExecutionStateError,
     ExecutionStore,
@@ -31,17 +48,187 @@ from .execution import (
     Run,
     Task,
 )
+from .security import TLSConfig
+from .performance import measure_execution, project_cost_ledger, project_incidents
+from .deployment import release_check
 
 if TYPE_CHECKING:
     from .workbench import Workbench
 
-__all__ = ["LocalWebOperator", "OperatorServer"]
+__all__ = ["LocalWebOperator", "OperatorServer", "OperatorAuthenticator"]
+
+
+class OperatorAuthenticator:
+    """Stateless HMAC bearer tokens with explicit subject and expiry."""
+
+    def __init__(self, secret: bytes | str, *, issuer: str = "lipas", ttl_s: float = 3600.0) -> None:
+        if isinstance(secret, str):
+            secret = secret.encode("utf-8")
+        if not isinstance(secret, bytes) or len(secret) < 16:
+            raise ValueError("operator auth secret must contain at least 16 bytes")
+        if not isinstance(issuer, str) or not issuer.strip():
+            raise ValueError("issuer must be non-empty")
+        try:
+            valid_ttl = (
+                not isinstance(ttl_s, bool)
+                and isinstance(ttl_s, (int, float))
+                and math.isfinite(float(ttl_s))
+                and ttl_s >= 1
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_ttl = False
+        if not valid_ttl:
+            raise ValueError("ttl_s must be finite and at least one second")
+        self._secret = secret
+        self.issuer = issuer.strip()
+        self.ttl_s = float(ttl_s)
+
+    def issue(self, subject: str, *, ttl_s: float | None = None, now: int | None = None) -> str:
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError("subject must be non-empty")
+        if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
+            raise TypeError("now must be an int or None")
+        issued = int(time.time() if now is None else now)
+        if ttl_s is not None and isinstance(ttl_s, bool):
+            raise TypeError("ttl_s must be a finite number")
+        try:
+            ttl = self.ttl_s if ttl_s is None else float(ttl_s)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("ttl_s must be finite and at least one second") from exc
+        if not math.isfinite(ttl) or ttl < 1:
+            raise ValueError("ttl_s must be finite and at least one second")
+        payload = {"iss": self.issuer, "sub": subject.strip(), "iat": issued, "exp": issued + int(ttl), "jti": secrets.token_urlsafe(12)}
+        encoded = _b64json(payload)
+        signature = _b64(hmac.new(self._secret, encoded.encode(), hashlib.sha256).digest())
+        return f"{encoded}.{signature}"
+
+    def verify(self, token: str, *, now: int | None = None) -> str | None:
+        if not isinstance(token, str) or token.count(".") != 1:
+            return None
+        encoded, signature = token.split(".", 1)
+        expected = _b64(hmac.new(self._secret, encoded.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            payload = json.loads(
+                _unb64(encoded).decode("utf-8"),
+                parse_constant=lambda raw: (_ for _ in ()).throw(
+                    ValueError(f"non-JSON numeric constant {raw!r}")
+                ),
+            )
+        except (ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+            return None
+        if now is not None and (isinstance(now, bool) or not isinstance(now, int)):
+            return None
+        current = int(time.time() if now is None else now)
+        if not isinstance(payload, Mapping) or payload.get("iss") != self.issuer:
+            return None
+        if not isinstance(payload.get("sub"), str) or not payload["sub"]:
+            return None
+        issued = payload.get("iat")
+        expires = payload.get("exp")
+        if (
+            not isinstance(issued, int)
+            or isinstance(issued, bool)
+            or not isinstance(expires, int)
+            or isinstance(expires, bool)
+            or expires <= issued
+            or current < issued - 30
+            or current >= expires
+        ):
+            return None
+        return payload["sub"]
+
+
+def _b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _unb64(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _b64json(value: Mapping[str, Any]) -> str:
+    return _b64(
+        json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
+
+
+def _operator_host_is_non_loopback(host: str) -> bool:
+    """Return whether a bind host can expose the operator beyond this host."""
+    normalized = host.strip().lower().strip("[]")
+    if normalized in {"localhost", "ip6-localhost"}:
+        return False
+    try:
+        return not ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        # DNS names cannot be proven loopback without a network lookup.  A
+        # production bind therefore treats them as externally reachable.
+        return True
+
+
+def _tls_context(
+    value: TLSConfig | ssl.SSLContext | None,
+    *,
+    server: bool,
+) -> ssl.SSLContext | None:
+    if value is None:
+        return None
+    if isinstance(value, TLSConfig):
+        return value.server_context() if server else value.client_context()
+    if not isinstance(value, ssl.SSLContext):
+        raise TypeError("tls must be TLSConfig, ssl.SSLContext, or None")
+    return value
 
 
 class OperatorServer(HTTPServer):
     """Typed HTTP server carrying its owning :class:`LocalWebOperator`."""
 
     operator: "LocalWebOperator"
+    tls_enabled: bool = False
+    tls_context: ssl.SSLContext | None = None
+    _tls_lock: Any = None
+
+    def get_request(self) -> tuple[socket.socket, Any]:  # noqa: D401 - stdlib hook
+        """Accept one connection using the context current at accept time."""
+        request, client_address = super().get_request()
+        lock = getattr(self, "_tls_lock", None)
+        if lock is None:
+            context = self.tls_context
+        else:
+            with lock:
+                context = self.tls_context
+        if context is None:
+            return request, client_address
+        try:
+            return context.wrap_socket(request, server_side=True), client_address
+        except BaseException:
+            request.close()
+            raise
+
+    def reload_tls(self, tls: TLSConfig | ssl.SSLContext) -> None:
+        """Atomically switch certificates for future connections.
+
+        Existing connections keep their negotiated session; newly accepted
+        sockets use the new context.  The listening socket is never replaced,
+        so the bound port and in-flight requests remain stable.
+        """
+        context = _tls_context(tls, server=True)
+        if context is None:  # defensive; the public type excludes None
+            raise ValueError("tls material is required for reload")
+        lock = getattr(self, "_tls_lock", None)
+        if lock is None:
+            self.tls_context = context
+            self.tls_enabled = True
+        else:
+            with lock:
+                self.tls_context = context
+                self.tls_enabled = True
 
 
 class _OperatorHandler(BaseHTTPRequestHandler):
@@ -68,6 +255,34 @@ class _OperatorHandler(BaseHTTPRequestHandler):
                 if path in {(), ("ui",), ("index.html",)}:
                     self._send_html(200, operator.render_ui())
                     return
+                if path and path[-1] == "stream":
+                    access_token = _query_one(query, "access_token")
+                    authorized = operator._authorized(self.headers.get("Authorization"))
+                    if access_token is not None:
+                        authorized = authorized or operator._authorized(
+                            "Bearer " + access_token,
+                        )
+                    if operator.require_authentication and not authorized:
+                        self._send(401, {"error": "operator authorization required"})
+                        return
+                    if "after" not in query:
+                        last_event = self.headers.get("Last-Event-ID")
+                        if last_event:
+                            query = {**query, "after": [last_event]}
+                    self._send_sse(operator._sse(path, query))
+                    return
+                # Health probes remain public when authentication is enabled;
+                # all data projections still require an operator credential.
+                public_health = path in {
+                    ("health",), ("api", "health"), ("ready",), ("api", "ready"),
+                }
+                if (
+                    operator.require_authentication
+                    and not public_health
+                    and not operator._authorized(self.headers.get("Authorization"))
+                ):
+                    self._send(401, {"error": "operator authorization required"})
+                    return
                 payload = operator._get(path, query)
                 self._send(200, payload)
                 return
@@ -93,6 +308,8 @@ class _OperatorHandler(BaseHTTPRequestHandler):
             # operator-server failure.  Keeping this distinction makes a UI
             # refresh and retry safe without treating the database as broken.
             self._send(409, {"error": "state conflict", "detail": str(exc)})
+        except SessionConflictError as exc:
+            self._send(409, {"error": "state conflict", "detail": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive HTTP boundary
             self._send(500, {"error": "operator failure", "detail": type(exc).__name__})
 
@@ -109,8 +326,16 @@ class _OperatorHandler(BaseHTTPRequestHandler):
             raise ValueError("request body exceeds operator limit")
         raw = self.rfile.read(length)
         try:
-            value = json.loads(raw.decode("utf-8")) if raw else {}
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = (
+                json.loads(
+                    raw.decode("utf-8"),
+                    parse_constant=lambda raw: (_ for _ in ()).throw(
+                        ValueError(f"non-JSON numeric constant {raw!r}")
+                    ),
+                )
+                if raw else {}
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError("request body must be UTF-8 JSON") from exc
         if not isinstance(value, Mapping):
             raise ValueError("request body must be a JSON object")
@@ -128,6 +353,8 @@ class _OperatorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        if self.server.tls_enabled:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -137,8 +364,29 @@ class _OperatorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        if self.server.tls_enabled:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _send_sse(self, events: tuple[tuple[str, str, str], ...]) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        if self.server.tls_enabled:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        # This endpoint emits one bounded catch-up batch.  Closing the
+        # response lets EventSource reconnect and resume from Last-Event-ID
+        # without retaining a server-side socket indefinitely.
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not events:
+            self.wfile.write(b": heartbeat\n\n")
+            self.wfile.flush()
+            return
+        for event_id, event_type, data in events:
+            self.wfile.write(f"id: {event_id}\nevent: {event_type}\ndata: {data}\n\n".encode("utf-8"))
+        self.wfile.flush()
 
 
 class LocalWebOperator:
@@ -155,8 +403,14 @@ class LocalWebOperator:
         *,
         workbench: "Workbench | None" = None,
         operations: Any | None = None,
+        sessions: SQLiteSessionStore | None = None,
+        conversation_workspace: str | Path | None = None,
+        conversation_event_reader: Any | None = None,
+        promote_message: Any | None = None,
         coordinator: AgentCoordinator | None = None,
         operator_token: str | None = None,
+        authenticator: OperatorAuthenticator | None = None,
+        require_authentication: bool = False,
         max_body_bytes: int = 64 * 1024,
         max_items: int = 1_000,
     ) -> None:
@@ -167,9 +421,13 @@ class LocalWebOperator:
         if coordinator is not None and coordinator.execution is not execution:
             raise ValueError("coordinator must borrow the supplied execution store")
         if operator_token is not None and (
-            not isinstance(operator_token, str) or not operator_token
+            not isinstance(operator_token, str) or not operator_token.strip()
         ):
             raise ValueError("operator_token must be a non-empty string or None")
+        if authenticator is not None and not isinstance(authenticator, OperatorAuthenticator):
+            raise TypeError("authenticator must be OperatorAuthenticator or None")
+        if not isinstance(require_authentication, bool):
+            raise TypeError("require_authentication must be bool")
         if (
             isinstance(max_body_bytes, bool)
             or not isinstance(max_body_bytes, int)
@@ -186,8 +444,14 @@ class LocalWebOperator:
         self.execution = execution
         self.workbench = workbench
         self.operations = operations
+        self.sessions = sessions
+        self.conversation_workspace = conversation_workspace
+        self.conversation_event_reader = conversation_event_reader
+        self.promote_message = promote_message
         self.coordinator = coordinator
-        self.operator_token = operator_token
+        self.operator_token = operator_token.strip() if operator_token is not None else None
+        self.authenticator = authenticator
+        self.require_authentication = require_authentication
         self.max_body_bytes = max_body_bytes
         self.max_items = max_items
         self._server: OperatorServer | None = None
@@ -204,10 +468,10 @@ class LocalWebOperator:
     def render_ui(self) -> str:
         """Return a dependency-free browser projection for local operation.
 
-        The page polls the reconnectable JSON routes and never stores a
-        second execution state. Mutations remain explicit API calls protected
-        by the bearer-token boundary; the token field is only kept in the
-        browser tab's session storage.
+        The page uses cursor-based SSE when available and bounded polling as a
+        fallback; it never stores a second execution state. Mutations remain
+        explicit API calls protected by the bearer-token boundary; the token
+        field is only kept in the browser tab's session storage.
         """
         return """<!doctype html>
 <html lang="en"><meta charset="utf-8">
@@ -215,21 +479,41 @@ class LocalWebOperator:
 <title>LIPAS Local Operator</title>
 <style>body{font:15px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#f7f7f8;color:#202124}pre{white-space:pre-wrap;background:#fff;border:1px solid #ddd;padding:1rem;border-radius:8px}button{padding:.4rem .7rem;margin:.2rem}small{color:#666}</style>
 <h1>LIPAS Local Operator</h1>
-<p><small>Projection only. State and recovery remain owned by ExecutionStore.</small></p>
+<p><small>Conversation is the front door; Task/Run/Effect remain the execution authority.</small></p>
 <label>Operator token <input id="token" type="password" autocomplete="off"></label>
 <button onclick="refresh()">Refresh</button>
+<section><h2>Conversation</h2><select id="conversation"></select><input id="title" placeholder="New conversation title"><button onclick="newConversation()">New</button><br><textarea id="composer" rows="3" cols="70" placeholder="Ask or describe work…"></textarea><br><button onclick="sendMessage()">Send message</button><button onclick="promoteMessage()">Promote last message to Task</button><br><input id="attachment" type="file"><button onclick="uploadAttachment()">Upload attachment</button><div id="messages"></div></section>
 <div id="controls"></div>
 <pre id="view">Loading…</pre>
 <script>
-const view=document.getElementById('view'), controls=document.getElementById('controls'), token=document.getElementById('token');
+const view=document.getElementById('view'), controls=document.getElementById('controls'), token=document.getElementById('token'), conversation=document.getElementById('conversation'), messages=document.getElementById('messages');
 token.value=sessionStorage.getItem('lipas.operator.token')||'';
 token.onchange=()=>sessionStorage.setItem('lipas.operator.token',token.value);
-async function mutate(path,body={}){const r=await fetch(path,{method:'POST',headers:{'Authorization':'Bearer '+token.value,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok) alert((await r.json()).detail||r.status);await refresh()}
+async function mutate(path,body={}){const r=await fetch(path,{method:'POST',headers:{'Authorization':'Bearer '+token.value,'Content-Type':'application/json'},body:JSON.stringify(body)});let d={};try{d=await r.json()}catch(_){}if(!r.ok){alert(d.detail||d.error||r.status);return false}await refresh();return true}
+function currentConversation(){return conversation.value}
+async function newConversation(){const title=document.getElementById('title').value||'New conversation';await mutate('/api/conversations',{title:title})}
+async function sendMessage(){const text=document.getElementById('composer').value.trim();if(!text||!currentConversation())return;await mutate('/api/conversations/'+encodeURIComponent(currentConversation())+'/messages',{role:'user',content:text});document.getElementById('composer').value=''}
+async function promoteMessage(){if(!currentConversation())return;const r=await fetch('/api/conversations/'+encodeURIComponent(currentConversation()),{cache:'no-store'}),d=await r.json(),m=(d.messages||[]).filter(x=>x.role==='user').pop();if(m)await mutate('/api/conversations/'+encodeURIComponent(currentConversation())+'/messages/'+encodeURIComponent(m.id)+'/promote',{})}
+async function uploadAttachment(){const input=document.getElementById('attachment'),file=input.files[0];if(!file||!currentConversation())return;if(file.size>44*1024){alert('Attachment exceeds the local operator body limit');return}const bytes=new Uint8Array(await file.arrayBuffer());let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);await mutate('/api/conversations/'+encodeURIComponent(currentConversation())+'/attachments',{filename:file.name,mime_type:file.type||'application/octet-stream',content_base64:btoa(binary)});input.value=''}
 function button(label,path,body={}){const b=document.createElement('button');b.textContent=label;b.onclick=()=>mutate(path,body);return b}
 function operationButton(label,op,found){const b=document.createElement('button');b.textContent=label;b.onclick=()=>{const observation=prompt('How was the provider outcome checked?');if(!observation)return;const body={found:found,observation:observation};if(found){const reference=prompt('Provider reference');if(!reference)return;body.provider_reference=reference;body.result={operator:'browser'}}mutate('/api/operations/'+encodeURIComponent(op.key)+'/reconcile',body)};return b}
-function controlsFor(data){controls.replaceChildren();for(const t of (data.tasks||[])){if(t.state==='open')controls.append(button('Cancel task '+t.id.slice(0,8),'/api/tasks/'+encodeURIComponent(t.id)+'/cancel'))}for(const r of (data.runs||[])){if(['pending','running','waiting'].includes(r.state))controls.append(button('Cancel run '+r.id.slice(0,8),'/api/runs/'+encodeURIComponent(r.id)+'/cancel'));if(r.recovery_required)controls.append(button('Reopen uncertain '+r.id.slice(0,8),'/api/runs/'+encodeURIComponent(r.id)+'/reopen',{acknowledge_uncertain:true,reconciled:true,evidence:{source:'operator_ui',observation:'Operator confirmed the external Effect/provider outcome and completed the required reconciliation.'}}))}for(const i of (data.pending_interrupts||[])){if(i.state==='pending'){controls.append(button('Approve '+i.id.slice(0,8),'/api/interrupts/'+encodeURIComponent(i.id)+'/approve'));controls.append(button('Deny '+i.id.slice(0,8),'/api/interrupts/'+encodeURIComponent(i.id)+'/deny'))}}for(const op of (data.operations||[])){if(op.state==='uncertain'){controls.append(operationButton('Reconcile delivered '+op.key.slice(0,12),op,true));controls.append(operationButton('Reconcile absent '+op.key.slice(0,12),op,false))}}}
-async function refresh(){try{const r=await fetch('/api/snapshot',{cache:'no-store'}),data=await r.json();controlsFor(data);view.textContent=JSON.stringify(data,null,2)}catch(e){view.textContent=String(e)}}
-refresh(); setInterval(refresh,2000);
+function controlsFor(data){controls.replaceChildren();for(const t of (data.tasks||[])){if(t.state==='open')controls.append(button('Cancel task '+t.id.slice(0,8),'/api/tasks/'+encodeURIComponent(t.id)+'/cancel'))}for(const r of (data.runs||[])){if(['pending','running','waiting'].includes(r.state))controls.append(button('Cancel run '+r.id.slice(0,8),'/api/runs/'+encodeURIComponent(r.id)+'/cancel'));if(r.recovery_required)controls.append(button('Reopen uncertain '+r.id.slice(0,8),'/api/runs/'+encodeURIComponent(r.id)+'/reopen',{acknowledge_uncertain:true,reconciled:true,evidence:{source:'operator_ui',observation:'Operator confirmed the external Effect/provider outcome and completed the required reconciliation.'}}))}for(const i of (data.pending_interrupts||[])){if(i.state!=='pending')continue;if(i.kind==='approval'){controls.append(button('Approve '+i.id.slice(0,8),'/api/interrupts/'+encodeURIComponent(i.id)+'/approve'));controls.append(button('Deny '+i.id.slice(0,8),'/api/interrupts/'+encodeURIComponent(i.id)+'/deny'))}else{const b=button('Answer input '+i.id.slice(0,8),'#');b.onclick=()=>{const response=prompt('Provide the missing input');if(response!==null&&response.trim())mutate('/api/interrupts/'+encodeURIComponent(i.id)+'/resolve',{allow:true,response:response})};controls.append(b)}}for(const op of (data.operations||[])){if(op.state==='uncertain'){controls.append(operationButton('Reconcile delivered '+op.key.slice(0,12),op,true));controls.append(operationButton('Reconcile absent '+op.key.slice(0,12),op,false))}}}
+function renderConversations(data){const selected=currentConversation();conversation.replaceChildren();for(const c of (data.conversations||[])){const o=document.createElement('option');o.value=c.id;o.textContent=c.title+' ('+c.id.slice(0,8)+')';conversation.append(o)}if(selected&&[...conversation.options].some(o=>o.value===selected))conversation.value=selected;if(!conversation.value&&conversation.options.length)conversation.selectedIndex=0;renderMessages()}
+async function renderMessages(){if(!currentConversation()){messages.textContent='No conversation yet';return}try{const base='/api/conversations/'+encodeURIComponent(currentConversation()),r=await fetch(base,{cache:'no-store'}),d=await r.json(),er=await fetch(base+'/events?limit=100',{cache:'no-store'}),ed=await er.json();messages.replaceChildren();for(const m of (d.messages||[])){const p=document.createElement('p');p.textContent=String(m.role)+': '+String(m.content??'');messages.append(p)}for(const a of (d.attachments||[])){const p=document.createElement('p');p.textContent='attachment: '+String(a.filename)+' ('+String(a.size)+' bytes, '+String(a.sha256).slice(0,12)+'…)';messages.append(p)}for(const e of (ed.events||[])){if(e.kind==='message_created')continue;const card=document.createElement('pre');card.textContent='['+e.kind+'] '+JSON.stringify(e.payload);messages.append(card)}}catch(e){messages.textContent=String(e)}}
+conversation.onchange=renderMessages;
+let stream;
+function connectStream(){
+  if(!currentConversation()||typeof EventSource==='undefined')return;
+  if(stream)stream.close();
+  const suffix=token.value?'&access_token='+encodeURIComponent(token.value):'';
+  stream=new EventSource('/api/conversations/'+encodeURIComponent(currentConversation())+'/stream?limit=100'+suffix);
+  const streamEvent=()=>{renderMessages();refreshSnapshotOnly()};
+  ['message_created','task_promoted','agent_event','model_delta','event_appended'].forEach(k=>stream.addEventListener(k,streamEvent));
+  stream.onerror=()=>{stream.close();stream=null};
+}
+async function refreshSnapshotOnly(){try{const r=await fetch('/api/snapshot',{cache:'no-store'}),data=await r.json();renderConversations(data);controlsFor(data);view.textContent=JSON.stringify(data,null,2)}catch(e){view.textContent=String(e)}}
+async function refresh(){await refreshSnapshotOnly();connectStream()}
+refresh(); setInterval(()=>{if(!stream)refreshSnapshotOnly()},5000);
 </script>
 """
 
@@ -237,6 +521,8 @@ refresh(); setInterval(refresh,2000);
         self,
         host: str = "127.0.0.1",
         port: int = 0,
+        *,
+        tls: TLSConfig | ssl.SSLContext | None = None,
     ) -> OperatorServer:
         if not isinstance(host, str) or not host.strip():
             raise ValueError("host must be a non-empty string")
@@ -244,7 +530,17 @@ refresh(); setInterval(refresh,2000);
             raise ValueError("port must be an integer between 0 and 65535")
         if self._server is not None:
             raise RuntimeError("operator server is already active")
+        non_loopback = _operator_host_is_non_loopback(host)
+        if non_loopback and not self.require_authentication:
+            raise ValueError("non-loopback operator binds require authentication")
+        if non_loopback and tls is None:
+            raise ValueError("non-loopback operator binds require TLS")
+        context = _tls_context(tls, server=True)
         server = OperatorServer((host, port), _OperatorHandler)
+        server._tls_lock = threading.RLock()
+        if context is not None:
+            server.tls_context = context
+            server.tls_enabled = True
         server.operator = self
         self._server = server
         return server
@@ -255,8 +551,9 @@ refresh(); setInterval(refresh,2000);
         port: int = 0,
         *,
         poll_interval: float = 0.5,
+        tls: TLSConfig | ssl.SSLContext | None = None,
     ) -> None:
-        server = self.make_server(host, port)
+        server = self.make_server(host, port, tls=tls)
         try:
             server.serve_forever(poll_interval=poll_interval)
         finally:
@@ -286,20 +583,161 @@ refresh(); setInterval(refresh,2000);
         self.close()
 
     def _authorized(self, header: str | None) -> bool:
-        if self.operator_token is None or not isinstance(header, str):
+        if not isinstance(header, str):
             return False
         scheme, _, value = header.partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(
-            value, self.operator_token,
-        )
+        if scheme.lower() != "bearer" or not value:
+            return False
+        if self.authenticator is not None and self.authenticator.verify(value) is not None:
+            return True
+        return self.operator_token is not None and hmac.compare_digest(value, self.operator_token)
+
+    def _sse(self, path: tuple[str, ...], query: Mapping[str, list[str]]) -> tuple[tuple[str, str, str], ...]:
+        """Return one reconnectable SSE batch; clients use Last-Event-ID/after."""
+        after = _query_int(query, "after", default=0)
+        limit = _query_int(query, "limit", default=100)
+        if limit < 1 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        if len(path) == 4 and path[:2] == ("api", "conversations"):
+            page = self._conversation_events(path[2], after=after, limit=limit)
+            return tuple(
+                (
+                    str(item.sequence),
+                    item.kind,
+                    json.dumps(
+                        _conversation_event_json(item),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                )
+                for item in page.events
+            )
+        if len(path) == 4 and path[:2] == ("api", "runs"):
+            events = self.execution.agent_events(path[2], after=after, limit=limit)
+            return tuple(
+                (
+                    str(item.sequence),
+                    item.type,
+                    json.dumps(
+                        _event_json(item),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                )
+                for item in events
+            )
+        raise KeyError("/" + "/".join(path))
 
     def _get(self, path: tuple[str, ...], query: Mapping[str, list[str]]) -> dict[str, Any]:
+        if path == ("api", "conversations"):
+            sessions = self._conversation_store()
+            conversations = sessions.list_conversations(limit=self.max_items + 1)
+            return {
+                "conversations": [
+                    _conversation_json(value)
+                    for value in conversations[:self.max_items]
+                ],
+                "truncated": len(conversations) > self.max_items,
+            }
+        if len(path) == 3 and path[:2] == ("api", "conversations"):
+            sessions = self._conversation_store()
+            conversation = sessions.get_conversation(path[2])
+            if conversation is None:
+                raise KeyError(path[2])
+            messages = sessions.list_messages(path[2], limit=self.max_items + 1)
+            return {
+                "conversation": _conversation_json(conversation),
+                "messages": [
+                    _message_json(value) for value in messages[:self.max_items]
+                ],
+                "truncated": len(messages) > self.max_items,
+                "attachments": [
+                    _attachment_json(item)
+                    for item in sessions.list_attachments(path[2], limit=self.max_items)
+                ],
+            }
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "messages"
+        ):
+            sessions = self._conversation_store()
+            messages = sessions.list_messages(path[2], limit=self.max_items + 1)
+            return {
+                "conversation_id": path[2],
+                "messages": [
+                    _message_json(value) for value in messages[:self.max_items]
+                ],
+                "truncated": len(messages) > self.max_items,
+            }
+        if (
+            len(path) == 5
+            and path[:2] == ("api", "conversations")
+            and path[3] == "attachments"
+        ):
+            sessions = self._conversation_store()
+            attachment, content = sessions.read_attachment(path[4])
+            if attachment.conversation_id != path[2]:
+                raise KeyError(path[4])
+            if len(content) > self.max_body_bytes:
+                raise ValueError("attachment exceeds operator response limit")
+            return {
+                "attachment": _attachment_json(attachment),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "attachments"
+        ):
+            sessions = self._conversation_store()
+            return {
+                "conversation_id": path[2],
+                "attachments": [
+                    _attachment_json(item)
+                    for item in sessions.list_attachments(path[2], limit=self.max_items)
+                ],
+            }
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "events"
+        ):
+            after = _query_int(query, "after", default=0)
+            limit = _query_int(query, "limit", default=100)
+            if limit < 1 or limit > 1_000:
+                raise ValueError("limit must be between 1 and 1000")
+            page = self._conversation_events(path[2], after=after, limit=limit)
+            return _conversation_event_page_json(page)
         if path == ("health",) or path == ("api", "health"):
             return {
                 "ok": True,
                 "version": __version__,
                 "schema_version": self.execution.schema_version,
             }
+        if path == ("ready",) or path == ("api", "ready"):
+            if self.workbench is None:
+                return {
+                    "ready": self.execution.schema_version >= 1,
+                    "version": __version__,
+                    "schema_version": self.execution.schema_version,
+                }
+            return release_check(self.workbench.home).as_dict()
+        if path == ("api", "metrics"):
+            metrics, slo = measure_execution(self.execution)
+            return {"metrics": metrics.as_dict(), "slo": slo.as_dict()}
+        if path == ("api", "incidents"):
+            return {
+                "incidents": [
+                    item.as_dict() for item in project_incidents(self.execution)
+                ],
+            }
+        if path == ("api", "cost"):
+            return {"cost": project_cost_ledger(self.execution).as_dict()}
         if path in {("api", "snapshot"), ("api", "tasks")}:
             tasks = tuple(self.execution.list_tasks())
             if path == ("api", "tasks"):
@@ -315,6 +753,7 @@ refresh(); setInterval(refresh,2000);
             )
             return {
                 "version": __version__,
+                "conversations": self._conversations_json(),
                 "tasks": [_task_json(task) for task in tasks[:self.max_items]],
                 "runs": [_run_json(run) for run in runs[:self.max_items]],
                 "pending_interrupts": [
@@ -495,6 +934,104 @@ refresh(); setInterval(refresh,2000);
         raise KeyError("/" + "/".join(path))
 
     def _post(self, path: tuple[str, ...], body: Mapping[str, Any]) -> dict[str, Any]:
+        if path == ("api", "conversations"):
+            sessions = self._conversation_store()
+            conversation = sessions.create_conversation(
+                conversation_id=_optional_text(body.get("conversation_id")),
+                title=body.get("title", "New conversation"),
+                workspace=body.get("workspace", self.conversation_workspace or "."),
+                metadata=body.get("metadata"),
+            )
+            return {"conversation": _conversation_json(conversation)}
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "attachments"
+        ):
+            encoded = body.get("content_base64")
+            if not isinstance(encoded, str) or not encoded.strip():
+                raise ValueError("content_base64 is required")
+            try:
+                attachment_content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("content_base64 must be valid base64") from exc
+            attachment = self._conversation_store().save_attachment(
+                path[2], attachment_content,
+                attachment_id=_optional_text(body.get("attachment_id")),
+                filename=body.get("filename", "attachment.bin"),
+                mime_type=body.get("mime_type", "application/octet-stream"),
+                max_bytes=max(1, self.max_body_bytes),
+            )
+            return {"attachment": _attachment_json(attachment)}
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "messages"
+        ):
+            sessions = self._conversation_store()
+            role = body.get("role", "user")
+            content = body.get("content")
+            if content is None:
+                raise ValueError("content is required")
+            task_id = _optional_text(body.get("task_id"))
+            run_id = _optional_text(body.get("run_id"))
+            if (task_id is None) != (run_id is None):
+                raise ValueError("task_id and run_id must be provided together")
+            if task_id is not None:
+                assert run_id is not None
+                task = self.execution.get_task(task_id)
+                run = self.execution.get_run(run_id)
+                if task is None or run is None or run.task_id != task.id:
+                    raise KeyError("linked task/run does not exist")
+            message = sessions.append_message(
+                path[2], role=role, content=content,
+                message_id=_optional_text(body.get("message_id")),
+                kind=body.get("kind", "message"),
+                task_id=task_id,
+                run_id=run_id,
+                metadata=body.get("metadata"),
+            )
+            return {"message": _message_json(message)}
+        if (
+            len(path) == 4
+            and path[:2] == ("api", "conversations")
+            and path[3] == "events"
+        ):
+            sessions = self._conversation_store()
+            kind = body.get("kind")
+            payload = body.get("payload", {})
+            if not isinstance(kind, str) or not kind.strip():
+                raise ValueError("kind is required")
+            if not isinstance(payload, Mapping):
+                raise ValueError("payload must be an object")
+            event = sessions.append_event(
+                path[2], kind=kind,
+                event_id=_optional_text(body.get("event_id")),
+                message_id=_optional_text(body.get("message_id")),
+                task_id=_optional_text(body.get("task_id")),
+                run_id=_optional_text(body.get("run_id")),
+                payload=payload,
+            )
+            return _conversation_event_page_json(
+                ConversationEventPage((event,), event.sequence, False),
+            )
+        if (
+            len(path) == 6
+            and path[:2] == ("api", "conversations")
+            and path[3] == "messages"
+            and path[5] == "promote"
+        ):
+            if self.promote_message is None:
+                raise KeyError("conversation task promotion is not configured")
+            task, run, message = self.promote_message(
+                path[2], path[4], goal=body.get("goal"),
+                workspace=body.get("workspace"),
+            )
+            return {
+                "message": _message_json(message),
+                "task": _task_json(task),
+                "run": _run_json(run),
+            }
         if len(path) == 4 and path[:2] == ("api", "tasks") and path[3] == "cancel":
             task = self.execution.get_task(path[2])
             if task is None:
@@ -577,6 +1114,22 @@ refresh(); setInterval(refresh,2000);
             return {"operation": _operation_json(operation)}
         raise KeyError("/" + "/".join(path))
 
+    def _conversation_store(self) -> SQLiteSessionStore:
+        if self.sessions is None:
+            raise KeyError("conversation kernel is not configured")
+        return self.sessions
+
+    def _conversation_events(
+        self, conversation_id: str, *, after: int, limit: int,
+    ) -> ConversationEventPage:
+        if self.conversation_event_reader is not None:
+            return self.conversation_event_reader(
+                conversation_id, after=after, limit=limit,
+            )
+        return self._conversation_store().events(
+            conversation_id, after=after, limit=limit,
+        )
+
     def _operations_json(self) -> list[dict[str, Any]]:
         if self.operations is None:
             return []
@@ -585,10 +1138,99 @@ refresh(); setInterval(refresh,2000);
             for value in self.operations.pending()[:self.max_items]
         ]
 
+    def _conversations_json(self) -> list[dict[str, Any]]:
+        if self.sessions is None:
+            return []
+        return [
+            _conversation_json(value)
+            for value in self.sessions.list_conversations(limit=self.max_items)
+        ]
+
 
 def _query_one(query: Mapping[str, list[str]], name: str) -> str | None:
     values = query.get(name)
     return values[0] if values else None
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("value must be a non-empty string or null")
+    return value.strip()
+
+
+def _conversation_json(conversation: Conversation) -> dict[str, Any]:
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "workspace": conversation.workspace,
+        "state": conversation.state,
+        "metadata": _wire(conversation.metadata),
+        "created_at": conversation.created_at,
+        "updated_at": conversation.updated_at,
+    }
+
+
+def _message_json(message: Message) -> dict[str, Any]:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "role": message.role,
+        "kind": message.kind,
+        "content": _wire(message.content),
+        "task_id": message.task_id,
+        "run_id": message.run_id,
+        "metadata": _wire(message.metadata),
+        "created_at": message.created_at,
+    }
+
+
+def _conversation_event_page_json(page: ConversationEventPage) -> dict[str, Any]:
+    return {
+        "events": [
+            {
+                "event_id": event.event_id,
+                "conversation_id": event.conversation_id,
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "message_id": event.message_id,
+                "task_id": event.task_id,
+                "run_id": event.run_id,
+                "payload": _wire(event.payload),
+                "created_at": event.created_at,
+            }
+            for event in page.events
+        ],
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+    }
+
+
+def _conversation_event_json(event: Any) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "conversation_id": event.conversation_id,
+        "sequence": event.sequence,
+        "kind": event.kind,
+        "message_id": event.message_id,
+        "task_id": event.task_id,
+        "run_id": event.run_id,
+        "payload": _wire(event.payload),
+        "created_at": event.created_at,
+    }
+
+
+def _attachment_json(attachment: Any) -> dict[str, Any]:
+    return {
+        "id": attachment.id,
+        "conversation_id": attachment.conversation_id,
+        "filename": attachment.filename,
+        "mime_type": attachment.mime_type,
+        "size": attachment.size,
+        "sha256": attachment.sha256,
+        "created_at": attachment.created_at,
+    }
 
 
 def _query_int(query: Mapping[str, list[str]], name: str, *, default: int) -> int:
@@ -601,6 +1243,8 @@ def _query_int(query: Mapping[str, list[str]], name: str, *, default: int) -> in
         raise ValueError(f"{name} must be an integer") from exc
     if value < 0:
         raise ValueError(f"{name} must be non-negative")
+    if value > 2**63 - 1:
+        raise ValueError(f"{name} exceeds SQLite integer range")
     return value
 
 
@@ -846,12 +1490,56 @@ def _execution_evidence(
     }
 
 
-def _wire(value: Any) -> Any:
+def _wire(value: Any, *, _active: set[int] | None = None) -> Any:
     """Keep the HTTP boundary JSON-only without leaking object repr secrets."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        marker = "nan" if math.isnan(value) else "-inf" if value < 0 else "inf"
+        return {"__lipas_nonfinite__": marker}
+    if _active is None:
+        _active = set()
+    identity = id(value)
+    if identity in _active:
+        return {"type": "opaque", "python_type": type(value).__name__}
     if isinstance(value, Mapping):
-        return {str(key): _wire(item) for key, item in value.items()}
+        _active.add(identity)
+        try:
+            if any(not isinstance(key, str) for key in value):
+                return {
+                    "__lipas_mapping__": [
+                        {
+                            "key": _wire(key, _active=_active),
+                            "value": _wire(item, _active=_active),
+                        }
+                        for key, item in value.items()
+                    ],
+                }
+            return {
+                key: _wire(item, _active=_active)
+                for key, item in value.items()
+            }
+        finally:
+            _active.remove(identity)
     if isinstance(value, (tuple, list)):
-        return [_wire(item) for item in value]
+        _active.add(identity)
+        try:
+            return [_wire(item, _active=_active) for item in value]
+        finally:
+            _active.remove(identity)
+    if isinstance(value, (set, frozenset)):
+        _active.add(identity)
+        try:
+            projected = [_wire(item, _active=_active) for item in value]
+            return sorted(
+                projected,
+                key=lambda item: json.dumps(
+                    item, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ),
+            )
+        finally:
+            _active.remove(identity)
     return {"type": type(value).__name__}

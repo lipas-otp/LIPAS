@@ -208,12 +208,16 @@ class RetryPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.should_retry, bool):
             raise TypeError("RetryPolicy.should_retry must be bool")
-        if (
-            isinstance(self.base_delay_s, bool)
-            or not isinstance(self.base_delay_s, (int, float))
-            or not math.isfinite(float(self.base_delay_s))
-            or self.base_delay_s < 0
-        ):
+        try:
+            valid_delay = (
+                not isinstance(self.base_delay_s, bool)
+                and isinstance(self.base_delay_s, (int, float))
+                and math.isfinite(float(self.base_delay_s))
+                and self.base_delay_s >= 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid_delay = False
+        if not valid_delay:
             raise ValueError("RetryPolicy.base_delay_s must be finite and non-negative")
         if (
             isinstance(self.max_attempts, bool)

@@ -110,14 +110,24 @@ class OllamaAdapter:
         host: str | None = None,
         prices: PriceTable | None = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
+        trust_env: bool = False,
         client: httpx.AsyncClient | None = None,
         name: str = "ollama",
     ) -> None:
-        self.host = (
-            host or os.environ.get("OLLAMA_HOST") or _DEFAULT_HOST
-        ).rstrip("/")
+        configured_host = host or os.environ.get("OLLAMA_HOST") or _DEFAULT_HOST
+        if "://" not in configured_host:
+            configured_host = f"http://{configured_host}"
+        self.host = configured_host.rstrip("/")
         self.prices = prices
         self.timeout_s = timeout_s
+        if not isinstance(trust_env, bool):
+            raise TypeError("trust_env must be bool")
+        # Ollama is normally a local daemon.  Ignoring ambient proxy
+        # variables by default keeps unrelated shell settings (including
+        # unsupported ``socks://`` URLs) from preventing the client from even
+        # being constructed.  Callers connecting to a remote Ollama host can
+        # opt in explicitly.
+        self.trust_env = trust_env
         self._client = client
         self.name = name
 
@@ -177,7 +187,10 @@ class OllamaAdapter:
                 url, json=body, timeout=self.timeout_s,
             )
         else:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_s,
+                trust_env=self.trust_env,
+            ) as client:
                 resp = await client.post(url, json=body)
 
         if resp.status_code >= 400:
