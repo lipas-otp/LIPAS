@@ -46,6 +46,12 @@ async def main() -> None:
         print("email:", first.provider_reference, replay.provider_reference)
 
         async def transport(message):
+            # ``notifications/initialized`` is a JSON-RPC notification and
+            # therefore deliberately has no id or response.  A transport
+            # adapter must not manufacture an id for it: doing so turns a
+            # valid MCP handshake into a malformed response.
+            if "id" not in message:
+                return None
             if message["method"] == "initialize":
                 result = {"protocolVersion": "2025-06-18"}
             else:
