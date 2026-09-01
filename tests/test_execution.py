@@ -69,6 +69,15 @@ def test_task_run_and_checkpoint_survive_reopen(tmp_path):
         assert restored.state["iteration"] == 1
 
 
+def test_task_and_run_identities_must_be_non_empty(tmp_path):
+    with ExecutionStore(tmp_path / "ids.db") as store:
+        with pytest.raises(ValueError, match="task goal"):
+            store.create_task("   ", tmp_path)
+        task = store.create_task("valid", tmp_path, task_id="task-valid")
+        with pytest.raises(ValueError, match="run_id"):
+            store.create_run(task.id, run_id="  ")
+
+
 def test_expired_run_is_reclaimed_and_old_worker_is_fenced(tmp_path):
     with ExecutionStore(tmp_path / "execution.db") as store:
         _, first = _active_run(store, tmp_path)
@@ -152,15 +161,17 @@ def test_agent_event_identity_cannot_be_reused_with_different_payload(tmp_path):
             )
 
 
-def test_late_heartbeat_can_renew_until_a_replacement_changes_the_token(tmp_path):
+def test_expired_heartbeat_cannot_renew_even_before_replacement(tmp_path):
     with ExecutionStore(tmp_path / "execution.db") as store:
         _, first = _active_run(store, tmp_path)
-        renewed = store.renew_lease(
-            first.id, first.lease_token or "", lease_seconds=10, now=161,
-        )
-        assert renewed.lease_expires == 171
+        # An expired token is fenced immediately.  Allowing a late heartbeat
+        # to extend it would let a paused worker race a replacement claim.
+        with pytest.raises(ExecutionLeaseError):
+            store.renew_lease(
+                first.id, first.lease_token or "", lease_seconds=10, now=161,
+            )
 
-        replacement = store.claim_run(first.id, lease_seconds=10, now=172)
+        replacement = store.claim_run(first.id, lease_seconds=10, now=161)
         assert replacement.lease_token != first.lease_token
         with pytest.raises(ExecutionLeaseError):
             store.renew_lease(

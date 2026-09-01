@@ -9,7 +9,7 @@ import tomllib
 from lipas import __version__
 
 
-RELEASE = "0.40.0"
+RELEASE = "0.63.0"
 
 
 def test_version_has_one_packaging_source_of_truth():
@@ -32,13 +32,13 @@ def test_version_has_one_packaging_source_of_truth():
 
 def test_release_headings_and_product_banners_are_current():
     assert (
-        f"## [{RELEASE}] — 2026-08-24 · Local Operator & Recovery Beta"
+        f"## [{RELEASE}] — 2026-09-01 · Capability-Complete Local-First Refinement"
         in Path("CHANGELOG.md").read_text()
     )
-    assert f"**{RELEASE} local operator and recovery beta.**" in Path(
+    assert f"**{RELEASE} capability-complete local-first refinement.**" in Path(
         "README.md",
     ).read_text()
-    assert f"**{RELEASE} local operator 与 recovery beta。**" in Path(
+    assert f"**{RELEASE} local-first 能力完整的单工作区整理版。**" in Path(
         "README.zh-CN.md",
     ).read_text()
     package_info = Path("PKG-INFO").read_text(encoding="utf-8")

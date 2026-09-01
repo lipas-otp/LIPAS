@@ -156,11 +156,10 @@ def test_dispatcher_finishes_cancelled_expired_run_after_restart(tmp_path):
         )
         store.cancel_task(claimed.task_id)
 
+    executed: list[str] = []
+
     async def execute(_task, discovered):
-        with ExecutionStore(path) as store:
-            store.finish_cancelled(
-                discovered.id, discovered.lease_token,  # type: ignore[arg-type]
-            )
+        executed.append(discovered.id)
 
     outcomes = asyncio.run(TaskDispatcher(
         path, execute, max_concurrency=1,
@@ -169,6 +168,7 @@ def test_dispatcher_finishes_cancelled_expired_run_after_restart(tmp_path):
     assert len(outcomes) == 1
     assert outcomes[0].status == "cancelled"
     assert outcomes[0].attempt == 2
+    assert executed == []
 
 
 def test_continuous_dispatcher_picks_up_a_task_submitted_after_start(tmp_path):

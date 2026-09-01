@@ -21,7 +21,7 @@ LIPAS 0.35 在执行核心之外扩展业务广度：
 
 | 领域 | Skills |
 | --- | --- |
-| 文件 | `workspace-files`、`document-processing` |
+| 文件 | `workspace-files`、`document-processing`（受限 PDF 提取与文本/Office 转换 Tool） |
 | 工程 | `coding-task`、`code-review`、`release-readiness` |
 | 办公 | `email-drafting`、`business-report`、`meeting-notes`、`business-notice`、`proposal-writing`、`calendar-planning` |
 | 个人写作 | `personal-letter`、`speech-writing`、`celebration-message` |
@@ -76,6 +76,27 @@ lipas task start . "修复 parser 并检查发布准备度" \
 无 Tool 的内置 chat 只接受 Draft Scenario；对缺少能力的 Workspace/Connector Scenario
 会在启动前失败。Task Workbench 也会先校验默认 Tool。自定义 chat/task factory 可以接收
 `skills=`，并可选接收 `scenarios=`；额外 Tool 仍由 factory 明确组合。
+
+工程 Task 的默认 Workbench Tool 还包括纯算术 `calculate`、受限 CSV 概览
+`analyze_csv`，以及需要审批的 `python_exec`。Python 在临时 worker 中运行，具有时间、
+内存、源码和输出上限，不会隐式获得项目文件。生产环境应选择 Bubblewrap 作为 OS
+隔离边界；显式选择的 `local` 只是受信任的兼容模式，非隔离结果会记录到 evidence。
+
+文档 workflow 还提供受限 ZIP/TAR `inspect_archive` 和需要审批的
+`extract_archive` Tool。提取前会检查路径穿越、链接/设备成员、成员数量和展开后大小。
+如果 PDF 是纯图片且没有可提取文字，结果会标记 `needs_ocr`；系统不会隐式启动 OCR，
+宿主应在独立 sandbox 与数据出境 policy 下另行提供 OCR capability。
+
+需要本地 RAG 的应用可以使用 `KnowledgeStore`，把已经获授权的文本写入可持久化、按
+scope 过滤的 lexical index。检索结果带有来源、chunk 和文档 digest 引用。它只是普通
+应用上下文，不是对话记忆，也不是 Claim authority；以后可以在同一边界后接 embedding/
+vector provider。
+
+Provider integration 可以使用 `fetch_url_tool(HttpClient(...))` 获得只读
+`fetch_url` Tool。它复用 `HttpClient` 的 HTTPS/host allowlist、重定向、timeout 和响应
+策略，再提取有大小上限的可见 HTML 或 UTF-8 文本并返回 SHA-256 digest。Tavily、Exa、
+ArXiv 等搜索服务应实现为独立 adapter，返回来源 URL 与引用 evidence，而不是放宽这个
+通用 fetch 边界。
 
 ## Python API
 

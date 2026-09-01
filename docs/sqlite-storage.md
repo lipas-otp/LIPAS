@@ -2,7 +2,7 @@
 
 > Language: [English](sqlite-storage.md) | [中文](sqlite-storage.zh-CN.md)
 >
-> The storage kernel shipped in 0.38 and is the supported backend for LIPAS 0.40.0.
+> The storage kernel shipped in 0.38 and remains the supported backend for LIPAS 0.63.0.
 
 LIPAS deliberately uses SQLite for local and moderate-concurrency deployments.
 Agent work is dominated by model, network, sandbox, and tool latency; durable
@@ -39,6 +39,8 @@ All normal stores open connections through the same kernel:
 - `BEGIN IMMEDIATE` for CAS/fenced control transactions.
 
 One normal acquisition attempt waits for at most the configured busy timeout.
+Concurrent first opens also use a bounded retry while selecting WAL; this is
+connection bootstrap and never replays an application transaction body.
 Only a caller that explicitly requests more attempts can wait again. LIPAS
 never automatically replays a transaction body because caller code might
 contain an external side effect. No database transaction is held across a
@@ -97,6 +99,16 @@ Normal state transitions drain at most one bounded outbox batch; explicit
 `repair_audit()` streams the complete remaining backlog. Legacy audit seeding
 is stamped once rather than rescanning all Tasks, Operations, or handoffs at
 every open.
+
+## Workspace evidence bundles
+
+`WorkspaceStorage.backup_bundle()` archives `workspace.db`, every regular file
+under `runs/`, and the installation manifest in one manifest- and SHA-256-
+verified directory. `verify_bundle()` performs the same path, hash, and SQLite
+integrity checks without modifying a workspace; `restore_bundle()` stages the
+new tree under an exclusive lease and writes a durable recovery marker before
+publishing it. A restart settles that marker to either a complete new tree or
+the preserved old tree, and refuses to open an ambiguous half-restore.
 
 ## Scaling without a server database
 

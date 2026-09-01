@@ -79,6 +79,8 @@ version；如果语义改变，必须使用新的 handoff identity。
 场景里各写一套网络逻辑。HTTP write 在发送前写入 `OperationJournal`，需要稳定
 `idempotency_key`；timeout/transport error 会进入 `uncertain`，必须通过同一个 journal 或
 `/api/operations/<key>/reconcile` 完成 reconciliation 后才能使用新 key。
+MCP `tools/call` notification 如果没有 JSON-RPC id，必须在 params 中提供
+`_lipas_request_id`；否则 server 会拒绝，因为它没有可 replay 的 operation identity。
 
 ```python
 from lipas import EgressPolicy, HttpClient, OperationJournal
@@ -100,9 +102,105 @@ await mcp.call_tool("lookup_ticket", {"id": "42"}, request_id="ticket-42-lookup-
 
 `EmailConnector` 是 connector boundary，不是新的 Agent 类型。它要求 provider 返回
 provider reference 并实现按 idempotency key lookup；pending/uncertain key 会被拒绝，必须
-先获得显式 approval，再发送；之后可用 `connector.reconcile(key)`。异步 gateway timeout 会保留后台调用并允许 late completion
+先获得显式 approval，再发送；之后可用 `connector.reconcile(key)`，且 provider lookup 在
+found 时必须给出 provider reference，否则仍保持 `uncertain`。异步 gateway timeout 会保留后台调用并允许 late completion
 收敛 Effect；无法强杀的同步工具可在 operator/provider lookup 后显式调用
 `ToolHarness.reconcile_orphan()`。
+
+如果只需要受限的网页读取，可以在同一个 allowlist client 上包装
+`fetch_url_tool`：
+
+```python
+from lipas import EgressPolicy, HttpClient, fetch_url_tool
+
+http = HttpClient(
+    base_url="https://docs.example.test",
+    egress=EgressPolicy(frozenset({"docs.example.test"})),
+)
+fetch_url = fetch_url_tool(http)
+```
+
+该 Tool 沿用 client 的 HTTPS/host、timeout 与重定向策略，返回有大小上限的可见文本和
+内容 digest。搜索 adapter 应只对自己 allowlist API 返回的 URL 调用它，并保留来源与引用
+metadata。
+
+本地 RAG 可以使用 `KnowledgeStore`，它提供持久化 lexical index，但不会成为对话记忆或
+Claim authority：
+
+```python
+from lipas import KnowledgeStore
+
+with KnowledgeStore("knowledge.db") as knowledge:
+    knowledge.ingest("docs/guide.md", guide_text, scope="team-a")
+    hits = knowledge.search("approval workflow", scope="team-a")
+```
+
+每个 hit 都包含 source、chunk、scope 和文档 digest。只应写入已经获授权的文本，并把引用
+随生成结果一起保存。
+
+## Remote worker、Web SSE 与附件
+
+`RemoteWorkerHTTPClient`/`RemoteWorkerHTTPServer` 是 hybrid execution 的
+provider-neutral reference transport。client 默认要求 HTTPS，将 fenced lease
+发送到 worker，并用 HMAC-SHA256 签名 worker capability fingerprint；server 会先验证
+worker id 与 attestation，再调用 worker，返回包含 event、checkpoint 和 Effect
+observation 的结构化结果。`allow_http=True` 仅用于本地测试；生产部署仍需自己负责
+TLS 证书、secret rotation、网络策略和 worker admission。
+
+`TLSConfig` 会校验私钥权限，并提供证书 SHA-256 fingerprint 供轮换记录使用。
+`OperatorServer.reload_tls()` 与 `RemoteWorkerHTTPServer.reload_tls()` 不重新绑定监听端口，
+只替换后续连接使用的 context；现有连接继续使用已协商的会话。
+`RemoteWorkerHTTPClient.reload_tls()` 也支持在 CA/client trust context 轮换后替换未来连接的
+context。部署层应原子替换证书和私钥，构造新的 `TLSConfig`，记录轮换前后 fingerprint，
+reload 后再做探针验证。
+
+Local Web operator 提供可重连、基于 cursor 的 SSE 批次：
+
+```text
+GET /api/conversations/<id>/stream?after=0&limit=100
+GET /api/runs/<id>/stream?after=0&limit=100
+```
+
+当 `require_authentication=True` 时使用 `Authorization: Bearer <token>`。无法设置 header 的
+浏览器 `EventSource` 可以使用等价的短期 `access_token` query 参数；不要把长期 secret
+放入 URL 或 access log。SSE 是 catch-up
+传输，不是无限内存流；SQLite conversation/Run event log 仍是 replay authority。
+Conversation attachment 通过有界 JSON base64 上传，保存在 workspace 下的生成路径中，带
+SHA-256 digest 和幂等 id；filename 只作为 metadata，不能逃逸 workspace。
+
+## Extension registry 的真实验签
+
+`ExtensionSigner` 对 canonical manifest metadata 加 artifact digest 生成 HMAC-SHA256
+签名。配置 signer 后，`ExtensionRegistry` 在 certification 前验证签名；artifact 或
+manifest 被篡改会 fail closed。`ExtensionRegistryService` 在 `/v1/extensions` 提供受认证的
+注册/撤销和只读 certification metadata，但不会 import、install 或执行 package。签名
+secret 应放在部署 secret store；certification 是 admission metadata，不是 execution authority。
+
+## Design-partner 验证
+
+`run_design_partner_validation()` 可对本地 fixture 或外部 adapter（设置
+`evidence_scope="external_adapter"`）执行同一组有界 case，生成
+包含 run identity、unsafe-delivery、reconciliation time、operator acceptance 和 failure
+categories 的报告。本地报告会标记为 `local_fixture`，并明确要求外部 partner evidence，
+不能冒充客户验证。真实 partner 提供验收 artifact 后，可用
+`DesignPartnerSignoff.from_file()` 记录 SHA-256，再调用 `report.with_signoff()`；只有
+artifact 仍与 digest 一致时，报告才会暴露 `externally_accepted=True`。
+
+真实 provider workflow 使用显式 opt-in helper：
+
+```python
+from lipas import run_provider_workflow
+
+evidence = await run_provider_workflow(
+    agent, runtime.execution, "summarize release notes",
+    workspace=project_dir, live=True,
+    request_id="release-notes-2026-08-30",
+)
+```
+
+它只创建一个确定性的 Task/Run，继续走 durable Agent/Effect 路径，并返回有界的
+provider/model/terminal evidence。`live=True` 是强制的，因为请求可能计费；本地 fixture
+仍应使用普通 Agent API，并保持 fixture 标记。
 
 ## Hermes MCP
 
@@ -158,7 +256,16 @@ gateway = ActionGateway(
 ```
 
 Effect intent 只保留引用，不保留解析后的值；工具返回值与异常会在持久化前，对已解析的
-精确值进行脱敏。当前 LIPAS 尚未提供通用 secret vault 或任意 secret provider 插件。
+精确值进行脱敏。若使用 KMS/HSM/secret manager，可注入 `ManagedSecretResolver`，并按需提供
+provider 专用 redactor；未提供时 LIPAS 使用有界的内存精确值脱敏。`vault://` 等自定义
+namespace 会先经过 allowlist 和 resolver，不会作为普通字符串透传。部署层 callback 负责认证、
+轮换、TTL 和外部审计；本地文件 resolver 本身不等价于密钥托管服务。
+
+OpenAI-compatible adapter 也可以使用同一边界：传入
+`api_key_reference="secret://..."` 与 `SecretResolver`，不要在代码中内联 `api_key`。
+解析只发生在 adapter 构造时，key 仅留在 HTTP client 内存中；部署配置只应保存 opaque reference。
+外部轮换后可调用 `adapter.reload_api_key()`（或重新构造 Agent）再发起后续请求；已经构造 header
+的 in-flight 请求继续使用旧 key。
 
 路径检查、allowlist、审批和脱敏都是防误操作层，不是恶意模型的安全边界。本地
 workbench 现在默认通过 Linux Bubblewrap 执行命令：`auto` 与 `bwrap` 无法建立文件系统和

@@ -364,6 +364,8 @@ the LIPAS boundary before replacing a tool body with a real client.
 | [Durable execution](../examples/11_durable_execution.py) | Chapter 10 | Separate execution/effect stores, a durable approval Interrupt, and resume of the same run. |
 | [Local task product](../examples/12_local_task_product.py) | Chapter 10 | An isolated ChangeSet, command approval, restart, verification evidence, review, and explicit apply. |
 | [Operator beta](../examples/14_operator_beta.py) | Chapter 10 | A local Task/Run projection, deterministic fault drill, and bounded SQLite transition benchmark. |
+| [External connectors](../examples/15_external_connectors.py) | Chapter 10 | Idempotent email delivery and a transport-neutral MCP client without a second authority. |
+| [Workspace capabilities](../examples/16_workspace_capabilities.py) | Chapter 10 | A provider-free smoke test for bounded files, documents, archives, computation, and local knowledge. |
 
 Run the first three with a local Ollama model, for example:
 
@@ -373,7 +375,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-The latter five are provider-free. The complete example catalogue, including
+The remaining projects are provider-free. The complete example catalogue, including
 replay and supervision, is in [examples/README.md](../examples/README.md).
 
 ## API card

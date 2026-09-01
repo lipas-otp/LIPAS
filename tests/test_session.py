@@ -1,12 +1,14 @@
 """Tests for lipas.session.open_session."""
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
 import pytest
 
 from lipas.calculus import Claim
+from lipas.agent import Agent
 from lipas.exceptions import ClaimIdConflict
 from lipas.rows.capability import CapabilityRow
 from lipas.rows.base import InvariantViolation
@@ -31,6 +33,7 @@ from lipas.effect import (
 from lipas.rows.history import HistoryRow
 from lipas.serialization.store_sqlite import SqliteClaimStore
 from lipas.session import open_session
+from tests.fake_adapter import FakeAdapter
 
 
 @pytest.fixture
@@ -100,6 +103,41 @@ def test_open_session_creates_missing_parent_directories(tmp_path):
         assert path.is_file()
     finally:
         rowset.store.close()
+
+
+def test_agent_session_restores_complete_message_history_across_reopen(tmp_path):
+    path = tmp_path / "chat.db"
+
+    first_adapter = FakeAdapter.echoing()
+    first_agent = Agent(
+        adapter=first_adapter,
+        model="fake",
+        session_path=path,
+    )
+    try:
+        first = first_agent.session(session_id="chat")
+        asyncio.run(first.run("first turn"))
+    finally:
+        first_agent.close()
+
+    second_adapter = FakeAdapter.echoing()
+    second_agent = Agent(
+        adapter=second_adapter,
+        model="fake",
+        session_path=path,
+    )
+    try:
+        second = second_agent.session(session_id="chat")
+        asyncio.run(second.run("second turn"))
+        messages = second_adapter.seen_requests[0].messages
+        assert [message["role"] for message in messages] == [
+            "user", "assistant", "user",
+        ]
+        assert messages[0]["content"] == "first turn"
+        assert "echo: first turn" in str(messages[1]["content"])
+        assert messages[2]["content"] == "second turn"
+    finally:
+        second_agent.close()
 
 
 @pytest.mark.parametrize("budgets", [

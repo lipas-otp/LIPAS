@@ -103,6 +103,16 @@ accepted intent snapshots the submitted input. `caused_by` can link an Agent
 effect to its handoff envelope; `compensates` can link a compensating effect to an
 earlier one.
 
+The 0.50 `AgentRuntime.execute_effect()` bridge carries a product-level
+`EffectProposal` into the matching `LLMHarness` or `ToolHarness`. The Harness
+maps arbitrary proposal identity to the historical `call_`/`tool_` claim id,
+stores namespaced proposal provenance (including `caused_by`) on the intent,
+and returns an `EffectObservation`
+projected from the same tape. A repeated proposal recovers its terminal claim;
+an intent-only claim projects as `uncertain`, never as a successful delivery.
+Reconciliation may use either the product proposal id or the mapped claim id;
+it records one terminal result and never submits a second live request.
+
 ## Replay: reproduce decisions without accidentally repeating effects
 
 LLM replay substitutes a recorded reply. Tool replay is strict by default: a

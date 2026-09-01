@@ -232,7 +232,7 @@ def test_local_operator_http_boundary_redacts_and_authorizes_mutations(
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2) as wake:
             wake.sendall(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
-    except ConnectionRefusedError:
+    except (ConnectionRefusedError, ConnectionResetError):
         # The authenticated request may have been the final handle_request
         # iteration already; shutdown is then complete before the wake-up
         # connection is attempted.

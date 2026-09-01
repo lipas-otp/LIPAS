@@ -116,6 +116,15 @@ def test_workspace_scenario_checks_tool_presence_and_effect_identity():
     assert mismatch.mismatches[0].actual is SideEffectClass.PURE
 
 
+def test_coding_scenario_declares_bounded_computation_tools():
+    scenario = load_builtin_scenario("coding-change")
+    requirements = {value.name: value for value in scenario.capabilities}
+    assert requirements["calculate"].side_effect is SideEffectClass.READ_ONLY
+    assert requirements["analyze_csv"].side_effect is SideEffectClass.READ_ONLY
+    assert requirements["python_exec"].side_effect is SideEffectClass.EXTERNAL_WRITE
+    assert requirements["python_exec"].approval == "before-call"
+
+
 def test_external_scenario_never_treats_tool_shape_as_complete_host_policy():
     scenario = load_builtin_scenario("email-delivery")
     requirement = scenario.capabilities[0]
@@ -146,6 +155,21 @@ def test_external_scenario_never_treats_tool_shape_as_complete_host_policy():
     assert incomplete.schema_mismatches[0].missing_parameters == (
         "account", "recipients", "subject", "body", "idempotency_key",
     )
+
+
+def test_document_scenario_declares_pdf_and_conversion_tools():
+    scenario = load_builtin_scenario("document-processing")
+    assert [value.name for value in scenario.capabilities] == [
+        "list_workspace_files",
+        "read_workspace_file",
+        "search_workspace",
+        "read_pdf",
+        "write_workspace_file",
+        "convert_workspace_file",
+    ]
+    assert scenario.capabilities[2].side_effect is SideEffectClass.READ_ONLY
+    assert scenario.capabilities[-1].side_effect is SideEffectClass.IDEMPOTENT_WRITE
+    assert scenario.capabilities[-1].approval == "delivery"
 
 
 def test_missing_scenario_tools_fail_before_execution():

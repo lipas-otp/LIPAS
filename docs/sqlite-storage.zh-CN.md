@@ -2,7 +2,7 @@
 
 > 语言：[English](sqlite-storage.md) | [中文](sqlite-storage.zh-CN.md)
 >
-> 存储内核在 0.38 引入，并作为 LIPAS 0.40.0 的受支持后端。
+> 存储内核在 0.38 引入，并继续作为 LIPAS 0.63.0 的受支持后端。
 
 LIPAS 明确选择 SQLite 作为本地和中等并发部署的存储内核。Agent 的主要耗时来自模型、
 网络、sandbox 和 Tool，持久控制写入则短而小。对这一常见本地负载，PostgreSQL 会显著
@@ -36,8 +36,10 @@ runs/<run-id>/claims.db
 - WAL 达到 1,000 page 后自动 checkpoint；
 - CAS/fencing 控制事务使用 `BEGIN IMMEDIATE`。
 
-一次常规 writer ownership 获取最多等待一个配置的 busy timeout；只有调用方显式要求更多
-attempt 时才会再次等待。LIPAS 不会自动重放事务 body，因为调用方代码可能隐藏外部副作用。
+一次常规 writer ownership 获取最多等待一个配置的 busy timeout；并发首次打开数据库时，
+选择 WAL 也会使用有界重试。这只是 connection bootstrap，不会重放应用事务 body；只有
+调用方显式要求更多 attempt 时才会再次等待。LIPAS 不会自动重放事务 body，因为调用方代码
+可能隐藏外部副作用。
 任何数据库事务都不得跨越模型、网络、sandbox 或 Tool `await`。
 
 ## 并发模型
@@ -86,6 +88,14 @@ projection snapshot 保存 reducer 的 merged result 与最后 sequence。重新
 普通状态转换每次最多 drain 一个有界 outbox batch；显式 `repair_audit()` 会流式处理完整
 剩余 backlog。旧审计记录只 seed 并标记一次，不会在每次打开时重新扫描所有 Task、
 Operation 或 handoff。
+
+## Workspace evidence bundle
+
+`WorkspaceStorage.backup_bundle()` 将 `workspace.db`、`runs/` 下全部普通文件和安装清单
+归档为带 manifest 与 SHA-256 校验的目录。`verify_bundle()` 只读执行路径、哈希和 SQLite
+完整性检查，不修改 workspace；`restore_bundle()` 在独占 lease 下先 staging，并在发布前
+写入持久恢复标记。进程重启时会把标记保守结算为完整的新树或保留的旧树；无法证明完整性
+时拒绝打开含糊的半恢复状态。
 
 ## 不引入服务端数据库时如何扩展
 

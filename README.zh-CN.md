@@ -2,9 +2,10 @@
 
 > 语言：[English](README.md) | [中文](README.zh-CN.md)
 
-LIPAS 是面向个人与小团队的本地可信任务 Agent。它在用户选定的 workspace 中工作，
-高风险动作先审批，中断后能够恢复，完成后验证结果并交付证据，而不只是结束一段聊天。
-Python runtime 是内部可靠性基础，也保留为可选的高级嵌入能力。
+LIPAS 是带有 local-first control plane 的可信 Agent 执行与交付平台。它在用户选定的
+workspace 中工作，高风险动作先审批，中断后能够恢复，完成后验证结果并交付证据，而不只是
+结束一段聊天。模型和执行 provider 可以运行在本地，也可以是显式配置的远程 endpoint；
+authority、policy 和 evidence 始终由宿主控制。
 
 ```text
 Agent  = 一个会思考并使用工具的 assistant
@@ -12,40 +13,63 @@ Agent  = 一个会思考并使用工具的 assistant
 AgentCoordinator = 在具名成员之间建立 ExecutionStore-backed 归属
 Team   = legacy mailbox 兼容 facade
 ```
-
-> **0.40.0 local operator 与 recovery beta。** `AgentCoordinator` 现在把每个 handoff 映射为现有
-> `ExecutionStore` 下确定性的 Task/Run。Sequential、RoundRobin、受限 parallel、
-> map/reduce、durable Selector 与受限 Swarm 因而共用同一套 lease、cancellation、event
-> 与 terminal replay 权威，不另建 graph 或 mailbox database。
-> 这一边界包含聚合 event handle、shared budget/capability policy、durable Agent 成员、
-> 无依赖 LangGraph/AutoGen handoff adapter，以及 scaffold/conformance SDK。
-
-> **0.38.0 SQLite 并发与证据存储。** durable Run 现在无需 Runtime 全局锁即可并发
-> 执行；所有核心 Store 共享同一套 WAL、超时、事务和错误策略；Claim tape 支持并发
-> 幂等追加、有界分页和可重建 projection snapshot。0.35 的 18 个 Scenario 与 17 个
-> instruction-only Skill 全部继续保留。
-
-> **0.40.0 已发布。** `LocalWebOperator` 在 loopback HTTP 边界投影同一套 Task/Run/
-> Interrupt/event；`/` 提供无依赖的浏览器 projection，mutation route 必须使用 bearer token。`FaultCampaign` 和
-> `benchmark_execution_store()` 提供确定性的恢复演练与本地 transition 测量。本轮加固
-> 增加有界 Task detail（diff、artifact、report）、安全的 Task 取消/审批别名、可复用
-> fault plan，以及多连接 SQLite contention probe。
-
-## 一个系统，两层能力
+---
 
 ```text
-LIPAS 业务与产品层（0.40.0 SQLite-first runtime）
+Agent 提出 Effect
+        ↓
+Runtime 按 policy、budget、capability、approval 决定准入
+        ↓
+Harness / Tool / Connector / Worker 执行
+        ↓
+Observation → Artifact / Report → verified Delivery
+```
+
+同一套语义同时支持 deterministic workflow step 与 autonomous agentic step。Agent、graph
+node 和 member 只能提出工作，不能直接拥有改变世界的 authority。`EffectProposal`、
+`EffectDecision`、`EffectObservation` 是 0.50 边界的公共契约。Runtime bridge 现在会把已准入
+的 proposal 传给现有 Harness，由 Harness 将 proposal identity 写入 Run 的 Effect intent，
+再从持久 Claim tape 返回 observation。重复 proposal 只会恢复 terminal result；只有 intent
+而没有 terminal claim 时保持 `uncertain`，绝不报告为成功。Proposal metadata 会放入独立
+namespace，不能覆盖保留审计字段，`caused_by` 作为持久因果链接保留。崩溃后可使用 proposal
+id 或映射后的 claim id 做 reconciliation，关闭 orphan 时不会再次提交实时请求。
+Proposal identity 对应不可变证据；如果复用时改变 provenance，会 fail closed。
+如果改变 causation 也会 fail closed。Gateway 还会把 pending approval 绑定到工具与参数摘要，
+因此审批不能被复用到另一份 payload。
+
+```python
+observation = await runtime.execute_effect(
+    proposal,
+    harness=tool_harness,
+    target=ToolTarget(send_email, {"to": "user@example.com"}),
+    available_capabilities={"email.send"},
+    approved=True,
+)
+```
+
+## 一个系统，一个 local-first control plane
+
+```text
+LIPAS control 与产品层（0.63.0 local-first runtime）
   Scenario / Skill / Task / Workspace / Approval / Artifact / Local Web operator
                               │
                               ▼
 LIPAS Python runtime（当前可用）
   Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation
   AgentCoordinator / legacy Team
+                              │
+                              ▼
+执行 provider（本地 sandbox、显式模型 endpoint、未来 worker）
 ```
 
-工作台是 LIPAS 执行工作区任务的第一方体验，例如检查文件、进行受控修改、运行验证并
-交付报告。对于需要自有领域模型或界面的应用，Python API 仍然可以独立嵌入。两层能力
+工作台是 LIPAS 执行工作区任务的第一方体验，例如检查文件、进行受控修改、阅读受限 PDF、
+转换文档、运行验证并交付报告。Coding 任务已经提供读写、文本搜索、Git diff/status 以及白名单测试/
+质量检查命令。对于需要自有领域模型或界面的应用，Python API 仍然可以独立嵌入。两层能力
 共享同一套 Effect 与审计记录；工作台不会另建一套执行模型。
+
+安装 `lipas[documents]`（或 `lipas[all]`）即可启用受限文档 Tool 所需的可选
+PDF/DOCX/XLSX/PPTX 解析器；ZIP/TAR 检查与安全解压使用标准库，并受成员数和展开大小
+限制。Coding 工作台还提供受限算术、CSV 概览和临时 Python worker。
 
 应用现在可以通过一个 lifecycle owner 打开这些边界：
 
@@ -67,16 +91,52 @@ with LIPASRuntime.open(".lipas") as runtime:
 `.lipas/runs/<run-id>/claims.db`，从而保持 budget 与 replay 隔离，而不会形成第二套
 Task/Run 状态机。SQLite 是经过明确选择的本地内核：WAL 让 reader 不受短写事务阻塞，
 默认 `synchronous=FULL` 保护持久提交，per-Run evidence 文件减少全局热点。它是有界的
-单写者设计，不伪装成分布式数据库；详见
+单写者 control-plane 设计，不伪装成分布式数据库。远程模型不会成为 authority；未来 remote
+worker 也必须通过同一套 Run、Effect、policy 和 evidence 契约返回。详见
 [SQLite 存储与并发](docs/sqlite-storage.zh-CN.md)。打开旧工作区绝不会静默改写数据；请先
-运行 `lipas migrate plan`，再以
-`lipas migrate apply --yes` 显式迁移。migration 与 rollback 采用 copy-on-write，保留并
-验证备份、处理 SQLite WAL 状态，并拒绝活跃 Runtime 或 SQLite writer。死亡进程留下的
-stale migration lock 可以恢复；活跃 lock 绝不会被删除。
+运行 `lipas migrate plan`，再以 `lipas migrate apply --yes` 显式迁移。
+migration 与 rollback 采用 copy-on-write，保留并验证备份、处理 SQLite WAL 状态，
+并拒绝活跃 Runtime 或 SQLite writer。死亡进程留下的 stale migration lock 可以恢复；
+活跃 lock 绝不会被删除。
 
 Agent 调用、对话 Session 与 durable Run 也共享 `RunContext`、`AgentEvent`、取消、
 deadline 和事件 cursor。权威来源与兼容边界见
 [统一 runtime 契约](docs/runtime-contracts.zh-CN.md)。
+
+## 对话是产品入口
+
+LIPAS 已经支持带持久 session 的对话式 REPL：
+
+```bash
+lipas chat --model phi4-mini --session runs/chat.db
+```
+
+下一步应把对话作为 workspace Task 的统一入口，而不是再创建一套 Agent 或权限系统：
+
+```text
+Conversation / chat message
+          │
+          ├── 只需回答 → Session / RunHandle
+          ├── 需要行动 → Task / durable Run
+          ├── 高风险操作 → Approval 或 Input Interrupt
+          └── 完成工作 → diff / verification / report / delivery
+```
+
+---
+
+```python
+with LIPASRuntime.open(".lipas", sandbox="local") as runtime:
+    chat = runtime.create_conversation(title="发布检查")
+    message = runtime.append_message(
+        chat.id, role="user", content="检查发布状态", message_id="msg-1",
+    )
+    task, run, message = runtime.promote_message_to_task(chat.id, message.id)
+    page = runtime.conversation_events(chat.id, limit=100)
+```
+
+无依赖的 Web preview 通过 `runtime.operator(...)` 启动，与 CLI 和 Python 宿主共享同一套
+Task/Run/Approval/Effect 契约。客户端应保存返回的 `message_id` 和 `next_cursor`；这样
+重试就是幂等写入，断线后可以从 cursor 继续追赶事件。
 
 ## 底层的一个核心想法
 
@@ -109,9 +169,12 @@ store 通过可修复 outbox 镜像 transition。代码保持自然的 Python，
 
 ## 从这里开始
 
+最稳妥的首次试用方式是先按[五分钟首次试用](docs/onboarding.zh-CN.md#五分钟首次试用)
+完成 provider-free 流程，再连接模型。
+
 ```bash
 pip install 'lipas[ollama]'
-ollama pull gemma4:12b
+ollama pull phi4-mini
 ```
 
 ```python
@@ -224,12 +287,14 @@ async def main():
 cursor 提供规范化 run/model/tool 事件。adapter 产出的真实 delta 也通过同一套
 `AgentEvent` 协议向上提供。
 
-## 本地工作区任务（0.40 产品 beta）
+## 本地与混合工作区任务（0.63 产品）
 
-历史 0.31.0 切片让本地任务产品纵切默认使用统一 runtime；当前 0.40 产品 beta
-在独立产品层复用同一个
-`ExecutionStore` 与 Effect tape，不会把 Workspace、Artifact 或 Report 概念反向塞进
-Agent runtime。默认状态目录是 `~/.lipas`，也可以用 `LIPAS_HOME` 或 `--home` 指定。
+历史 0.31.0 切片让本地任务产品纵切默认使用统一 runtime；当前 0.63 产品版本
+在独立产品层复用同一个 `ExecutionStore` 与 Effect tape，不会把 Workspace、Artifact 或
+Report 概念反向塞进 Agent runtime。workspace 与 control state 默认保留在本地，模型可以
+使用本地 Ollama，也可以使用显式的 OpenAI-compatible endpoint。多机器 worker pool 是未来
+执行层，不是 0.63 的隐式 fallback。默认状态目录是 `~/.lipas`，也可以用 `LIPAS_HOME` 或
+`--home` 指定。
 
 ```bash
 lipas task start . "修正文档中的错误并运行相关测试"
@@ -297,11 +362,11 @@ timeout 会被标记为 recovery-required；operator 必须先完成 Effect/prov
 与 `ToolHarness.reconcile_orphan()` 可以在不发起未经验证的第二次请求的前提下关闭
 intent-only Effect。
 
-## 实验性互操作
+## Integration 与执行边界
 
-LIPAS 优先发展自己的任务产品。LangGraph、MCP server、OpenCrew/OpenClaw adapter
-只是实验性兼容样例，不属于核心产品界面，也不承诺长期兼容；HTTP/MCP client 则是第一方
-capability boundary。详见[Integration 指南](docs/integrations.zh-CN.md)。
+LIPAS 的核心是执行与交付契约，而不是某一种模型托管拓扑。LangGraph、MCP server、
+OpenCrew/OpenClaw adapter 仍是兼容边界，不是另一套 authority，也不是对这些框架的完整复制；
+HTTP/MCP client 则是第一方 capability boundary。详见[Integration 指南](docs/integrations.zh-CN.md)。
 
 ## 业务 Skill 与 Scenario
 
@@ -348,7 +413,7 @@ uncertain-result reconciliation。详见[业务 Skill、Scenario 与 Capability]
 
 ```bash
 pip install 'lipas[ollama,cli]'
-lipas init support-demo --model gemma4:12b
+lipas init support-demo --model phi4-mini
 cd support-demo
 lipas chat --factory agent:build_agent
 lipas trace runs/chat.db
@@ -356,11 +421,13 @@ lipas effects runs/chat.db
 ```
 
 从源码 checkout、但尚未安装时，请改用 `python -m lipas.cli`。session 文件会自动
-创建。Ollama 是本地的，但通过本地 HTTP service 访问；timeout 表示本地 daemon/model
-未及时回答，并不表示 LIPAS 联系了互联网。
+创建。Ollama 是本地的，但通过本地 HTTP service 访问；LIPAS 也支持显式的远程兼容
+endpoint，但不会因此把 task authority 或 evidence 移出宿主 workspace。timeout 表示本地
+daemon/model 未及时回答，并不表示 LIPAS 联系了互联网。
 
 ## 按需阅读
 
+- [架构导览](docs/architecture.zh-CN.md) —— 请求路径、模块职责、权威存储和入口选择。
 - [循序上手 LIPAS](docs/tutorial.zh-CN.md) —— 推荐的线性教程，从一个 Agent 到
   完整项目。
 - [执行模型](docs/execution-model.zh-CN.md) —— Claim、effect、持久 run、replay、
@@ -369,10 +436,10 @@ lipas effects runs/chat.db
   cancellation、replay 与剩余边界。
 - [SQLite 存储与并发](docs/sqlite-storage.zh-CN.md) —— WAL 策略、并发 Run 边界、
   evidence 分页/snapshot 与诚实的规模限制。
-- [路线图](docs/roadmap.zh-CN.md) —— runtime 与本地任务工作台如何作为同一个
-  LIPAS 项目推进。
+- [路线图](docs/roadmap.zh-CN.md) —— local-first control plane 如何从单用户产品发展到
+  共享与混合执行。
 - [战略](docs/strategy.zh-CN.md) —— LIPAS 与 LangGraph、AutoGen 的定位、当前缺口、
-  架构护栏以及通往 0.40 的路径。
+  架构护栏以及通往 0.50 的路径。
 - [OpenAI-compatible 模型端点](docs/model-providers.zh-CN.md) —— 通过显式 Chat
   Completions URL、model 与 API key 接入，不使用隐藏 fallback。
 - [实验性 Integration](docs/integrations.zh-CN.md) —— 可选 LangGraph、MCP server、

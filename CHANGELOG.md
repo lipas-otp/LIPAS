@@ -1,5 +1,246 @@
 # Changelog
 
+## Unreleased
+
+No changes recorded yet.
+
+## [0.63.0] — 2026-09-01 · Capability-Complete Local-First Refinement
+
+### Added
+
+- Ollama quickstart and examples now default to `phi4-mini`.
+- Added a concise architecture guide covering the request path, module
+  ownership, authoritative stores, and the deliberate read-only chat versus
+  full Workbench capability boundary.
+- Added a provider-free workspace capability example combining CSV profiling,
+  arithmetic, Markdown conversion, safe archive handling, atomic file writes,
+  and scoped lexical knowledge retrieval.
+- Added regression coverage for the architecture index, invalid workspace
+  argument types, and archive member names that resolve to the extraction root.
+
+### Changed
+
+- Centralized Workbench path, file, digest, evidence, and atomic-write helpers
+  so document, data, archive, and file tools share one policy path.
+- Kept document parsers, computation, archive, web, and knowledge helpers
+  dependency-optional and authority-free; Workbench remains the single place
+  that supplies workspace policy, staging, approval, and evidence.
+- Corrected the package metadata and bilingual documentation indexes to the
+  0.63.0 release line, while retaining 0.60 as a historical milestone.
+
+### Fixed
+
+- Closed ZIP/TAR handles when member validation fails instead of leaking an
+  archive descriptor.
+- Rejected `.` and empty-component archive members that could target the
+  temporary extraction root.
+- Restored strict type-checking for optional XLSX conversion branches and
+  aligned the Python execution sandbox protocol with the shared sandbox type.
+
+## [0.60.0] — 2026-08-30 · Productionized Local-First Single Workspace
+
+### Added
+
+#### 0.60 productionization pass (local-first single workspace)
+
+- Added idempotent `install_workspace()`/`upgrade_workspace()` helpers, a
+  0600 `.installation.json` manifest, atomic permission hardening, and a
+  machine-readable `release check` report. The CLI now exposes `install`,
+  `upgrade`, `backup`, `restore`, and `release check` commands.
+- Added `FileSecretResolver` for atomic local secret rotation and `TLSConfig`
+  for TLS 1.2+ Operator/remote Worker endpoints. Non-loopback servers now fail
+  closed without authentication and TLS.
+- Added bounded `execute_compiled_workflow()` and
+  `LIPASRuntime.execute_workflow()`, which run a compiled plan as one durable
+  Task/Run with step lifecycle events while preserving the Effect bridge for
+  world-changing callbacks.
+- Added Local Web `/api/metrics`, `/api/incidents`, and `/api/cost` projections
+  for operator dashboards.
+- Added a manifest- and SHA-256-verified workspace evidence bundle that
+  captures `workspace.db`, per-Run `runs/**` tapes, and installation metadata;
+  bundle restore stages both control state and evidence under an exclusive
+  lease and rewrites
+  installation paths for a new home. SQLite/Run evidence permissions are
+  hardened to 0600/0700, and MCP JSON-RPC notifications now correctly carry no
+  response id.
+- Workflow execution now renews short leases and persists per-step checkpoints;
+  an expired owner can reclaim the same Run and replay only unfinished steps.
+- Added read-only `WorkspaceStorage.verify_bundle()` and `lipas verify-bundle`
+  for offline manifest/hash/SQLite validation. Bundle restore now writes a
+  durable pending marker and recovers conservatively after a process crash;
+  a mixed old/new workspace is never opened as current.
+- Workflow cancellation is now a first-class result (`cancelled`) and the
+  Runtime settles the underlying durable Run as `CANCELLED`, including when
+  lease heartbeat observes an operator cancellation request.
+- Added `ExecutionSoakReport`/`run_execution_soak()` and the `lipas soak` CLI
+  for bounded local durability rehearsals with terminal-state invariants.
+- Added `ManagedSecretResolver` as an explicit KMS/HSM/secret-manager
+  integration boundary, plus certificate fingerprints and live TLS context
+  reload for Operator and remote Worker servers (including client trust
+  context reload). Managed provider keys can be re-resolved after rotation;
+  custom secret namespaces and bounded fallback redaction are supported. These contracts record
+  deployment evidence but do not claim custody of external keys or provider
+  availability.
+- Added explicit `run_provider_workflow(..., live=True)` evidence for one
+  durable Agent/Task/Run against a real configured provider, with prompt
+  secret rejection, provider/model identity binding, usage aggregation, and
+  terminal outcome classification. Added verified `DesignPartnerSignoff`
+  artifacts so local fixtures cannot be promoted to external acceptance
+  without an operator-supplied partner record.
+
+#### 0.51 · Bounded autonomous workflow compiler
+
+- Added `WorkflowGoal`, `WorkflowConstraint`, and `WorkflowStep` contracts,
+  plus `AutonomousWorkflowCompiler`, which deterministically produces an
+  inspectable `CompiledWorkflow`/`AgentPlan` from a goal and bounded
+  constraints.
+- Fixed and adaptive steps share the existing Plan/Handoff boundary;
+  adaptive steps are explicitly capped and dependency cycles are rejected.
+  Compilation is side-effect free and grants no Task, Run, Effect, or Tool
+  authority. `LIPASRuntime.compile_workflow()` provides the same helper with
+  the Runtime workspace as its default.
+
+#### 0.41 · Conversation kernel
+
+- Added durable `Conversation`, `Message`, and `ConversationEvent` resources
+  to the existing SQLite authority. Message identity, additive schema
+  migration, stable per-conversation cursors, and fail-closed future-version
+  checks are explicit.
+- Added `LIPASRuntime.create_conversation()`, `append_message()`,
+  `conversation_events()`, and idempotent `promote_message_to_task()`. A
+  retried actionable message maps to one deterministic Task/Run.
+
+#### 0.42 · Local Web conversation operator
+
+- Added local Web conversation routes for list/detail/messages/events, explicit
+  event append, and message promotion.
+- Added cursor-based SSE catch-up, stateless HMAC bearer authentication, and
+  bounded content-addressed attachments with SHA-256/idempotent upload
+  semantics. SSE remains a projection, not a second event authority.
+
+#### 0.43 · Hybrid execution
+
+- Added a first-party HTTPS-gated `RemoteWorkerHTTPClient`/
+  `RemoteWorkerHTTPServer` transport with HMAC-SHA256 worker capability
+  attestation, fenced leases, and structured remote results.
+- Worker events, checkpoints, and Effect observations remain persisted by the
+  host-owned Run authority; TLS and key custody remain deployment obligations.
+
+#### 0.44 · Shared team workspace
+
+- Added host-owned `WorkspaceIdentity`, bounded `ApprovalDelegation`, and
+  durable policy/audit boundaries without mailbox authority.
+
+#### 0.45 · Production connector vertical
+
+- Added explicit timeout → uncertain → reconcile evidence, provider request
+  identity, provider references, connector descriptors, and deterministic
+  HTTP/MCP/Email fixtures.
+- `DesignPartnerCase` and `run_design_partner_validation()` produce structured
+  local-fixture reports; they do not count as external partner evidence.
+
+#### 0.46 · Plan/Handoff interoperability
+
+- Added `AgentPlan`/`PlanStep` and external Plan/Handoff boundaries so graph or
+  team hosts can be represented by one scoped LIPAS Run.
+
+#### 0.47 · Observability and evaluation
+
+- Added ExecutionStore-derived `ExecutionMetrics` and `SLOReport` projections
+  with cost, replay, incident, and bounded-window evidence.
+
+#### 0.48 · Extension ecosystem
+
+- Added canonical HMAC-SHA256 artifact/manifest verification before
+  certification. `ExtensionRegistryService` exposes authenticated metadata,
+  registration, revocation, and rollback endpoints without importing or
+  executing package code.
+
+#### 0.49 · Release candidate preparation
+
+- Added integrity-checked, lease-fenced workspace backup/restore. Installer,
+  compatibility policy, and external partner acceptance remain open.
+
+#### 0.50 · Agentic Execution System bridge
+
+- North-star semantics are now explicit in the public API: an
+  `EffectProposal` is admitted by `AgentRuntime.decide_effect()` into an
+  `EffectDecision`; `AgentRuntime.execute_effect()` now passes that decision
+  into the existing LLM/Tool Harness, which persists proposal provenance on
+  the Effect intent and projects a durable `EffectObservation`. It does not
+  create a parallel scheduler.
+- Repeated proposals recover the existing terminal Effect without a second
+  provider/tool call. Intent-only Effects project as `uncertain`; they cannot
+  be reported as successful until reconciliation closes the orphan.
+- Runtime admission now validates capability iterables, boolean approval
+  inputs, and finite non-negative budget snapshots. Effect contracts expose
+  structural `as_dict()` views for host-side audit/export without claiming
+  that serialization itself grants authority.
+- Proposal provenance is namespaced on the intent and preserves `caused_by`;
+  arbitrary metadata cannot shadow reserved audit fields. Orphan reconciliation
+  accepts the product-facing proposal identity and still closes the mapped
+  historical claim exactly once. Reusing an identity with changed provenance
+  now fails closed instead of silently returning the old result.
+- Approval/replay identity is now bound to the request payload and causal
+  parent, including direct Action Gateway and LLM/Tool Harness redelivery.
+- HTTP provider request identity is explicit and separate from the operation
+  idempotency key; blank identities and redirected external writes fail closed
+  as `uncertain`. LangGraph/OpenClaw adapters reject blank fallback identities.
+- Input interrupts now have a distinct Local Web answer action instead of being
+  presented as approval, and an empty execution window cannot be reported as a
+  healthy SLO.
+- LangGraph tool calls and MCP notifications now fail closed without a stable
+  replay identity; Email reconciliation cannot promote a found result without
+  a provider reference; Run creation re-checks Task state inside its write
+  transaction.
+- The 0.41 conversation projection now rejects cross-conversation Task/Run
+  ownership conflicts instead of allowing ambiguous links.
+- The 0.43 remote boundary accepts structured `RemoteExecutionResult` values
+  and persists worker events, fenced checkpoints, and Effect observations before
+  settling the canonical Run.
+- Release 0.44 adds the SQLite-backed `WorkspacePolicyStore` for identity,
+  delegation, revocation, and policy audit.
+- Release 0.45 adds connector descriptors and a bounded process-local rate
+  limiter.
+- Release 0.46 adds `ExternalRunEnvelope`/`execute_external()` so a LangGraph
+  or AutoGen host can be represented by one LIPAS Run.
+- Release 0.47 adds cost, incident, evaluation, and bounded SLO projections.
+- Release 0.48 adds host trust policy, real HMAC signer verification,
+  authenticated registry metadata/revocation endpoints, and rollback.
+- Release 0.49 adds integrity-checked, lease-fenced workspace backup/restore.
+  These releases do not imply an installer, hosted tenancy, or external
+  partner acceptance.
+- Release 0.50 adds `LIPASRuntime.execute_effect_for_run()`, which clones a Harness
+  onto the Run-owned durable evidence tape and closes the proposal→observation
+  persistence gap without changing the low-level compatibility bridge.
+
+### Fixed
+
+- Concurrent first opens of a file-backed SQLite workspace now retry WAL mode
+  selection within the shared busy policy instead of surfacing a spurious
+  `database is locked` during connection bootstrap.
+- Local operator shutdown tests now tolerate the expected reset/refusal race
+  when the final wake-up connection arrives as the server is closing.
+- Resource accounting now rejects non-finite/overflowing aggregates before
+  folding claims; Run-scoped Harness clones reset replay bookkeeping so
+  evidence tapes cannot share mutable cursor state.
+- Workflow constraints are canonicalized and copied to every compiled step;
+  equivalent dependency declarations produce stable plan fingerprints.
+- Workspace policy and extension-registry startup now check future schema
+  versions before creating business tables, and all projected event kinds
+  reject CR/LF so reconnectable SSE cannot be used as a field-injection
+  channel.
+- Benchmark value objects now reject non-representable counters and report
+  only finite throughput values.
+
+### Verification
+
+- Added restart/migration, duplicate promotion, cursor catch-up, execution
+  projection, and local Web conversation route tests.
+- The full suite passes 825 tests; Ruff, mypy, compileall, and whitespace
+  checks pass as well. Real loopback TLS rotation, external provider custody,
+  and design-partner acceptance remain deployment evidence obligations.
+
 ## [0.40.0] — 2026-08-24 · Local Operator & Recovery Beta
 
 ### Added

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from importlib import import_module
+import asyncio
+import inspect
 from pathlib import Path
 import re
 from urllib.parse import unquote
@@ -62,9 +64,13 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
         "examples.10_research_review_team",
         "examples.11_durable_execution",
         "examples.12_local_task_product",
-    ):
-        module = import_module(module_name)
-        module.main()
+        "examples.15_external_connectors",
+        "examples.16_workspace_capabilities",
+        ):
+            module = import_module(module_name)
+            result = module.main()
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
 
     output = capsys.readouterr().out
     assert "live executions after replay: 1" in output
@@ -81,6 +87,10 @@ def test_offline_lessons_run_from_a_fresh_directory(tmp_path, monkeypatch, capsy
     assert "change set state: ready" in output
     assert "applied files: ['note.txt']" in output
     assert "original after apply: after" in output
+    assert "mcp:" in output
+    assert "csv rows: 2" in output
+    assert "calculation: 21" in output
+    assert "knowledge hits: 1" in output
 
 
 def test_documentation_local_links_resolve():
@@ -126,3 +136,14 @@ def test_lesson_catalogues_and_tutorial_cover_every_numbered_example():
     assert "examples/12_local_task_product.py" in tutorial_zh
     assert not Path("docs/getting-started.md").exists()
     assert not Path("docs/getting-started.zh-CN.md").exists()
+
+
+def test_architecture_guides_keep_the_authority_map_visible():
+    english = Path("docs/architecture.md").read_text(encoding="utf-8")
+    chinese = Path("docs/architecture.zh-CN.md").read_text(encoding="utf-8")
+    for text in (english, chinese):
+        assert "Agent" in text
+        assert "Workbench" in text
+        assert "ExecutionStore" in text
+        assert "OperationJournal" in text
+        assert "Claim" in text

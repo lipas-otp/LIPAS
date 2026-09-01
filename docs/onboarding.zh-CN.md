@@ -1,11 +1,67 @@
 # 面向生产的安装与 onboarding
 
-LIPAS 0.40 是 local-first。推荐先使用不依赖 provider 的路径，验证 storage、sandbox、
+LIPAS 0.63 是 local-first。推荐先使用不依赖 provider 的路径，验证 storage、sandbox、
 审批、恢复和交付，再配置可能产生费用的模型或 connector：
+
+## 五分钟首次试用
+
+如果从源码 checkout 开始，先使用隔离的虚拟环境和专门的试用 home：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[all]'
+mkdir -p ~/lipas-demo
+cd ~/lipas-demo
+lipas install --home ~/.lipas-demo --sandbox auto
+lipas doctor --home ~/.lipas-demo
+lipas tour --offline
+```
+
+离线 tour 不需要模型、provider 账号或网络访问，是最推荐的第一个成功标准。
+如果 `doctor` 报告 Bubblewrap 不可用，仍可先完成离线 tour；只有在临时 workspace
+中处理可信代码、并明确接受不隔离 fallback 时，才使用 `--sandbox local`。
+
+之后若要试用本地模型，启动 Ollama、准备模型，再执行一次有界 prompt：
+
+```bash
+ollama pull gemma4:12b
+lipas model list
+lipas chat --model gemma4:12b \
+  --session ~/.lipas-demo/runs/chat.db \
+  --once "用三句话解释 local-first control plane。"
+```
+
+模型名也可以直接写在 `chat` 后面，适合快速试用：
+
+```bash
+lipas chat phi4-mini --once "用一句话介绍你自己"
+```
+
+本地 Ollama 默认直连，不会读取 shell 中的 `HTTP(S)_PROXY`/`ALL_PROXY`，
+因此不会被不兼容的代理配置挡住。连接远程 Ollama 且确实需要代理时，显式加上
+`--trust-env`。
+
+内置 Chat 默认会把上下文记在 `~/.lipas/runs/chat.db`；一次性试用可加
+`--no-memory`。这里保存的是当前会话的完整消息历史（用户消息、助手回复和工具结果），
+不是模型的隐式个人记忆；目前还没有自动摘要或向量检索，因此超长对话仍受模型上下文窗口
+限制。如果希望它读取项目文件或提取 PDF 文本，可显式加上 `--workspace .`，这只提供
+受边界保护的只读文件工具；写入、格式转换和命令执行仍应使用 Task Workbench。
+交互式 REPL 中的 `:memory` 可查看会话记忆，`:runtime` 可查看当前目录与能力边界。
+
+Chat 还会提供只读的 `get_runtime_info` 工具，返回真实的当前目录、选定 workspace、会话
+身份、记忆模式和能力边界。询问目录或能力时，模型必须以这些运行时事实为准，不能笼统声称
+“没有文件系统”。Chat 本身没有写入和 shell 权限；需要修改文件时使用
+`lipas task start <目标> <workspace>`，再明确审核并应用生成的 ChangeSet。
+
+例如：`lipas chat phi4-mini --workspace . --once "列出 Python 文件并概括入口"`。
+
+## 标准安装与 readiness
 
 ```bash
 python -m pip install 'lipas[all]'
-mkdir -p ~/.lipas
+lipas install --home ~/.lipas --sandbox auto
+lipas release check --home ~/.lipas
 lipas doctor --home ~/.lipas --json
 lipas tour --offline
 ```
@@ -24,6 +80,22 @@ lipas migrate verify --home ~/.lipas
 lipas audit --home ~/.lipas --repair
 ```
 
+生产环境也可以直接使用幂等的 `lipas upgrade --home ~/.lipas`；它会写入
+`.installation.json`，不会删除保留的 legacy 或 pre-restore backup。`lipas backup`
+与 `lipas restore` 使用 SQLite online-backup 和 integrity check；restore 会与活动
+Runtime fencing，并要求显式确认参数。
+
+需要完整迁移（包括每个 Run 的证据）时，显式创建 bundle：
+
+```bash
+lipas backup --home ~/.lipas --destination /safe/lipas-bundle --include-evidence
+lipas restore --home ~/.lipas-restored --source /safe/lipas-bundle --yes
+```
+
+bundle 包含 `workspace.db`、`runs/**`（包括每个 Run 的 `claims.db`）和安装元数据；
+manifest 记录文件大小、SHA-256 与 SQLite integrity。恢复到新 home 时会重写安装路径，
+并默认保留 rollback bundle。
+
 启用 external connector 前必须确认 egress allowlist、稳定幂等 key、provider lookup/
 reconciliation、审批中的 scope/preview/diff/budget，以及一次 provider-free 故障演练。
 Local operator 提供 `/api/approvals`、`/api/operations` 与
@@ -31,6 +103,35 @@ Local operator 提供 `/api/approvals`、`/api/operations` 与
 operator 明确决定；每次 operation closeout 都必须记录 observation，found 时还必须
 记录 provider reference，Run reopen 则必须记录 evidence 对象。它绝不会由 timeout 或
 单独的布尔确认自动推断。
+
+本地密钥可以由 `FileSecretResolver` 管理：业务数据只保存
+`secret://file/NAME` 引用，文件以 0600 权限原子轮换。任何非 loopback 的 Operator
+或 remote Worker bind 都必须配置 `TLSConfig`（TLS 1.2+ 证书/私钥）并保持认证开启；
+loopback HTTP 只用于开发 fixture。
+
+邀请 partner 前可以先运行可重复的 fixture harness：
+
+```python
+from lipas import DesignPartnerCase, run_design_partner_validation
+
+report = run_design_partner_validation(
+    "local-fixture",
+    [
+        DesignPartnerCase("repo", "Repository maintenance", "inspect, patch, verify"),
+        DesignPartnerCase("mail", "Controlled email", "draft, approve, send, reconcile"),
+    ],
+    lambda case: {
+        "run_id": "fixture-" + case.case_id,
+        "success": True,
+        "unsafe_delivery": False,
+        "operator_accepted": True,
+    },
+)
+assert report.evidence_scope == "local_fixture"
+```
+
+这只验证报告格式和 operator workflow，不是 partner 证据；外部 partner 必须使用自己的
+账号执行同样的 case，并对脱敏证据包签字确认。
 
 ## Design partner 验证
 

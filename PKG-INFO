@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: lipas
-Version: 0.40.0
-Summary: LIPAS — trustworthy Agent execution with durable recovery, staged delivery, business Scenarios, and explicit capability contracts.
+Version: 0.63.0
+Summary: LIPAS — a trustworthy Agent Operating Runtime with durable recovery, explicit Effect admission, staged delivery, business Scenarios, and capability contracts.
 Project-URL: Homepage, https://github.com/lipas-otp/lipas
 Project-URL: Repository, https://github.com/lipas-otp/lipas
 Project-URL: Changelog, https://github.com/lipas-otp/lipas/blob/main/CHANGELOG.md
@@ -208,7 +208,7 @@ License:                                  Apache License
            See the License for the specific language governing permissions and
            limitations under the License.
 License-File: LICENSE
-Keywords: agent,agent-coordination,agent-runtime,audit,budget,business-scenarios,chat-completions,llm,local-agent,multi-agent,openai-compatible,react,replay,side-effects,task-agent,tool-use
+Keywords: agent,agent-coordination,agent-runtime,audit,budget,business-scenarios,chat-completions,effect-observation,effect-proposal,extension-sdk,fault-injection,llm,local-agent,local-web,multi-agent,openai-compatible,react,replay,side-effects,task-agent,tool-use
 Classifier: Development Status :: 3 - Alpha
 Classifier: Intended Audience :: Developers
 Classifier: License :: OSI Approved :: Apache Software License
@@ -245,11 +245,14 @@ Description-Content-Type: text/markdown
 
 > Language: [English](README.md) | [中文](README.zh-CN.md)
 
-LIPAS is a local trustworthy task agent for individuals and small teams. It
-works inside a selected workspace, asks before risky actions, survives
-interruptions, verifies the result, and delivers evidence instead of merely
-ending a chat. Its Python runtime is the internal reliability foundation and
-an optional advanced embedding surface.
+LIPAS is a trustworthy Agent execution and delivery platform with a
+local-first control plane. It works inside a selected workspace, asks before
+risky actions, survives interruptions, verifies the result, and delivers
+evidence instead of merely ending a chat. The model and execution provider may
+be local or an explicitly configured remote endpoint; authority, policy, and
+evidence remain controlled by the host. The same contracts serve individual
+users, small teams, and applications that need a path toward shared or hybrid
+execution.
 
 ```text
 Agent  = one assistant that thinks and uses tools
@@ -258,7 +261,16 @@ AgentCoordinator = ExecutionStore-backed ownership across named members
 Team   = the legacy mailbox compatibility facade
 ```
 
-> **0.40.0 local operator and recovery beta.** `AgentCoordinator` now maps every
+> **0.63.0 capability-complete local-first refinement.** The
+> repository-side 1.0 hardening pass is now available: idempotent install and
+> upgrade, integrity-checked backup/restore bundles, bounded durability soak,
+> TLS context rotation, managed-secret integration boundaries, explicit live
+> provider workflow evidence, and digest-verified design-partner signoff
+> artifacts. These contracts are implemented and tested locally; real provider
+> accounts, external key custody, loopback-capable TLS drills, and partner
+> acceptance still require deployment evidence.
+
+> **Historical 0.40.0 local operator and recovery beta.** `AgentCoordinator` now maps every
 > handoff to one deterministic Task/Run under the existing `ExecutionStore`.
 > Sequential, RoundRobin, bounded parallel, map/reduce, durable Selector, and
 > bounded Swarm policies therefore share one lease, cancellation, event, and
@@ -273,7 +285,7 @@ Team   = the legacy mailbox compatibility facade
 > idempotent append, bounded pages, and rebuildable projection snapshots. The
 > 18 Scenarios and 17 instruction-only Skills from 0.35 remain available.
 
-> **0.40.0 is now shipped.** `LocalWebOperator` exposes the same Task/Run/
+> **Historical 0.40.0 shipped.** `LocalWebOperator` exposes the same Task/Run/
 > Interrupt/event projections over a loopback HTTP boundary; `/` serves a small
 > dependency-free browser projection, mutation routes
 > require a bearer token. `FaultCampaign` and `benchmark_execution_store()`
@@ -282,16 +294,96 @@ Team   = the legacy mailbox compatibility facade
 > safe task cancellation/approval aliases, reusable fault plans, and a
 > multi-connection SQLite contention probe.
 
-## One system, two layers
+> **0.41 Conversation kernel.** Durable Conversation/Message identities,
+> unified cursors, and idempotent message → Task/Run promotion are available in
+> the local-first authority.
+
+> **0.42 Local Web operator.** The browser adds authenticated SSE catch-up,
+> approval/input cards, tool activity, diffs, reports, and safe attachments;
+> it remains a local projection rather than hosted tenancy.
+
+The following releases expose independent Python contracts:
+
+- **0.43** — `RemoteWorkerRunner` and its HTTPS transport provide fenced leases,
+  capability attestation, checkpoints, and remote Effect observations.
+- **0.44** — `WorkspaceIdentity`, `ApprovalDelegation`, and
+  `WorkspacePolicyStore` provide scoped shared-workspace policy.
+- **0.45** — HTTP/MCP/Email connectors provide provider request identity,
+  idempotency, and timeout → uncertain → reconcile recovery.
+- **0.46** — `AgentPlan`/`PlanStep` and `ExternalRunEnvelope` define the
+  LangGraph/AutoGen Plan/Handoff boundary.
+- **0.47** — `measure_execution()` provides bounded cost, metrics, replay,
+  incident, and SLO projections.
+- **0.48** — `ExtensionSigner`, `ExtensionRegistry`, and
+  `ExtensionRegistryService` provide provenance and offline certification.
+
+**0.49** added integrity-checked backup/restore. **0.50** adds the Runtime bridge from
+`EffectProposal` through Harness to durable `EffectObservation`; its full
+autonomous-workspace gate remains open. **0.51** adds a side-effect-free
+bounded workflow compiler for inspectable fixed steps and explicitly capped
+adaptive steps. See the
+[independent release gates](docs/roadmap.md#release-gates-one-independent-gate-per-release).
+For the final deployment runbook, see the [1.0 release checklist](docs/release-checklist.md).
+The production probe surface includes `run_provider_workflow(..., live=True)`,
+`lipas soak`, certificate-context reload, managed KMS/HSM secret resolution,
+and digest-verified design-partner signoff artifacts.
+
+## The 0.50 direction: Agent Operating Runtime
+
+LIPAS is converging on an **Agentic Execution System**: Codex/WorkBuddy agency
+in a real workspace, LangGraph-style durable orchestration, AutoGen/Microsoft
+Agent Framework collaboration patterns, and LIPAS Runtime Semantics underneath.
 
 ```text
-LIPAS business and product layer (0.40.0 SQLite-first runtime)
+Agent proposes Effect
+        ↓
+Runtime admits by policy, budget, capability, and approval
+        ↓
+Harness / Tool / Connector / Worker acts
+        ↓
+Observation → Artifact / Report → verified Delivery
+```
+
+The same semantics support deterministic workflow steps and autonomous
+agentic steps. Agents, graph nodes, and members propose work; they do not
+directly own world-changing authority. `EffectProposal`, `EffectDecision`, and
+`EffectObservation` are the public contracts for this 0.50 boundary. The
+Runtime bridge now passes an admitted proposal into the existing Harness,
+which folds the proposal identity into the Run's Effect intent and returns an
+observation from the durable Claim tape. A repeated proposal replays its
+terminal result; an intent without a terminal claim remains `uncertain` and
+cannot be reported as success. Proposal metadata is namespaced so it cannot
+shadow reserved audit fields, and `caused_by` remains a durable causal link.
+After a crash, reconciliation can address the proposal id or its mapped claim
+id and closes the orphan without a second live submission.
+Proposal identity is immutable evidence: reusing it with changed provenance
+or causation fails closed. The gateway also binds a pending approval to the
+tool and argument digest, so approval cannot be replayed onto a different
+payload.
+
+```python
+observation = await runtime.execute_effect(
+    proposal,
+    harness=tool_harness,
+    target=ToolTarget(send_email, {"to": "user@example.com"}),
+    available_capabilities={"email.send"},
+    approved=True,
+)
+```
+
+## One system, a local-first control plane
+
+```text
+LIPAS control and product layer (0.63.0 local-first runtime)
   Scenario / Skill / Task / Workspace / Approval / Artifact / Local Web operator
                               │
                               ▼
 LIPAS Python runtime (available today)
   Agent / Tool / Effect / Guard / Budget / Replay / Execution / Operation
   AgentCoordinator / legacy Team
+                              │
+                              ▼
+Execution providers (local sandbox, explicit model endpoint, future worker)
 ```
 
 The workbench is the first-party way to use LIPAS for workspace tasks such as
@@ -299,6 +391,13 @@ inspecting files, making controlled changes, running checks, and delivering a
 report. The Python API remains independently useful for applications that need
 their own domain model or interface. Both layers share the same Effects and
 audit record; the workbench does not create a second execution model.
+
+Workspace capabilities include bounded PDF/PPTX reading, TXT/Markdown/HTML/
+JSON/CSV/DOCX/XLSX conversion, ZIP/TAR inspection and safe extraction, CSV
+profiling, arithmetic calculation, and an approval-gated temporary Python
+worker. Provider-facing applications can add the allowlisted `fetch_url` Tool
+and the scope-filtered `KnowledgeStore` retrieval context; neither silently
+grants network or account access.
 
 Applications can open those layers through one lifecycle owner:
 
@@ -319,10 +418,12 @@ with LIPASRuntime.open(".lipas") as runtime:
 The global control and product tables live in `.lipas/workspace.db`. Each Run
 keeps its Claim/Effect tape under `.lipas/runs/<run-id>/claims.db`, preserving
 budget and replay isolation without creating another Task/Run state machine.
-SQLite remains the deliberate local engine: WAL keeps readers moving, write
-transactions stay short, `synchronous=FULL` protects the durable default, and
-per-Run evidence files remove unnecessary global hotspots. It is a bounded
-single-writer design, not a disguised distributed database; see
+SQLite remains the deliberate local control-plane engine: WAL keeps readers
+moving, write transactions stay short, `synchronous=FULL` protects the durable
+default, and per-Run evidence files remove unnecessary global hotspots. It is a
+bounded single-writer design, not a disguised distributed database. A remote
+model endpoint does not become the authority, and a future remote worker must
+return through the same Run, Effect, policy, and evidence contracts; see
 [SQLite storage and concurrency](docs/sqlite-storage.md).
 Legacy workspaces are never changed on open: inspect and migrate them with
 `lipas migrate plan` and `lipas migrate apply --yes`. Migration and rollback
@@ -334,6 +435,50 @@ Agent calls, conversational Sessions, and durable Runs also share
 `RunContext`, `AgentEvent`, cancellation, deadlines, and event cursors. See
 [Unified runtime contracts](docs/runtime-contracts.md) for the authority and
 compatibility boundaries.
+
+## Conversation is the front door
+
+LIPAS already supports a persisted conversational REPL:
+
+```bash
+lipas chat --model gemma4:12b --session runs/chat.db
+```
+
+The next product slice is to make that conversation the front door to the
+same control plane used by workspace Tasks. A conversation is not a second
+Agent or permission system:
+
+```text
+Conversation / chat message
+          │
+          ├── answer-only turn → Session / RunHandle
+          ├── actionable request → Task / durable Run
+          ├── risky operation → Approval or Input Interrupt
+          └── completed work → diff / verification / report / delivery
+```
+
+Release 0.41 supplies the conversation kernel: messages have stable IDs and
+an actionable message can be promoted idempotently to one deterministic
+Task/Run. Release 0.42 supplies the local Web projection:
+`/api/conversations/<id>/events` provides a cursor-based stream for model
+deltas, tool activity, approval/input cards, diffs, reports, and durable
+AgentEvents. The Python API remains available for embedding the identical
+flow in a desktop app, notebook, service, or another chat host.
+
+```python
+with LIPASRuntime.open(".lipas", sandbox="local") as runtime:
+    chat = runtime.create_conversation(title="Release check")
+    message = runtime.append_message(
+        chat.id, role="user", content="inspect the release", message_id="msg-1",
+    )
+    task, run, message = runtime.promote_message_to_task(chat.id, message.id)
+    page = runtime.conversation_events(chat.id, limit=100)
+```
+
+The dependency-free Web preview is started with `runtime.operator(...)` and
+uses the same Task/Run/Approval/Effect contracts as the CLI and Python host.
+Clients should persist the returned `message_id` and `next_cursor`; retries
+then become ordinary idempotent writes and catch-up reads.
 
 ## The one idea underneath
 
@@ -369,6 +514,10 @@ For the precise guarantees and limits, read the short [Execution
 model](docs/execution-model.md).
 
 ## Start here
+
+For the lowest-risk first run, follow the provider-free
+[five-minute onboarding path](docs/onboarding.md#five-minute-first-use) before
+connecting a model.
 
 ```bash
 pip install 'lipas[ollama]'
@@ -493,13 +642,16 @@ workflow.
 durable event cursors expose normalized run/model/tool events; adapters that
 produce real deltas surface them through the same `AgentEvent` protocol.
 
-## Local workspace tasks (0.40 product beta)
+## Local and hybrid workspace tasks (0.63 product)
 
 The historical 0.31.0 slice made the local-task vertical use the unified runtime by
-default. The current 0.40 product beta
+default. The current 0.63 product release
 reuses the same `ExecutionStore` and Effect tape from a separate product layer;
 Workspace, Artifact, and Report concepts do not leak back into the Agent
-runtime. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
+runtime. The workspace and control state remain local by default, while the
+model may be local Ollama or an explicit OpenAI-compatible endpoint. A
+multi-machine worker pool is a future execution tier, not an implicit fallback
+in 0.63. State defaults to `~/.lipas` and can be changed with `LIPAS_HOME` or
 `--home`.
 
 ```bash
@@ -581,12 +733,13 @@ explicitly reopen the Run before resume. `LLMHarness.reconcile_orphan()` and
 `ToolHarness.reconcile_orphan()` close intent-only Effects without issuing an
 unverified second request.
 
-## Experimental interoperability
+## Interoperability and execution boundaries
 
-LIPAS develops its own task product first. LangGraph, MCP-server, and
-OpenCrew/OpenClaw adapters are experimental compatibility samples: they are
-not core product surfaces and carry no compatibility commitment. The HTTP and
-MCP clients are first-party capability boundaries. See the
+LIPAS owns the execution and delivery contracts rather than a particular
+model-hosting topology. LangGraph, MCP-server, and OpenCrew/OpenClaw adapters
+remain compatibility boundaries, not alternate authorities or complete copies
+of those frameworks. The HTTP and MCP clients are first-party capability
+boundaries. See the
 [integration guide](docs/integrations.md) for both.
 
 ## Business Skills and Scenarios
@@ -646,12 +799,14 @@ lipas effects runs/chat.db
 ```
 
 From a source checkout before installation, use `python -m lipas.cli` instead.
-The session file is created automatically. Ollama is local but accessed through
-its local HTTP service; a timeout means the local daemon/model did not answer
-in time, not that LIPAS contacted the internet.
+The session file is created automatically. Ollama is one local execution option;
+LIPAS also supports explicit remote-compatible endpoints without moving task
+authority or evidence out of the host workspace.
 
 ## Read only what you need
 
+- [Architecture at a glance](docs/architecture.md) — the request path, module
+  ownership, authoritative stores, and entry-point decision guide.
 - [LIPAS, step by step](docs/tutorial.md) — the recommended linear tutorial,
   from one Agent through complete projects.
 - [Execution model](docs/execution-model.md) — the exact semantics and limits
@@ -660,10 +815,10 @@ in time, not that LIPAS contacted the internet.
   coordination policies, cancellation, replay, and remaining limits.
 - [SQLite storage and concurrency](docs/sqlite-storage.md) — WAL policy,
   concurrent Run boundaries, evidence paging/snapshots, and honest scale limits.
-- [Roadmap](docs/roadmap.md) — how the runtime and local task workbench advance
-  as one LIPAS project.
+- [Roadmap](docs/roadmap.md) — how the local-first control plane grows from a
+  single-user product into shared and hybrid execution.
 - [Strategy](docs/strategy.md) — LIPAS's position alongside LangGraph and
-  AutoGen, current gaps, architectural guardrails, and the path to 0.40.
+  AutoGen, current gaps, architectural guardrails, and the path to 0.50.
 - [OpenAI-compatible model endpoints](docs/model-providers.md) — connect an
   explicit Chat Completions URL, model, and API key without hidden fallback.
 - [Experimental integrations](docs/integrations.md) — optional LangGraph,

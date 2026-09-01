@@ -134,6 +134,57 @@ def test_http_maps_json_body_and_rejects_duplicate_pending_submission(tmp_path):
     pending.close()
 
 
+def test_http_rejects_empty_ids_and_binds_provider_identity(tmp_path):
+    journal = OperationJournal(tmp_path / "identity-http.db")
+    client = _HttpxLike()
+    http = HttpClient(
+        base_url="https://api.example.test/v1",
+        egress=EgressPolicy(frozenset({"api.example.test"})),
+        journal=journal,
+        client=client,
+    )
+
+    # The fake succeeds, so the first call is terminal; use it to assert the
+    # durable identity and then verify a changed provider id is rejected.
+    async def successful():
+        with pytest.raises(ValueError, match="request_id"):
+            await http.request("GET", "health", request_id="")
+        response = await http.request(
+            "POST", "messages", json_body={"text": "identity"},
+            request_id="provider-request-1", idempotency_key="operation-1",
+        )
+        assert response.status_code == 200
+        with pytest.raises(ValueError, match="different operation"):
+            await http.request(
+                "POST", "messages", json_body={"text": "identity"},
+                request_id="provider-request-2", idempotency_key="operation-1",
+            )
+
+    asyncio.run(successful())
+    operation = journal.get("operation-1")
+    assert operation is not None
+    assert operation.provider_request_id == "provider-request-1"
+    assert client.calls[0]["headers"]["X-Request-ID"] == "provider-request-1"
+    assert client.calls[0]["headers"]["Idempotency-Key"] == "operation-1"
+    journal.close()
+
+
+def test_operation_provider_identity_cannot_be_reused_by_another_key(tmp_path):
+    journal = OperationJournal(tmp_path / "provider-identity.db")
+    journal.prepare(
+        key="operation-a", kind="http_request", request={"url": "https://a"},
+        provider_request_id="provider-a",
+    )
+    with pytest.raises(ValueError, match="provider_request_id"):
+        journal.prepare(
+            key="operation-b", kind="http_request", request={"url": "https://b"},
+            provider_request_id="provider-a",
+        )
+    with pytest.raises(ValueError, match="provider_reference"):
+        journal.settle("operation-a", result={"ok": True}, provider_reference=" ")
+    journal.close()
+
+
 def test_http_cancellation_preserves_cancelled_error_but_marks_uncertain(tmp_path):
     class BlockingHttp:
         async def request(self, method, url, **kwargs):
@@ -159,6 +210,32 @@ def test_http_cancellation_preserves_cancelled_error_but_marks_uncertain(tmp_pat
 
     asyncio.run(run())
     operation = journal.get("cancel-1")
+    assert operation is not None and operation.state == "uncertain"
+    journal.close()
+
+
+def test_http_write_redirect_is_uncertain_not_success(tmp_path):
+    class RedirectHttp:
+        async def request(self, method, url, **kwargs):
+            return _Response(302, {"location": "https://other.example.test"}, b"", url)
+
+    journal = OperationJournal(tmp_path / "redirect-http.db")
+    http = HttpClient(
+        base_url="https://api.example.test/v1",
+        egress=EgressPolicy(frozenset({"api.example.test"})),
+        journal=journal,
+        client=RedirectHttp(),
+    )
+
+    async def run():
+        with pytest.raises(HttpOperationUncertain):
+            await http.request(
+                "POST", "messages", json_body={"text": "redirect"},
+                idempotency_key="redirect-1",
+            )
+
+    asyncio.run(run())
+    operation = journal.get("redirect-1")
     assert operation is not None and operation.state == "uncertain"
     journal.close()
 
@@ -214,6 +291,31 @@ def test_email_provider_rejection_is_terminal_failure(tmp_path):
     assert operation.state == "failed"
 
 
+def test_email_provider_rejection_without_reference_is_terminal_failure(tmp_path):
+    class RejectingMail:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send(self, message, *, idempotency_key):
+            self.calls += 1
+            return {"accepted": False, "reason": "policy"}
+
+        def lookup(self, *, idempotency_key):
+            return (False, None, None)
+
+    provider = RejectingMail()
+    journal = OperationJournal(tmp_path / "mail-rejected-no-reference.db")
+    connector = EmailConnector(provider, journal)
+    operation = connector.send(
+        EmailMessage("bot@example.test", ("owner@example.test",), "No", "No"),
+        idempotency_key="draft-rejected-no-reference",
+        approved=True,
+    )
+    assert operation.state == "failed"
+    assert provider.calls == 1
+    journal.close()
+
+
 def test_email_provider_without_reference_is_uncertain(tmp_path):
     class NoReference:
         def send(self, message, *, idempotency_key):
@@ -231,6 +333,31 @@ def test_email_provider_without_reference_is_uncertain(tmp_path):
             approved=True,
         )
     operation = journal.get("mail-no-reference")
+    assert operation is not None and operation.state == "uncertain"
+    journal.close()
+
+
+def test_email_reconcile_without_reference_stays_uncertain(tmp_path):
+    class LookupWithoutReference(_Mail):
+        def send(self, message, *, idempotency_key):
+            self.calls += 1
+            raise TimeoutError("provider timeout")
+
+        def lookup(self, *, idempotency_key):
+            return (True, {"accepted": True}, None)
+
+    provider = LookupWithoutReference()
+    journal = OperationJournal(tmp_path / "mail-reconcile-no-reference.db")
+    connector = EmailConnector(provider, journal)
+    with pytest.raises(RuntimeError, match="uncertain"):
+        connector.send(
+            EmailMessage("bot@example.test", ("owner@example.test",), "No", "No"),
+            idempotency_key="mail-reconcile-no-reference",
+            approved=True,
+        )
+    with pytest.raises(ValueError, match="provider_reference"):
+        connector.reconcile("mail-reconcile-no-reference")
+    operation = journal.get("mail-reconcile-no-reference")
     assert operation is not None and operation.state == "uncertain"
     journal.close()
 
@@ -261,6 +388,8 @@ def test_mcp_client_transport_boundary():
         client = MCPClient(send)
         assert await client.initialize() == {"server": "test"}
         assert await client.list_tools() == ()
+        with pytest.raises(TypeError, match="arguments"):
+            await client.call_tool("lookup", "not-a-mapping")  # type: ignore[arg-type]
         result = await client.call_tool("lookup", {"id": "1"}, request_id="lookup-1")
         assert result["isError"] is False
 

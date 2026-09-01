@@ -22,11 +22,107 @@ The `lipas` executable is installed with the package. While working directly
 from a source checkout before installation, use `python -m lipas.cli` in its
 place, for example `python -m lipas.cli chat --model gemma4:12b`.
 
+## Install and maintain one local workspace
+
+The 0.63/1.0 local-first path uses an explicit manifest and copy-on-write
+storage operations:
+
+```bash
+lipas install --home ~/.lipas --sandbox auto
+lipas release check --home ~/.lipas
+lipas backup --home ~/.lipas --destination /safe/path/lipas.db
+lipas backup --home ~/.lipas --destination /safe/path/lipas-bundle --include-evidence
+lipas verify-bundle --source /safe/path/lipas-bundle
+lipas soak --home ~/.lipas --iterations 10000 --json
+lipas restore --home ~/.lipas --source /safe/path/lipas.db --yes
+lipas restore --home ~/.lipas --source /safe/path/lipas-bundle --yes
+lipas upgrade --home ~/.lipas
+```
+
+`install` is idempotent and creates `.installation.json`, `workspace.db`, and
+the `runs/` evidence directory with restrictive permissions. `upgrade` applies
+legacy migration only when required and never deletes the previous state.
+`release check` is read-only; a failed check must be resolved before exposing
+the operator beyond loopback. Restore requires `--yes` and preserves a
+pre-restore backup by default.
+The default backup is a single SQLite file for compatibility. Use
+`--include-evidence` to create a directory bundle containing `workspace.db`,
+all `runs/**` evidence (including per-Run `claims.db` tapes), and a manifest
+with file sizes, SHA-256 hashes, and SQLite integrity checks. Restoring a
+directory source automatically uses the bundle restore path and preserves a
+rollback bundle by default.
+`verify-bundle` performs the same manifest, path, hash, and SQLite integrity
+checks without modifying the destination workspace, so it can be used before
+copying a bundle to removable or offline storage.
+`soak` repeatedly exercises local durable Task/Run transitions and checks that
+each Run reaches a terminal state. Its report is local durability evidence,
+not a model/provider SLA; use `--duration` with a large iteration cap for a
+time-bounded rehearsal.
+
 For a one-off, tool-less local conversation:
 
 ```bash
 lipas chat --model gemma4:12b --session runs/try.db
 ```
+
+See which local models are installed with `lipas model list` (or the shortcut
+`lipas chat list`).
+
+The model can also be supplied positionally for a faster first run:
+
+```bash
+lipas chat phi4-mini --once "Say hello in one sentence"
+```
+
+Local Ollama connections ignore ambient `HTTP(S)_PROXY`/`ALL_PROXY` settings
+by default, so a shell proxy cannot prevent the local client from starting.
+When connecting to a remote Ollama host through a proxy, opt in with
+`--trust-env`.
+
+The built-in chat remembers the conversation in `~/.lipas/runs/chat.db` by default. Use
+`--session PATH --session-id NAME` for a separate memory, or `--no-memory` for
+a one-off in-memory turn. This is complete message-history memory (user turns,
+assistant replies, and tool results), not hidden personal memory: automatic
+summarisation and vector/semantic retrieval are not enabled yet, so a very long
+conversation remains subject to the selected model's context window. `:about`,
+`:memory`, `:runtime`, `:reset`, `:tools`, and `:help` are available inside the REPL.
+
+Chat also exposes a read-only `get_runtime_info` tool. It reports the actual
+working directory, selected workspace, session identity, memory mode, and
+capability boundary. The model must use those facts for location/capability
+questions rather than inventing a generic "no filesystem" limitation. Chat
+does not expose write or shell authority; use `lipas task start <goal>
+<workspace>` for staged workspace changes and review/apply the resulting
+ChangeSet explicitly.
+
+To let the model inspect a project (including bounded PDF text extraction), opt in to bounded read-only file tools:
+
+```bash
+lipas chat phi4-mini --workspace .
+```
+
+For example, ask it to inspect the project with
+`--once "List the Python files and summarize the entry point"`.
+
+Additional explicitly classified tools can be loaded with
+`--tool-factory module:callable`; shell and write capabilities remain outside
+the built-in chat surface and belong in the Task Workbench.
+
+Workspace Tasks include bounded document tools. `read_pdf` extracts text from
+an unencrypted PDF (with page/character limits), while
+`convert_workspace_file` can create reviewable TXT, Markdown, HTML, JSON, or
+CSV, DOCX, or XLSX outputs from supported text/PDF/DOCX/XLSX/PPTX input pairs
+(for example PDF→TXT/Markdown/HTML/JSON and XLSX→CSV/JSON). DOCX/XLSX/PPTX/PDF parsers
+are optional dependencies; install them with `pip install 'lipas[documents]'`.
+Every conversion writes inside the selected/staged workspace and records the
+source, target, digest, and size as evidence. Unsupported, encrypted, secret,
+oversized, or path-escaping inputs fail closed.
+
+The same Workbench exposes bounded `calculate` and `analyze_csv` helpers, plus
+`inspect_archive`/`extract_archive` for ZIP/TAR files. Archive extraction
+rejects traversal, links, and device members before writing and limits both
+member count and expanded bytes. `python_exec` is a temporary, approval-gated
+worker; it never receives implicit project files and reports its sandbox flags.
 
 For an OpenAI-compatible Chat Completions provider, pass the route and the
 name of a credential environment variable. The CLI intentionally has no
@@ -182,12 +278,12 @@ staging, command/write approval, Effect recording, or recovery.
 CLI, Python API, Sessions, Handoffs, Operations, and product events share the
 same global database. Per-Run Claim/Effect tapes remain separate under
 `runs/<run-id>/claims.db` so budgets and replay evidence cannot leak between
-concurrent Runs. In 0.40, core connections share WAL and bounded contention
+concurrent Runs. Since 0.40, core connections share WAL and bounded contention
 policy, and durable convenience calls no longer hold a Runtime-wide lock.
 SQLite remains a single physical writer; deployment and scale guidance is in
 [SQLite storage and concurrency](sqlite-storage.md).
 
-## Local Web operator (0.40.0)
+## Local Web operator (0.63.0)
 
 The Python API exposes a dependency-free operator projection without adding a
 second queue or status store:
@@ -198,12 +294,25 @@ with LIPASRuntime.open(".lipas") as runtime:
     operator.serve_forever(host="127.0.0.1", port=8787)
 ```
 
+The production CLI wrapper keeps the operator authenticated and prints a
+one-time token for loopback development when `LIPAS_OPERATOR_TOKEN` is absent:
+
+```bash
+export LIPAS_OPERATOR_TOKEN='a-long-local-secret'
+lipas operator serve --home ~/.lipas --host 127.0.0.1 --port 8787
+```
+
+Non-loopback binds require `--certfile`/`--keyfile` (and the token environment
+variable); `TLSConfig` enforces TLS 1.2+ and private-key permissions. Use
+`--cafile --require-client-certificate` when mutual TLS is part of the host
+policy.
+
 `serve_forever` owns the serving thread. If an application runs it in a
 dedicated thread, call `operator.shutdown()` from another thread and let the
 loop close the server; the Runtime/Store itself must still be opened in the
 serving thread when the default thread-bound SQLite connection is used.
 
-`GET /`, `/ui`, `/health`, `/api/snapshot`, `/api/tasks`, `/api/tasks/<id>`,
+`GET /`, `/ui`, `/health`, `/ready`, `/api/snapshot`, `/api/tasks`, `/api/tasks/<id>`,
 `/api/runs`, `/api/runs/<id>`, and `/api/runs/<id>/events` return bounded,
 redacted projections. The root route is a small dependency-free browser page;
 the JSON routes are the reconnectable contract. When the
@@ -216,6 +325,39 @@ HTTP 409 so a UI can refresh and retry without guessing state. The operator
 remains a projection rather than a second scheduler; clients can
 reconnect using the same per-Run and aggregate event cursors.
 
+### Conversation kernel (0.41)
+
+When the operator is created from `LIPASRuntime`, release 0.41 exposes the
+conversation kernel over the same workspace database:
+
+```text
+GET  /api/conversations
+POST /api/conversations
+GET  /api/conversations/<conversation-id>
+GET  /api/conversations/<conversation-id>/messages
+POST /api/conversations/<conversation-id>/messages
+GET  /api/conversations/<conversation-id>/events?after=0&limit=100
+POST /api/conversations/<conversation-id>/events
+POST /api/conversations/<conversation-id>/messages/<message-id>/promote
+```
+
+All POST routes require the operator bearer token. A client should send a
+stable `message_id` and retain `next_cursor`; duplicate message or promotion
+requests return the original fact rather than creating another Task/Run. The
+event route is intentionally cursor-pollable instead of hiding a second
+streaming state: a chat host can append `model_delta`, `tool_activity`,
+`approval_card`, `diff`, or `report` events while durable AgentEvents and
+Interrupts are projected automatically for linked Runs. This keeps browser,
+CLI, and Python views reconnectable without a frontend dependency or an SSE
+server thread competing with SQLite's thread-bound connection.
+
+### Local Web conversation projection (0.42)
+
+Release 0.42 adds the browser timeline, authenticated SSE catch-up, approval
+and input cards, tool activity, diffs, reports, and content-addressed
+attachments on top of the 0.41 routes. It remains a bounded projection of the
+same authority and does not create a second scheduler.
+
 `GET /api/approvals` adds risk, scope, preview/diff, and budget fields;
 `GET /api/operations` lists pending/uncertain external operations. A provider or
 operator can explicitly reconcile one with `POST
@@ -225,6 +367,12 @@ phase timeout requires `POST /api/runs/<id>/reopen` with
 `{"acknowledge_uncertain":true,"reconciled":true,"evidence":{"observation":"..."}}`
 after its Effect/provider outcome has been reconciled. Neither route retries a
 live operation implicitly or treats a checkbox alone as provider evidence.
+
+`GET /api/metrics`, `/api/incidents`, and `/api/cost` expose bounded derived
+projections for a local dashboard. They do not replace the append-only event
+or Effect evidence, and an empty execution window is never reported healthy.
+`/ready` (or `/api/ready`) runs the local installation/readiness checks,
+including schema, permission, and disposable backup/restore verification.
 
 ## Inspect a run
 

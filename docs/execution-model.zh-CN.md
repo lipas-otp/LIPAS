@@ -90,6 +90,14 @@ rejection。使用 `estimate=` 的工具必须先给出有限且非负的估计�
 intent 会快照提交的输入。`caused_by` 可将 Agent effect 链至其 handoff envelope；
 `compensates` 可将补偿 effect 链至较早 effect。
 
+0.50 的 `AgentRuntime.execute_effect()` bridge 会把产品层的 `EffectProposal` 传给匹配的
+`LLMHarness` 或 `ToolHarness`。Harness 将任意 proposal identity 稳定映射为历史兼容的
+`call_`/`tool_` claim id，把带 namespace 的 proposal provenance（包括 `caused_by`）写入
+intent，并从同一条 tape 投影返回 `EffectObservation`。重复 proposal 会恢复 terminal
+claim；只有 intent 的 claim 会投影为 `uncertain`，绝不会被当作成功交付。Reconciliation
+可以使用产品 proposal id 或映射后的 claim id，只会记录一个 terminal result，不会再次提交
+实时请求。
+
 ## Replay：复现决策，而不意外重复 effect
 
 LLM replay 会替换为已记录的 reply。工具 replay 默认严格：已记录的工具结果会

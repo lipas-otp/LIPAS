@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -15,6 +16,77 @@ from lipas.cli import main
 from tests.fake_adapter import FakeAdapter
 from lipas import tool
 from lipas.tools import ToolRegistry
+
+
+def test_default_chat_instructions_explain_current_session_memory():
+    from lipas.cli import _DEFAULT_INSTRUCTIONS
+
+    assert "every turn in this CLI session" in _DEFAULT_INSTRUCTIONS
+    assert "do not give a generic claim that you have no memory" in (
+        _DEFAULT_INSTRUCTIONS
+    )
+
+
+def test_chat_runtime_facts_and_tool_report_real_authority(monkeypatch, tmp_path):
+    from lipas.cli import _chat_runtime_instructions, _chat_runtime_tool
+
+    monkeypatch.chdir(tmp_path)
+    tool_value = _chat_runtime_tool(
+        workspace=None,
+        session_path=None,
+        session_id="chat-1",
+    )
+    payload = tool_value.invoke()
+    assert payload["current_working_directory"] == str(tmp_path.resolve())
+    assert payload["selected_workspace"] is None
+    assert payload["session_id"] == "chat-1"
+    assert payload["memory"]["mode"] == "ephemeral"
+    assert payload["capabilities"]["write"] is False
+
+    instructions = _chat_runtime_instructions(
+        "base",
+        workspace=tmp_path,
+        session_path=Path("chat.db"),
+        session_id="chat-1",
+    )
+    assert str(tmp_path.resolve()) in instructions
+    assert "write_capability: none in chat" in instructions
+    assert "never claim that you do not run in a filesystem" in instructions
+
+
+def test_chat_composition_always_includes_runtime_authority(monkeypatch, tmp_path):
+    captured = {}
+
+    class StubAgent:
+        @classmethod
+        def ollama(cls, *_args, **kwargs):
+            captured.update(kwargs)
+            return cls()
+
+        def close(self):
+            pass
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("lipas.cli.Agent", StubAgent)
+    monkeypatch.setattr(
+        "lipas.cli._chat",
+        lambda *_args, **_kwargs: __import__("asyncio").sleep(0),
+    )
+    assert main(["chat", "--no-memory", "--once", "where am I?"]) == 0
+    assert "get_runtime_info" in captured["tools"].names()
+    assert str(tmp_path.resolve()) in captured["instructions"]
+    assert "write_capability: none in chat" in captured["instructions"]
+
+
+def test_chat_workspace_tools_include_bounded_pdf_reader(monkeypatch, tmp_path):
+    from lipas.cli import _chat_workspace_tools
+
+    (tmp_path / "sample.pdf").write_bytes(b"%PDF-not-a-real-document")
+    tools = {value.name: value for value in _chat_workspace_tools(tmp_path)}
+    assert {"list_workspace_files", "read_workspace_file", "read_pdf"} <= tools.keys()
+    monkeypatch.setitem(sys.modules, "pypdf", None)
+    with pytest.raises(ValueError, match=r"lipas\[documents\]"):
+        tools["read_pdf"].invoke(relative_path="sample.pdf")
 
 
 def test_version_flag_uses_package_version(capsys):

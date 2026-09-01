@@ -337,6 +337,8 @@ timeout 已经提供；跨阶段绝对 deadline 与 durable event catch-up 使�
 | [Durable execution](../examples/11_durable_execution.py) | 第 10 章 | 分离的 execution/effect store、持久审批 Interrupt，以及恢复同一个 run。 |
 | [Local task product](../examples/12_local_task_product.py) | 第 10 章 | 隔离的 ChangeSet、命令审批、重启恢复、验证证据、review 与显式 apply。 |
 | [Operator beta](../examples/14_operator_beta.py) | 第 10 章 | 本地 Task/Run projection、确定性故障演练和有界 SQLite transition benchmark。 |
+| [External connectors](../examples/15_external_connectors.py) | 第 10 章 | 幂等 Email delivery 与 transport-neutral MCP client，不建立第二套 authority。 |
+| [Workspace capabilities](../examples/16_workspace_capabilities.py) | 第 10 章 | 受限文件、文档、归档、计算和本地知识 Tool 的 provider-free 冒烟测试。 |
 
 例如，使用本地 Ollama 模型运行前三个：
 
@@ -346,7 +348,7 @@ python -m examples.03_support_triage
 python -m examples.04_daily_brief
 ```
 
-后四个不依赖 provider。包括 replay 和 supervision 的完整示例目录见
+其余项目不依赖 provider。包括 replay 和 supervision 的完整示例目录见
 [examples/README.zh-CN.md](../examples/README.zh-CN.md)。
 
 ## API 卡片

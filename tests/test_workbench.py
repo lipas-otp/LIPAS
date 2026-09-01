@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,14 @@ def test_workspace_capabilities_reject_escape_and_record_evidence(tmp_path):
         task, run = workbench.create_task("update a note", workspace)
         tools = {value.name: value for value in workbench.workspace_tools(task.id, run.id)}
 
+        info = tools["get_workspace_info"].invoke()
+        assert info["current_working_directory"] == str(workspace.resolve())
+        assert info["selected_workspace"] == str(workspace.resolve())
+        assert info["filesystem_capability"] == "read_write"
+        matches = tools["search_workspace"].invoke(query="test_ok")
+        assert matches[0]["path"] == "test_sample.py"
+        assert matches[0]["line"] == 1
+
         with pytest.raises(WorkspacePolicyError):
             tools["read_workspace_file"].invoke(relative_path="../outside/secret")
         with pytest.raises(WorkspacePolicyError):
@@ -122,6 +131,79 @@ def test_workspace_capabilities_reject_escape_and_record_evidence(tmp_path):
         assert len(artifacts) == 1
         assert artifacts[0].kind == "file_write"
         assert artifacts[0].metadata["before_sha256"] is None
+
+        with pytest.raises(WorkspacePolicyError, match="must be a string"):
+            tools["read_workspace_file"].invoke(relative_path=None)
+        with pytest.raises(WorkspacePolicyError, match="content must be a string"):
+            asyncio.run(tools["write_workspace_file"].acall({
+                "relative_path": "bad.txt", "content": 123,
+            }))
+
+
+def test_document_conversion_is_bounded_and_records_evidence(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.md").write_text(
+        "# Title\n\nA short paragraph.", encoding="utf-8",
+    )
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        task, run = workbench.create_task("convert note", workspace)
+        tools = {value.name: value for value in workbench.workspace_tools(task.id, run.id)}
+        result = asyncio.run(tools["convert_workspace_file"].acall({
+            "source_path": "note.md",
+            "destination_path": "out.html",
+        }))
+        assert result["source_format"] == "md"
+        assert result["target_format"] == "html"
+        assert "<h1>Title</h1>" in (workspace / "out.html").read_text(encoding="utf-8")
+        artifacts = workbench.artifacts(task.id)
+        conversion = next(value for value in artifacts if value.kind == "document_conversion")
+        assert conversion.path == "out.html"
+        assert conversion.metadata["source_path"] == "note.md"
+
+
+def test_pdf_tool_reports_optional_dependency_and_never_reads_outside_workspace(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "sample.pdf").write_bytes(b"%PDF-not-a-real-document")
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        task, run = workbench.create_task("read PDF", workspace)
+        tools = {value.name: value for value in workbench.workspace_tools(task.id, run.id)}
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        with pytest.raises(WorkspacePolicyError, match=r"lipas\[documents\]"):
+            tools["read_pdf"].invoke(relative_path="sample.pdf")
+        with pytest.raises(WorkspacePolicyError):
+            tools["read_pdf"].invoke(relative_path="../outside.pdf")
+
+
+def test_document_outputs_report_optional_dependencies(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("hello\n", encoding="utf-8")
+    with Workbench(tmp_path / "home", sandbox="local") as workbench:
+        task, run = workbench.create_task("office output", workspace)
+        tools = {value.name: value for value in workbench.workspace_tools(task.id, run.id)}
+        monkeypatch.setitem(sys.modules, "docx", None)
+        with pytest.raises(WorkspacePolicyError, match=r"lipas\[documents\]"):
+            asyncio.run(tools["convert_workspace_file"].acall({
+                "source_path": "note.txt",
+                "destination_path": "note.docx",
+            }))
+        monkeypatch.setitem(sys.modules, "openpyxl", None)
+        with pytest.raises(WorkspacePolicyError, match=r"lipas\[documents\]"):
+            asyncio.run(tools["convert_workspace_file"].acall({
+                "source_path": "note.txt",
+                "destination_path": "note.xlsx",
+            }))
+        monkeypatch.setitem(sys.modules, "pptx", None)
+        (workspace / "slides.pptx").write_bytes(b"not-a-pptx")
+        with pytest.raises(WorkspacePolicyError, match=r"lipas\[documents\]"):
+            asyncio.run(tools["convert_workspace_file"].acall({
+                "source_path": "slides.pptx",
+                "destination_path": "slides.txt",
+            }))
 
 
 def test_new_runs_receive_distinct_claim_sessions(tmp_path):

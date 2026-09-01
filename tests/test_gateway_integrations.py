@@ -60,6 +60,35 @@ def test_gateway_fails_closed_for_write_then_redelivers_recorded_result(tmp_path
         assert calls == ["write:x"]
 
 
+def test_gateway_rejects_empty_identity_and_approval_payload_reuse(tmp_path):
+    calls: list[str] = []
+    with ActionGateway(_tools(calls), session=tmp_path / "identity.db") as gateway:
+        with pytest.raises(ValueError, match="request_id"):
+            asyncio.run(gateway.call(
+                "save", {"value": "x"}, request_id="",
+            ))
+        denied = asyncio.run(gateway.call(
+            "save", {"value": "x"}, request_id="approval-bound",
+        ))
+        assert denied.status == "approval_required"
+        with pytest.raises(ValueError, match="different arguments"):
+            asyncio.run(gateway.call(
+                "save", {"value": "y"}, request_id="approval-bound", approved=True,
+            ))
+        assert calls == []
+
+        done = asyncio.run(gateway.call(
+            "save", {"value": "x"}, request_id="causal-bound",
+            approved=True, caused_by="task-a",
+        ))
+        assert done.status == "ok"
+        with pytest.raises(ValueError, match="different causation"):
+            asyncio.run(gateway.call(
+                "save", {"value": "x"}, request_id="causal-bound",
+                approved=True, caused_by="task-b",
+            ))
+
+
 def test_gateway_rejects_raw_secret_before_any_persistent_claim(tmp_path):
     calls: list[str] = []
     with ActionGateway(_tools(calls), session=tmp_path / "actions.db") as gateway:
@@ -153,6 +182,12 @@ def test_langgraph_node_and_tool_adapter_use_gateway_idempotency(tmp_path):
         }))
         assert result["output"] == {"value": "tool"}
         assert calls == ["read:node", "read:tool"]
+        with pytest.raises(ValueError, match="request id"):
+            asyncio.run(adapter.ainvoke({
+                "value": "blank", "_lipas_request_id": "",
+            }))
+        with pytest.raises(ValueError, match="require _lipas_request_id"):
+            asyncio.run(adapter.ainvoke({"value": "missing"}))
 
 
 def test_mcp_lists_annotations_and_calls_read_but_denies_write(tmp_path):
@@ -183,6 +218,11 @@ def test_mcp_lists_annotations_and_calls_read_but_denies_write(tmp_path):
         }))
         assert write["result"]["structuredContent"]["status"] == "approval_required"  # type: ignore[index]
         assert calls == ["read:mcp"]
+        notification = asyncio.run(server.handle({
+            "jsonrpc": "2.0", "method": "tools/call",
+            "params": {"name": "lookup", "arguments": {"value": "mcp"}},
+        }))
+        assert notification["error"]["code"] == -32600  # type: ignore[index]
 
 
 def test_openclaw_backend_requires_stable_id_and_trusted_approval(tmp_path):

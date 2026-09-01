@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "lipas"
 dynamic = ["version"]
-description = "LIPAS — trustworthy Agent execution with durable recovery, staged delivery, business Scenarios, and explicit capability contracts."
+description = "LIPAS — a trustworthy Agent Operating Runtime with durable recovery, explicit Effect admission, staged delivery, business Scenarios, and capability contracts."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ keywords = [
     "side-effects", "budget", "react", "tool-use", "openai-compatible",
     "chat-completions", "agent-runtime", "multi-agent", "agent-coordination",
     "business-scenarios", "local-web", "fault-injection", "extension-sdk",
+    "effect-proposal", "effect-observation",
 ]
 
 classifiers = [
@@ -42,6 +43,15 @@ ollama = [
 ]
 cli = ["prompt-toolkit>=3.0"]
 compatible = ["httpx>=0.27"]
+# Optional bounded document extraction/conversion.  LIPAS core stays
+# dependency-free; Workbench reports a precise install hint when a parser is
+# requested without this extra.
+documents = [
+    "pypdf>=5.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6.23",
+]
 # Compatibility alias for existing installs and the OpenAI Responses adapter.
 openai = ["httpx>=0.27"]
 # anthropic = [ "anthropic>=0.28", ]
@@ -53,7 +63,14 @@ dev = [
     "mypy>=1.10",
     "ruff>=0.6",
 ]
-all = ["httpx>=0.27", "prompt-toolkit>=3.0"]
+all = [
+    "httpx>=0.27",
+    "prompt-toolkit>=3.0",
+    "pypdf>=5.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6.23",
+]
 
 [project.urls]
 Homepage   = "https://github.com/lipas-otp/lipas"

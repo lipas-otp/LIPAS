@@ -2,7 +2,7 @@
 
 > Language: [English](model-providers.md) | [中文](model-providers.zh-CN.md)
 
-LIPAS 0.40 retains the 0.32 provider boundary for services that implement the OpenAI-compatible Chat
+LIPAS 0.63 retains the 0.32 provider boundary for services that implement the OpenAI-compatible Chat
 Completions contract. The integration is intentionally configured with an
 explicit URL, model name, and credential: LIPAS does not guess a provider,
 silently change a model, or fall back to another endpoint.
